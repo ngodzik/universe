@@ -295,6 +295,9 @@ struct Ctx<'a, M, D, O> {
     /// The conversation as an investigator may look at it again, during
     /// `/debug`.
     history: Option<investigate::History>,
+    /// Whether the model was told this request of lines it wrote that
+    /// repeat code already in the project: once is enough.
+    repeats_told: bool,
 }
 
 enum Attempt {
@@ -467,6 +470,7 @@ impl Session {
             last_context: None,
             last_request: None,
             history: None,
+            repeats_told: false,
         };
         // A request keeps its own session warm; the other one is ticked
         // meanwhile, and the ticks count with the request.
@@ -1584,6 +1588,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         last_context: None,
         last_request: None,
         history: None,
+        repeats_told: false,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -1663,7 +1668,25 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             Role::Member
         };
         let edits = ctx.toolbox.edits();
-        let finished = converse(ctx, tier, messages, role).await?;
+        let mut finished = converse(ctx, tier, messages, role).await?;
+        // Lines it wrote that repeat code already in the project: it is
+        // asked, once a request, to share what does the same thing.
+        if finished
+            && role != Role::Reader
+            && !ctx.repeats_told
+            && ctx.toolbox.edits() != edits
+            && let Some(said) = repeats_now(ctx)
+        {
+            ctx.repeats_told = true;
+            (ctx.observe)(Event::Notice {
+                model: tier.clone(),
+                text: format!("lines it wrote repeat code already in the project:\n{said}"),
+            });
+            messages.push(Message::user(format!(
+                "{REPEATS_PROMPT}\n{said}\n{REPEATS_ASK}"
+            )));
+            finished = converse(ctx, tier, messages, role).await?;
+        }
 
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
@@ -1704,6 +1727,23 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         }
     }
     Ok(Attempt::Failed)
+}
+
+/// What a model is told of the lines it wrote that repeat the project's.
+const REPEATS_PROMPT: &str = "Some lines you wrote repeat code already in the project, line for \
+line, spacing aside:";
+
+/// What follows the list.
+const REPEATS_ASK: &str = "Where they do the same thing, share it: call the code that is \
+there, or move it where both can use it, rather than keep two copies. Where they only look \
+alike, leave them, and say why in a few words.";
+
+/// The lines written this request that repeat code already in the
+/// project, listed; `None` when there are none.
+fn repeats_now<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> Option<String> {
+    let changed: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
+    let root = ctx.toolbox.workspace().root();
+    universe_tools::repeats_said(&universe_tools::repeats(root, &changed, "HEAD"))
 }
 
 /// Hands the task to an agent such as Claude Code, then judges what it did
@@ -5638,6 +5678,66 @@ mod tests {
             Question::AddFolder { folder, .. } if *folder == other.path().canonicalize().unwrap()
         ));
         assert_eq!(toolbox.workspace().folders().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_repeated_the_projects_code_is_asked_once_to_share_it() {
+        let (dir, mut toolbox) = setup();
+        let body = "fn total(items: &[Item]) -> u64 {\n    let mut sum = 0;\n    for item in items {\n        sum += item.price * item.count;\n    }\n    apply_discount(sum, items.len())\n}\n";
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("cart.rs"), body).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let model = Scripted::new(vec![
+            calls("write_file", json!({"path": "bill.rs", "content": body})),
+            says("Wrote bill.rs."),
+            calls(
+                "write_file",
+                json!({"path": "bill.rs", "content": "use crate::cart::total;\n"}),
+            ),
+            says("It now calls cart's total."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut events = Vec::new();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "add a bill",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        // Told where, after it said it was done; then it went on.
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::User(text)) if text.contains("bill.rs:1-6 repeats cart.rs:1") && text.contains("share it")
+        ));
+        assert_eq!(seen.len(), 4);
+        assert!(events.iter().any(
+            |e| matches!(e, Event::Notice { text, .. } if text.contains("repeat code already"))
+        ));
     }
 
     #[tokio::test]

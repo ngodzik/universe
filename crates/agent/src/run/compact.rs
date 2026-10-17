@@ -408,6 +408,7 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             last_context: None,
             last_request: None,
             history: None,
+            repeats_told: false,
         }
     }
 }

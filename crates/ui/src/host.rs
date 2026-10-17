@@ -1307,7 +1307,20 @@ async fn check_progress<M: ChatModel>(
     )
     .await?;
     let verdicts = crate::tickets::parse_verdicts(&answer)?;
-    Ok(crate::tickets::progress(tickets, &marked, &verdicts))
+    let mut progress = crate::tickets::progress(tickets, &marked, &verdicts);
+    // What the branch wrote again that the project already had, as a model
+    // is told of it while it works; generated code repeats by nature.
+    let mut written: Vec<String> = marked
+        .iter()
+        .filter(|(_, generated)| !generated)
+        .map(|(hunk, _)| hunk.path.clone())
+        .collect();
+    written.dedup();
+    progress.repeats = universe_tools::repeats(root, &written, &base)
+        .iter()
+        .map(crate::tickets::RepeatRef::from)
+        .collect();
+    Ok(progress)
 }
 
 /// Puts `conversation`'s tools in `folder`, the copy of a pull request it

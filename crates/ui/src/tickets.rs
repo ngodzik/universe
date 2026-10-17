@@ -153,6 +153,34 @@ pub struct Progress {
     pub unattached: f64,
     /// The share that is generated code.
     pub generated: f64,
+    /// Lines the branch added that repeat code already in the project.
+    #[serde(default)]
+    pub repeats: Vec<RepeatRef>,
+}
+
+/// Lines the branch added that repeat code already in the project, as
+/// kept with a check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatRef {
+    /// The file they were added to.
+    pub path: String,
+    /// Their first and last lines there, from 1.
+    pub lines: (usize, usize),
+    /// Where the same lines already are.
+    pub found: String,
+    /// Their first line there, from 1.
+    pub found_line: usize,
+}
+
+impl From<&universe_tools::Repeat> for RepeatRef {
+    fn from(repeat: &universe_tools::Repeat) -> Self {
+        Self {
+            path: repeat.path.clone(),
+            lines: repeat.lines,
+            found: repeat.found.clone(),
+            found_line: repeat.found_line,
+        }
+    }
 }
 
 /// A piece of the diff, as kept with a check.
@@ -432,6 +460,8 @@ pub fn progress(tickets: &[Ticket], hunks: &[(Hunk, bool)], verdicts: &[Verdict]
         files: files.into_values().collect(),
         unattached,
         generated,
+        // Found by the host, which reads the project.
+        repeats: Vec::new(),
     }
 }
 

@@ -259,6 +259,25 @@ fn files(
             });
         }
     }
+    if !progress.repeats.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Lines that repeat code already in the project")
+                .size(14.0)
+                .color(TEXT),
+        );
+        for repeat in &progress.repeats {
+            let (first, last) = repeat.lines;
+            ui.label(
+                RichText::new(format!(
+                    "{}:{first}-{last} repeats {}:{}",
+                    repeat.path, repeat.found, repeat.found_line
+                ))
+                .size(12.0)
+                .color(YELLOW),
+            );
+        }
+    }
 }
 
 /// The pieces an item or a file is served by, on the left: each with lines
