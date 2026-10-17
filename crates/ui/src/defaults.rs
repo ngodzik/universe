@@ -137,6 +137,9 @@ pub struct Defaults {
     pub summarize_when_cold: Vec<String>,
     /// MCP servers, `[mcp.<name>]`, each a `url` (with `headers`) or a
     /// `command` (with `env`). Set in the file only: it may hold tokens.
+    /// Behind a proxy that signs TLS again, as some company networks do, a
+    /// server started with `npx` needs `NODE_EXTRA_CA_CERTS` in its `env`,
+    /// the path of the proxy's certificate.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
     /// Ticket trackers, `[trackers.<name>]`, each read through an MCP

@@ -230,6 +230,10 @@ where
         .add_systems(EguiPrimaryContextPass, draw::<M, D>)
         .add_systems(Last, close_or_reopen::<M, D>)
         .add_systems(
+            PreUpdate,
+            follow_new_window.before(EguiPreUpdateSet::InitContexts),
+        )
+        .add_systems(
             PostUpdate,
             copy_selection::<M, D>.after(EguiPostUpdateSet::ProcessOutput),
         )
@@ -1038,6 +1042,39 @@ fn close_or_reopen<M, D>(
         warn!("the system took the window away unasked: opening it again");
         let title = format!("{} · universe", shell.app.name());
         commands.spawn((main_window(title), PrimaryWindow));
+    }
+}
+
+/// Points egui's contexts at the primary window when it is made again, as
+/// macOS does after sleep or when a screen is unplugged. bevy_egui maps a
+/// window to its contexts only when a context is made: the new window's
+/// clicks and scrolling would reach nothing, while keys, which universe
+/// reads itself, still arrive. Harmless where windows are never remade.
+fn follow_new_window(
+    added: Query<Entity, Added<PrimaryWindow>>,
+    contexts: Query<(Entity, &bevy::camera::RenderTarget), With<bevy_egui::EguiContext>>,
+    mut map: ResMut<bevy_egui::input::WindowToEguiContextMap>,
+) {
+    let Ok(window) = added.single() else {
+        return;
+    };
+    for (context, target) in &contexts {
+        if !matches!(
+            target,
+            bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Primary)
+        ) {
+            continue;
+        }
+        if let Some(old) = map.context_to_window.insert(context, window)
+            && old != window
+            && let Some(theirs) = map.window_to_contexts.get_mut(&old)
+        {
+            theirs.remove(&context);
+        }
+        map.window_to_contexts
+            .entry(window)
+            .or_default()
+            .insert(context);
     }
 }
 
@@ -2410,5 +2447,43 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     if let Some((row, column)) = definition {
         app.definition_at(row, column);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::camera::RenderTarget;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::window::WindowRef;
+    use bevy_egui::input::WindowToEguiContextMap;
+
+    use super::*;
+
+    #[test]
+    fn a_window_made_again_gets_eguis_contexts() {
+        let mut world = World::new();
+        world.init_resource::<WindowToEguiContextMap>();
+        let context = world
+            .spawn((
+                RenderTarget::Window(WindowRef::Primary),
+                bevy_egui::EguiContext::default(),
+            ))
+            .id();
+        // Mapped to the window that is gone.
+        let gone = world.spawn_empty().id();
+        {
+            let mut map = world.resource_mut::<WindowToEguiContextMap>();
+            map.context_to_window.insert(context, gone);
+            map.window_to_contexts
+                .entry(gone)
+                .or_default()
+                .insert(context);
+        }
+        let window = world.spawn(PrimaryWindow).id();
+        world.run_system_once(follow_new_window).unwrap();
+        let map = world.resource::<WindowToEguiContextMap>();
+        assert_eq!(map.context_to_window[&context], window);
+        assert!(map.window_to_contexts[&window].contains(&context));
+        assert!(!map.window_to_contexts[&gone].contains(&context));
     }
 }
