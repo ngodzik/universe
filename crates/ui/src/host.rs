@@ -422,6 +422,12 @@ where
         }
         // What needs the conversation waits while a request has it, rather
         // than freeze the interface until its end.
+        // What the MCP servers have to say, such as a page to consent on.
+        if let Some(external) = app.external_tools().cloned() {
+            for notice in external.notices() {
+                app.report_info(&notice);
+            }
+        }
         let effect = match effect {
             Some(Effect::Save) if app.is_running() => {
                 self.slot(shown).save_pending = true;

@@ -5570,8 +5570,12 @@ dependencies = [
 name = "universe-mcp"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "reqwest",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "universe-core",
 ]

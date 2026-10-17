@@ -412,7 +412,10 @@ async fn interface(
         // Each server starts on a task of its own; its tools are offered
         // once it answers.
         external: (!defaults.mcp.is_empty()).then(|| {
-            Arc::new(universe_mcp::Mcp::start(&defaults.mcp))
+            // OAuth grants beside the settings, so that UNIVERSE_HOME
+            // keeps them apart too.
+            let grants = Defaults::path().map(|p| p.with_file_name("mcp-auth"));
+            Arc::new(universe_mcp::Mcp::start(&defaults.mcp, grants))
                 as Arc<dyn universe_core::ExternalTools>
         }),
         tiers,
