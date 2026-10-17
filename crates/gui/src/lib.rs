@@ -37,6 +37,7 @@ mod tickets_pane;
 mod transcript;
 mod universe;
 mod usage;
+mod viewer;
 mod windows;
 
 use std::sync::Arc;
@@ -45,7 +46,7 @@ use std::time::Duration;
 use bevy::app::AppExit;
 use bevy::camera::CameraOutputMode;
 use bevy::input::ButtonState;
-use bevy::input::keyboard::{KeyCode as PhysicalKey, KeyboardInput};
+use bevy::input::keyboard::{Key, KeyCode as PhysicalKey, KeyboardInput};
 use bevy::prelude::*;
 use bevy::render::render_resource::BlendState;
 use bevy::window::{CompositeAlphaMode, PrimaryWindow};
@@ -165,6 +166,7 @@ where
         diagrams,
         branch: branch_pane::BranchPane::default(),
         bullets_moving: false,
+        viewer: None,
         tickets: tickets_pane::TicketsPane::default(),
     };
 
@@ -285,6 +287,8 @@ struct Shell<M, D> {
     /// Whether a moving bullet was in view when the window last drew: it
     /// wakes then as a moving background does.
     bullets_moving: bool,
+    /// An image shown whole over the window, while it is.
+    viewer: Option<viewer::Viewer>,
     /// The branch's tickets, as their pane shows them.
     tickets: tickets_pane::TicketsPane,
 }
@@ -454,6 +458,21 @@ fn read_keys<M, D>(
             _ => {}
         }
         if !down {
+            continue;
+        }
+        // An image shown whole takes the keys: none reaches the state
+        // behind it.
+        if let Some(shown) = &mut shell.viewer {
+            match &event.logical_key {
+                Key::Escape => shell.viewer = None,
+                Key::Character(c) => match c.as_str() {
+                    "f" | "F" | "0" => shown.fit(),
+                    "+" | "=" => shown.zoom(viewer::STEP),
+                    "-" | "_" => shown.zoom(1.0 / viewer::STEP),
+                    _ => {}
+                },
+                _ => {}
+            }
             continue;
         }
         match keys::translate(&event.logical_key, *held) {
@@ -956,6 +975,19 @@ where
         ctx.request_repaint();
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
+    // An image clicked while drawing, shown whole over everything.
+    if let Some(texture) = ctx
+        .data_mut(|d| d.remove_temp::<Option<egui::TextureHandle>>(Id::new(viewer::OPEN)))
+        .flatten()
+    {
+        shell.viewer = Some(viewer::Viewer::new(texture));
+    }
+    if let Some(shown) = &mut shell.viewer
+        && !shown.show(&ctx)
+    {
+        shell.viewer = None;
+        ctx.request_repaint();
+    }
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
         ctx.request_repaint();
     }

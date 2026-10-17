@@ -841,8 +841,16 @@ fn link(job: &mut LayoutJob, range: &Range<usize>) {
 /// A fenced block on its own card, its language above it and a copy button
 /// beside; a diff tinted line by line.
 fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>) {
+    let mermaid = language.split_whitespace().next() == Some("mermaid");
+    // A diagram is drawn for a dark background on a transparent one: on an
+    // opaque card, it reads whatever shows through the window.
+    let fill = if mermaid {
+        crate::theme::RAISED
+    } else {
+        ui.visuals().faint_bg_color
+    };
     Frame::new()
-        .fill(ui.visuals().faint_bg_color)
+        .fill(fill)
         .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(10, 8))
@@ -855,7 +863,7 @@ fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>
                 ui.label(RichText::new(language).small().color(DIM));
             });
             // A diagram drawn takes the place of its code.
-            if language.split_whitespace().next() == Some("mermaid") {
+            if mermaid {
                 let diagrams: Option<crate::diagrams::Diagrams> =
                     ui.data(|d| d.get_temp(egui::Id::new("diagrams")));
                 if diagrams.is_some_and(|d| d.show(ui, code)) {
