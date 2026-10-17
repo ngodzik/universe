@@ -70,6 +70,8 @@ fn sized_window(
         .max_width(*widths.end())
         .frame(
             Frame::window(&ctx.global_style())
+                // As see-through as the window: its menus stay opaque.
+                .fill(ctx.global_style().visuals.faint_bg_color)
                 .stroke(Stroke::new(1.5, colour))
                 .inner_margin(Margin::same(18)),
         )

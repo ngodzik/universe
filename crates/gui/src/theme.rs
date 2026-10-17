@@ -143,12 +143,14 @@ fn fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Makes every surface egui fills, windows and menus included, as opaque
-/// as the window: Ctrl-M fades them all together.
+/// Makes every surface egui fills as opaque as the window, so that Ctrl-M
+/// fades them all together; but menus and tooltips, which egui fills with
+/// its windows' colour: see-through over text, they could not be read.
+/// Windows take [`Visuals::faint_bg_color`] instead, and fade.
 pub(crate) fn follow(ctx: &egui::Context, opacity: f32) {
     let mut visuals = ctx.global_style().visuals.clone();
     visuals.panel_fill = see(PANEL, opacity);
-    visuals.window_fill = see(RAISED, opacity);
+    visuals.window_fill = RAISED;
     visuals.extreme_bg_color = see(BACKGROUND, opacity);
     visuals.faint_bg_color = see(RAISED, opacity);
     visuals.selection.bg_fill = see(SELECTED, opacity);
