@@ -10,6 +10,7 @@
 mod document;
 mod error;
 mod external;
+mod subscription;
 mod traits;
 mod types;
 
@@ -18,6 +19,7 @@ pub use document::{
 };
 pub use error::CoreError;
 pub use external::{ExternalCall, ExternalTools, McpServer};
+pub use subscription::{Quota, QuotaWindow, SubscriptionCall};
 pub use traits::{ChatModel, Delegate};
 pub use types::{
     Agent, CacheTtl, CacheUse, ChatRequest, ChatResponse, ContextUse, DelegateEvent, DelegateReply,

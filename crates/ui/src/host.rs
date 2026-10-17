@@ -120,6 +120,8 @@ pub enum Incoming {
     DockerDue,
     /// Whether to keep the sessions warm is due to be looked at.
     WarmDue,
+    /// The agents' calls under their subscriptions, read from their files.
+    SubscriptionCalls(Vec<universe_core::SubscriptionCall>),
 }
 
 /// Carries out the effects the state returns, holds the conversation the
@@ -153,6 +155,11 @@ pub struct Host<M, D> {
     rules: crate::outside_rules::OutsideRules,
     /// The project's files of instructions, for agents to be told of.
     guides: crate::guides::Guides,
+    /// The agents' calls, read on a thread of their own.
+    calls_tx: mpsc::UnboundedSender<Vec<universe_core::SubscriptionCall>>,
+    calls_rx: mpsc::UnboundedReceiver<Vec<universe_core::SubscriptionCall>>,
+    /// They are being read: another read waits for it to end.
+    calls_reading: bool,
 }
 
 impl<M, D> Host<M, D>
@@ -166,6 +173,7 @@ where
     pub fn new(model: Arc<M>, delegate: Arc<D>, workspace: Workspace) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (docker_tx, docker_rx) = mpsc::unbounded_channel();
+        let (calls_tx, calls_rx) = mpsc::unbounded_channel();
         let store = Store::for_project(workspace.root());
         let workspace_root = &workspace.root().to_owned();
         Self {
@@ -186,6 +194,9 @@ where
             awake: crate::awake::Awake::default(),
             rules: crate::outside_rules::OutsideRules::default(),
             guides: crate::guides::Guides::default(),
+            calls_tx,
+            calls_rx,
+            calls_reading: false,
         }
     }
 
@@ -208,6 +219,14 @@ where
         self.rules.refresh_due();
         // Listed in the background, for the first request to an agent.
         self.guides.get(self.workspace.root());
+        // The quotas heard of in earlier sessions: Claude Code's are kept
+        // nowhere else.
+        if let Some(seen) = quotas_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+        {
+            app.subscriptions_loaded(seen);
+        }
         let state = self
             .store
             .as_ref()
@@ -318,6 +337,7 @@ where
             _ = self.docker_tick.tick(), if waiting.docker && !self.docker_asking => Incoming::DockerDue,
             _ = self.spin.tick(), if waiting.running => Incoming::Spin,
             _ = self.warm_tick.tick() => Incoming::WarmDue,
+            Some(calls) = self.calls_rx.recv() => Incoming::SubscriptionCalls(calls),
         }
     }
 
@@ -352,6 +372,11 @@ where
                 None
             }
             Incoming::DockerDue => Some(Effect::RefreshDocker),
+            Incoming::SubscriptionCalls(calls) => {
+                self.calls_reading = false;
+                app.subscription_calls_read(calls);
+                None
+            }
             Incoming::Spin => {
                 app.on_tick();
                 None
@@ -427,6 +452,24 @@ where
         }
         // What needs the conversation waits while a request has it, rather
         // than freeze the interface until its end.
+        // The agents' calls, read again on a thread when the state asks,
+        // as their files are large; the quotas kept as they come.
+        if !self.calls_reading && app.take_subscriptions_due() {
+            self.calls_reading = true;
+            let (delegate, tx) = (Arc::clone(&self.delegate), self.calls_tx.clone());
+            tokio::task::spawn_blocking(move || {
+                let since = crate::sessions::now().saturating_sub(crate::subscriptions::KEEP_SECS);
+                let _ = tx.send(delegate.subscription_calls(since));
+            });
+        }
+        if let Some(seen) = app.subscriptions_to_keep()
+            && let Some(path) = quotas_path()
+            && let Err(e) = serde_json::to_string(&seen)
+                .map_err(std::io::Error::other)
+                .and_then(|text| std::fs::write(&path, text))
+        {
+            app.report_error(format!("Could not keep the subscriptions' quotas: {e}"));
+        }
         // What the MCP servers have to say, such as a page to consent on.
         if let Some(external) = app.external_tools().cloned() {
             for notice in external.notices() {
@@ -1165,6 +1208,11 @@ async fn check_progress<M: ChatModel>(
     .await?;
     let verdicts = crate::tickets::parse_verdicts(&answer)?;
     Ok(crate::tickets::progress(tickets, &marked, &verdicts))
+}
+
+/// Where the quotas the agents reported are kept, beside the settings.
+fn quotas_path() -> Option<std::path::PathBuf> {
+    Defaults::path().map(|p| p.with_file_name("quotas.json"))
 }
 
 /// `config` with what a request reads again each time, an edit counting

@@ -29,6 +29,7 @@ mod review_view;
 mod service_board;
 mod services_view;
 mod sub_agent_pane;
+mod subscriptions_page;
 mod theme;
 mod tickets_pane;
 mod transcript;
@@ -65,7 +66,7 @@ use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use universe_ui::keymap::{Focus, Mode, Pending};
 use universe_ui::references::Reference;
 use universe_ui::workspaces::Relaunch;
-use universe_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
+use universe_ui::{App, Effect, Host, MapView, Settings, Start, UsagePage, Waiting, clipboard};
 
 pub use error::GuiError;
 
@@ -665,8 +666,9 @@ where
                     .stroke(Stroke::new(1.0, EDGE)),
                 )
                 .show(&mut root, |ui| {
-                    ScrollArea::vertical().show(ui, |ui| {
-                        usage::show(ui, &mut shell.usage, log, window);
+                    ScrollArea::vertical().show(ui, |ui| match shell.app.usage_page() {
+                        UsagePage::Costs => usage::show(ui, &mut shell.usage, log, window),
+                        UsagePage::Subscriptions => subscriptions_page::show(ui, &shell.app),
                     });
                 });
         }
@@ -1699,6 +1701,29 @@ fn status(ui: &mut Ui, app: &App) {
                 };
                 ui.label(RichText::new(chats).small().color(colour))
                     .on_hover_text("Other conversations go on while hidden: /chats lists them");
+            }
+            // The subscriptions' windows: how much is used, and when each
+            // starts again.
+            let now = universe_ui::sessions::now();
+            if let Some(line) = app.subscriptions().line(now) {
+                let fullest = app
+                    .subscriptions()
+                    .windows(now)
+                    .iter()
+                    .map(|w| w.estimate.unwrap_or(w.reported))
+                    .fold(0.0_f64, f64::max);
+                let colour = if fullest >= 90.0 {
+                    theme::RED
+                } else if fullest >= 70.0 {
+                    YELLOW
+                } else {
+                    DIM
+                };
+                ui.label(RichText::new(line).small().color(colour))
+                    .on_hover_text(
+                        "Each subscription's windows: the share used, and when it starts again. \
+                         Ctrl-O twice shows what each request took",
+                    );
             }
             if let Some(ticks) = app.tick_label() {
                 ui.label(RichText::new(ticks).small().color(theme::CYAN))

@@ -44,6 +44,15 @@ const MIN_OPACITY: f32 = 0.2;
 /// The opacities Ctrl-M goes through, after opaque.
 const OPACITY_STEPS: [f32; 3] = [0.8, 0.6, 0.4];
 
+/// The pages of the usage pane, a Ctrl-O apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePage {
+    /// Where the money goes, how full the conversation is, and the caches.
+    Costs,
+    /// The agents' subscriptions: their windows, what each request took.
+    Subscriptions,
+}
+
 /// How the window draws the codebase instead of the panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapView {
@@ -990,6 +999,12 @@ pub struct App {
     usage_window: u64,
     /// Whether the usage pane shows.
     usage_open: bool,
+    /// Which page of it: a second Ctrl-O turns to the subscriptions.
+    usage_page: UsagePage,
+    /// The agents' subscriptions, as they reported them.
+    subscriptions: crate::subscriptions::Subscriptions,
+    /// The agents' calls should be read again from their files.
+    subscriptions_due: bool,
     /// What the branch changed since it left the main one, while its pane
     /// shows.
     branch: Option<crate::changes::ChangeSet>,
@@ -1154,6 +1169,10 @@ impl App {
             history: History::default(),
             usage_window,
             usage_open: false,
+            usage_page: UsagePage::Costs,
+            subscriptions: crate::subscriptions::Subscriptions::default(),
+            // Read once at startup, for the status line.
+            subscriptions_due: true,
             branch: None,
             tickets_open: false,
             tickets_branch: None,
@@ -1991,8 +2010,19 @@ impl App {
                     return Some(Effect::Copy(text));
                 }
             }
+            // Closed, the costs, the subscriptions, then closed again.
             Action::ToggleUsage => {
-                self.usage_open = !self.usage_open;
+                match (self.usage_open, self.usage_page) {
+                    (false, _) => {
+                        self.usage_open = true;
+                        self.usage_page = UsagePage::Costs;
+                    }
+                    (true, UsagePage::Costs) => {
+                        self.usage_page = UsagePage::Subscriptions;
+                        self.subscriptions_due = true;
+                    }
+                    (true, UsagePage::Subscriptions) => self.usage_open = false,
+                }
                 if self.usage_open {
                     self.branch = None;
                     self.tickets_open = false;
@@ -4103,6 +4133,36 @@ impl App {
             .then_some((&self.chat.usage_log, self.usage_window))
     }
 
+    /// Which page of the usage pane shows.
+    pub fn usage_page(&self) -> UsagePage {
+        self.usage_page
+    }
+
+    /// The agents' subscriptions.
+    pub fn subscriptions(&self) -> &crate::subscriptions::Subscriptions {
+        &self.subscriptions
+    }
+
+    /// What was kept of the subscriptions in earlier sessions.
+    pub fn subscriptions_loaded(&mut self, seen: crate::subscriptions::Seen) {
+        self.subscriptions.loaded(seen);
+    }
+
+    /// The agents' calls, as just read from their files.
+    pub fn subscription_calls_read(&mut self, calls: Vec<universe_core::SubscriptionCall>) {
+        self.subscriptions.calls_read(calls);
+    }
+
+    /// Whether the agents' calls should be read again; asking clears it.
+    pub fn take_subscriptions_due(&mut self) -> bool {
+        std::mem::take(&mut self.subscriptions_due)
+    }
+
+    /// The subscriptions' quotas to keep, when they changed since.
+    pub fn subscriptions_to_keep(&mut self) -> Option<crate::subscriptions::Seen> {
+        self.subscriptions.take_to_keep()
+    }
+
     /// Asks which folder a new conversation works in, when the settings
     /// list some and the program was not started with `--here`.
     pub fn ask_workspace(&mut self) {
@@ -4956,6 +5016,13 @@ impl App {
                 sessions::ago(0, idle_secs).trim_end_matches(" ago")
             )),
             Event::Notice { model, text } => Entry::Info(format!("{model}: {text}")),
+            // For the status line and the subscriptions' page; the calls
+            // that took it are read again.
+            Event::Quota(quota) => {
+                self.subscriptions.add(quota);
+                self.subscriptions_due = true;
+                return;
+            }
             Event::Denied {
                 model,
                 action,
@@ -5288,8 +5355,19 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         app.on_key(ctrl('o'));
         assert_eq!(app.usage_pane().map(|(_, w)| w), Some(3600));
+        assert_eq!(app.usage_page(), UsagePage::Costs);
+        // Again: the subscriptions, their calls read again; again: closed.
+        app.take_subscriptions_due();
+        app.on_key(ctrl('o'));
+        assert_eq!(app.usage_page(), UsagePage::Subscriptions);
+        assert!(app.take_subscriptions_due());
         app.on_key(ctrl('o'));
         assert!(app.usage_pane().is_none());
+        // Opened again, on the costs.
+        app.on_key(ctrl('o'));
+        assert_eq!(app.usage_page(), UsagePage::Costs);
+        app.on_key(ctrl('o'));
+        app.on_key(ctrl('o'));
         // The next window, shown.
         app.on_key(ctrl('p'));
         assert_eq!(app.usage_pane().map(|(_, w)| w), Some(6 * 3600));

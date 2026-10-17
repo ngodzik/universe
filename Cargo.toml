@@ -49,6 +49,9 @@ tempfile   = "3.27.0"
 regex      = "1.13.1"
 similar    = "3.2.0"
 toml       = "1.1.6"
+# Local time for when a subscription's window starts again, the system's
+# time zone read as the platform keeps it.
+jiff       = { version = "0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # The directory walker of ripgrep: it skips what .gitignore skips.
 ignore     = "0.4.33"
 # Parsers for the code map.

@@ -1890,6 +1890,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                     model: tier.clone(),
                     text,
                 },
+                DelegateEvent::Quota(quota) => Event::Quota(quota),
                 DelegateEvent::Denied {
                     name,
                     input,

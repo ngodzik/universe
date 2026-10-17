@@ -31,6 +31,7 @@ pub mod review;
 mod search;
 pub mod sessions;
 pub mod style;
+pub mod subscriptions;
 pub mod tickets;
 pub mod tree;
 pub mod usage;
@@ -39,7 +40,7 @@ pub mod workspaces;
 pub use app::{
     AgentMessage, App, ChatRow, ChatState, CompactRow, DEFAULT_OPACITY, DefinitionChoice,
     DockerPane, Effect, Entry, Found, LineEditor, Lookup, MapView, Settings, Shown, SubAgent,
-    TaskRow, TickStatus, TicketView, parse_window, step_title,
+    TaskRow, TickStatus, TicketView, UsagePage, parse_window, step_title,
 };
 pub use defaults::Defaults;
 pub use host::{Host, Incoming, Start, Waiting};

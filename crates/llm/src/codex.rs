@@ -152,6 +152,7 @@ impl Delegate for Codex {
             rollout.find(session);
             rollout.skip_to_end();
         }
+        let started = std::time::SystemTime::now();
         let mut child = self
             .command(request)
             .spawn()
@@ -184,9 +185,19 @@ impl Delegate for Codex {
 
         parser
             .finish()
-            .map(|reply| DelegateReply {
-                billed: self.billed,
-                ..reply
+            .map(|mut reply| {
+                // The images Codex drew, which it keeps without saying so:
+                // shown after its reply, and kept in it.
+                for image in generated_images(&reply.session, started) {
+                    let line = format!("![image]({})", image.display());
+                    on_event(DelegateEvent::TextStart);
+                    on_event(DelegateEvent::Text(line.clone()));
+                    reply.text.push_str(&format!("\n\n{line}"));
+                }
+                DelegateReply {
+                    billed: self.billed,
+                    ..reply
+                }
             })
             .map_err(|reason| {
                 let errors: String = errors.trim().chars().take(STDERR_LIMIT).collect();
@@ -235,6 +246,10 @@ impl Codex {
                 }),
             });
         }
+        // Under a subscription, how much of it is left.
+        if let Some(quota) = rollout.quota.take().filter(|_| !self.billed) {
+            on_event(DelegateEvent::Quota(quota));
+        }
     }
 }
 
@@ -247,6 +262,8 @@ struct Rollout {
     offset: u64,
     /// The model of the latest turn, which the calls after it use.
     model: String,
+    /// The quota as last logged, until it is reported.
+    quota: Option<universe_core::Quota>,
 }
 
 impl Rollout {
@@ -291,6 +308,14 @@ impl Rollout {
                     self.model = model.to_owned();
                 }
             } else if payload["type"] == "token_count" {
+                let at = value["timestamp"]
+                    .as_str()
+                    .and_then(crate::subscriptions::epoch)
+                    .unwrap_or_else(crate::subscriptions::now);
+                if let Some(quota) = crate::subscriptions::codex_quota(&payload["rate_limits"], at)
+                {
+                    self.quota = Some(quota);
+                }
                 let usage = &payload["info"]["last_token_usage"];
                 let count = |key: &str| usage[key].as_u64().unwrap_or(0);
                 let input = count("input_tokens");
@@ -319,6 +344,37 @@ fn sessions_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
     Some(home.join("sessions"))
+}
+
+/// The images Codex drew in `session` since `since`, oldest first: it keeps
+/// them under `generated_images/<session>/` beside its sessions.
+fn generated_images(session: &str, since: std::time::SystemTime) -> Vec<PathBuf> {
+    sessions_dir()
+        .and_then(|d| d.parent().map(|p| p.join("generated_images").join(session)))
+        .map_or_else(Vec::new, |dir| images_since(&dir, since))
+}
+
+/// The images in `dir` written since `since`, oldest first.
+fn images_since(dir: &Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // A second's slack: some file systems keep coarse times.
+    let since = since - std::time::Duration::from_secs(1);
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let at = e.metadata().ok()?.modified().ok()?;
+            let path = e.path();
+            let image = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| matches!(x, "png" | "jpg" | "jpeg" | "webp" | "gif"));
+            (image && at >= since).then_some((at, path))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, path)| path).collect()
 }
 
 /// The file under `dir` whose name holds `session`, newest days first.
@@ -515,6 +571,24 @@ fn toml_string(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_images_codex_drew_during_the_request_are_found_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        std::fs::write(dir.path().join("exec-b.png"), "b").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not an image").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("exec-a.png"), "a").unwrap();
+        let found: Vec<String> = images_since(dir.path(), before)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, ["exec-b.png", "exec-a.png"]);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(images_since(dir.path(), later).is_empty());
+        assert!(images_since(&dir.path().join("none"), before).is_empty());
+    }
 
     fn parse(lines: &[&str]) -> (Vec<DelegateEvent>, Result<DelegateReply, Option<String>>) {
         let mut parser = StreamParser::default();

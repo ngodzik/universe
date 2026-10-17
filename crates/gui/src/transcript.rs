@@ -525,8 +525,25 @@ fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
             }
             Block::Quote { text, blocks } => quote(ui, app, text, blocks, effects),
             Block::Code { language, text } => code_block(ui, language, text, effects),
+            // A file of the machine, as Codex's drawings are given, or of
+            // the project: drawn as the diagrams are; else as written.
             Block::Image { alt, path } => {
-                ui.label(RichText::new(format!("![{alt}]({path})")).color(DIM));
+                let file = std::path::Path::new(path);
+                let file = if file.is_absolute() {
+                    file.to_owned()
+                } else {
+                    app.root().join(file)
+                };
+                let pictures: Option<crate::diagrams::Diagrams> =
+                    ui.data(|d| d.get_temp(egui::Id::new("diagrams")));
+                match pictures {
+                    Some(pictures) if file.is_file() => {
+                        pictures.picture(ui, &file);
+                    }
+                    _ => {
+                        ui.label(RichText::new(format!("![{alt}]({path})")).color(DIM));
+                    }
+                }
             }
             Block::Table {
                 header,
