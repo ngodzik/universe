@@ -449,7 +449,7 @@ fn diff_block(ui: &mut Ui, diff: &[DiffLine]) {
 /// A reply's Markdown, as `universe_ui::markdown` reads it: headings by
 /// level, lists nested, numbered or ticked, quotes behind a bar with a copy
 /// button, rules, tables, and fenced blocks with a copy button.
-fn markdown(ui: &mut Ui, app: &App, text: &str, effects: &mut Vec<Effect>) {
+pub(crate) fn markdown(ui: &mut Ui, app: &App, text: &str, effects: &mut Vec<Effect>) {
     blocks(ui, app, &md::parse(text), effects);
 }
 

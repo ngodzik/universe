@@ -55,7 +55,7 @@ impl App {
 
     /// The model for fresh work, and the models to pick the cheapest from
     /// when there is none: an agent cannot answer one question.
-    fn fresh_or_cheapest(&self) -> (Option<ModelId>, Vec<ModelId>) {
+    pub(super) fn fresh_or_cheapest(&self) -> (Option<ModelId>, Vec<ModelId>) {
         let fresh = self.fresh_model().filter(|m| m.delegate().is_none());
         (fresh, self.models())
     }

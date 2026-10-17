@@ -175,6 +175,68 @@ impl Hunk {
     }
 }
 
+/// One line of a file before and after, in the order a diff shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aligned {
+    /// The same in both: its place in the old lines and in the new.
+    Same(usize, usize),
+    /// Only in the old lines, removed: its place there.
+    Removed(usize),
+    /// Only in the new lines, added: its place there.
+    Added(usize),
+}
+
+/// Every line of `old` and `new`, aligned as a diff shows them: a minimal
+/// diff, the removed lines of a change before the added.
+///
+/// # Examples
+///
+/// ```
+/// use universe_tools::{Aligned, aligned};
+///
+/// let old = ["a", "b", "c"].map(String::from);
+/// let new = ["a", "B", "c", "d"].map(String::from);
+/// assert_eq!(
+///     aligned(&old, &new),
+///     [
+///         Aligned::Same(0, 0),
+///         Aligned::Removed(1),
+///         Aligned::Added(1),
+///         Aligned::Same(2, 2),
+///         Aligned::Added(3),
+///     ]
+/// );
+/// ```
+#[must_use]
+pub fn aligned(old: &[String], new: &[String]) -> Vec<Aligned> {
+    let mut out = Vec::with_capacity(old.len().max(new.len()));
+    for op in capture_diff_slices(Algorithm::Myers, old, new) {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => out.extend((0..len).map(|i| Aligned::Same(old_index + i, new_index + i))),
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => out.extend((old_index..old_index + old_len).map(Aligned::Removed)),
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => out.extend((new_index..new_index + new_len).map(Aligned::Added)),
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                out.extend((old_index..old_index + old_len).map(Aligned::Removed));
+                out.extend((new_index..new_index + new_len).map(Aligned::Added));
+            }
+        }
+    }
+    out
+}
+
 /// The pieces of the diff from `base` to the working tree, without context:
 /// the files not tracked yet as whole-file pieces, the deleted ones too.
 /// `None` outside git.

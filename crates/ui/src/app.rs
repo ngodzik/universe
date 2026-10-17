@@ -264,6 +264,21 @@ pub enum Effect {
     /// Say which rules kept outside the repository the project's models
     /// get, and how fresh their copies are.
     ShowRules,
+    /// Have a model summarize the pull request reviewed, unless its
+    /// summaries for this head are kept.
+    SummarizePull {
+        /// The folder it is checked out in.
+        copy: PathBuf,
+        /// The pull request.
+        pull: universe_tools::PullRequest,
+        /// Its diff by area.
+        areas: Vec<crate::pull_review::AreaDiff>,
+        /// The model that summarizes; the cheapest of `candidates` without
+        /// one.
+        model: Option<ModelId>,
+        /// The models to pick the cheapest from.
+        candidates: Vec<ModelId>,
+    },
     /// Check out pull request `number` apart, for review.
     FetchPull {
         /// Its number.
@@ -471,6 +486,8 @@ pub enum AgentMessage {
     Ticket(Result<crate::tickets::Ticket, String>),
     /// The branch's work judged against its tickets, or why it could not be.
     Progress(Result<crate::tickets::Progress, String>),
+    /// What a model said of the pull request reviewed, or why it did not.
+    Summaries(Result<crate::pull_review::Summaries, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -1010,6 +1027,14 @@ pub struct App {
     subscriptions: crate::subscriptions::Subscriptions,
     /// The agents' calls should be read again from their files.
     subscriptions_due: bool,
+    /// Lines of a reviewed file picked in the diff, for the next message
+    /// to be about: the file, the first line and the last.
+    picked: Option<(String, usize, usize)>,
+    /// What a model said of the pull request reviewed, once said.
+    summaries: Option<crate::pull_review::Summaries>,
+    /// The head commit summaries were asked for, so that they are asked
+    /// once.
+    summaries_asked: Option<String>,
     /// What the branch changed since it left the main one, while its pane
     /// shows.
     branch: Option<crate::changes::ChangeSet>,
@@ -1178,6 +1203,9 @@ impl App {
             subscriptions: crate::subscriptions::Subscriptions::default(),
             // Read once at startup, for the status line.
             subscriptions_due: true,
+            picked: None,
+            summaries: None,
+            summaries_asked: None,
             branch: None,
             tickets_open: false,
             tickets_branch: None,
@@ -1324,6 +1352,79 @@ impl App {
     /// The file tree, when open.
     pub fn tree(&self) -> Option<&FileTree> {
         self.tree.as_ref()
+    }
+
+    /// Asks for the pull request reviewed to be summarized, its diff by
+    /// area given by the window, which reads the areas; once per head.
+    pub fn ask_summaries(&mut self, areas: Vec<crate::pull_review::AreaDiff>) -> Option<Effect> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.clone()?;
+        if self.summaries_asked.as_deref() == Some(pull.head.as_str()) {
+            return None;
+        }
+        self.summaries_asked = Some(pull.head.clone());
+        self.summaries = None;
+        let copy = changes.root.clone();
+        let (model, candidates) = self.fresh_or_cheapest();
+        Some(Effect::SummarizePull {
+            copy,
+            pull,
+            areas,
+            model,
+            candidates,
+        })
+    }
+
+    /// Whether the pull request reviewed was asked to be summarized.
+    pub fn summaries_asked(&self) -> bool {
+        self.changes
+            .as_ref()
+            .and_then(|c| c.pull.as_ref())
+            .is_some_and(|p| self.summaries_asked.as_deref() == Some(p.head.as_str()))
+    }
+
+    /// What a model said of the pull request reviewed, once said.
+    pub fn summaries(&self) -> Option<&crate::pull_review::Summaries> {
+        let head = self.changes.as_ref()?.pull.as_ref()?.head.as_str();
+        self.summaries.as_ref().filter(|s| s.head == head)
+    }
+
+    /// Picks `line` of `path` in the diff, or with `extend` the lines from
+    /// the one picked to it; picking the one line picked again lets it go.
+    pub fn pick_line(&mut self, path: &str, line: usize, extend: bool) {
+        self.picked = match self.picked.take() {
+            Some((picked, first, last)) if extend && picked == path => {
+                Some((picked, first.min(line), last.max(line)))
+            }
+            Some((picked, first, last)) if picked == path && first == line && last == line => None,
+            _ => Some((path.to_owned(), line, line)),
+        };
+    }
+
+    /// The lines picked in the diff: the file, the first line and the last.
+    pub fn picked_lines(&self) -> Option<(&str, usize, usize)> {
+        self.picked
+            .as_ref()
+            .map(|(path, first, last)| (path.as_str(), *first, *last))
+    }
+
+    /// Shows `path` in the tree, its folders opened and its row chosen, as
+    /// the diff is read past it.
+    pub fn follow_in_tree(&mut self, path: &str) {
+        let Some(tree) = &mut self.tree else {
+            return;
+        };
+        tree.reveal_one(path);
+        if let Some(index) = tree.rows().iter().position(|r| r.path == Path::new(path)) {
+            tree.select(index);
+        }
+    }
+
+    /// Chooses the tree's row `index` without opening it.
+    pub fn choose_in_tree(&mut self, index: usize) {
+        if let Some(tree) = &mut self.tree {
+            tree.select(index);
+        }
     }
 
     /// The branch's changes, while a review or a piece of work is looked at.
@@ -2774,7 +2875,36 @@ impl App {
                     .with_external_tools(self.settings.external.clone())
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
-                self.chat.transcript.push(Entry::User(text.clone()));
+                // Lines picked in the diff go with the message, quoted.
+                let text = match self.picked.take() {
+                    Some((path, first, last)) => {
+                        let span = if first == last {
+                            format!("line {first}")
+                        } else {
+                            format!("lines {first}-{last}")
+                        };
+                        self.chat
+                            .transcript
+                            .push(Entry::Info(format!("About {path}, {span}")));
+                        let quoted: Vec<String> =
+                            std::fs::read_to_string(self.view_root().join(&path))
+                                .unwrap_or_default()
+                                .lines()
+                                .skip(first.saturating_sub(1))
+                                .take(last + 1 - first)
+                                .map(str::to_owned)
+                                .collect();
+                        self.chat.transcript.push(Entry::User(text.clone()));
+                        format!(
+                            "About {path}, {span}:\n```\n{}\n```\n\n{text}",
+                            quoted.join("\n")
+                        )
+                    }
+                    None => {
+                        self.chat.transcript.push(Entry::User(text.clone()));
+                        text
+                    }
+                };
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.chat.sub_view = None;
@@ -3270,6 +3400,13 @@ impl App {
             }
             AgentMessage::Progress(checked) => {
                 self.progress_checked(checked);
+                false
+            }
+            AgentMessage::Summaries(said) => {
+                match said {
+                    Ok(summaries) => self.summaries = Some(summaries),
+                    Err(e) => self.error(format!("The pull request was not summarized: {e}")),
+                }
                 false
             }
             AgentMessage::WalkAnswer(answer) => {

@@ -19,6 +19,7 @@ mod backdrop;
 mod branch_pane;
 mod database_view;
 mod diagrams;
+mod diff_view;
 mod docker_pane;
 mod error;
 mod fleet_view;
@@ -155,6 +156,8 @@ where
         usage: UsageView::default(),
         scroll_seen: 0,
         sub_seen: 0,
+        diffs: diff_view::DiffView::default(),
+        followed: None,
         wheel_rest: 0.0,
         transcript_rows: 0,
         relaunch: Arc::clone(&relaunch),
@@ -262,6 +265,10 @@ struct Shell<M, D> {
     scroll_seen: usize,
     /// The same for the sub-agent pane.
     sub_seen: usize,
+    /// A pull request's diff, while one is reviewed.
+    diffs: diff_view::DiffView,
+    /// The file the tree last followed in it.
+    followed: Option<String>,
     /// How many lines the conversation scrolls through, as last drawn.
     transcript_rows: usize,
     /// What the wheel or the touchpad moved short of a whole line, kept for
@@ -830,10 +837,85 @@ where
             .default_size(280.0)
             .frame(pane)
             .show(&mut root, |ui| {
-                tree(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
+                // While a pull request's diff shows, a file of the tree is a
+                // place in it rather than a file to open.
+                let pulled = shell.app.change_set().is_some_and(|c| c.pull.is_some())
+                    && shell.app.file().is_none();
+                let diffs = pulled.then_some(&mut shell.diffs);
+                tree(
+                    ui,
+                    &mut shell.app,
+                    &mut shell.wheel_rest,
+                    &mut shell.keys,
+                    diffs,
+                );
             });
     }
+    // A pull request reviewed: its diff, the tree following the file read.
+    let pulled = shell.app.change_set().filter(|c| c.pull.is_some()).cloned();
+    shell.diffs.update(pulled.as_ref());
+    if let Some(current) = shell.diffs.current().map(str::to_owned)
+        && shell.followed.as_deref() != Some(current.as_str())
+    {
+        shell.app.follow_in_tree(&current);
+        shell.followed = Some(current);
+    }
     if view.is_some() {
+    } else if pulled.is_some() && shell.app.file().is_none() && !zoomed {
+        // The conversation under the diff, resizable.
+        let height = ctx.content_rect().height() * 0.35;
+        egui::Panel::bottom("pull-chat")
+            .resizable(true)
+            .default_size(height)
+            .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
+            .show(&mut root, |ui| conversation(ui, shell));
+        egui::CentralPanel::default()
+            .frame(pane.fill(background))
+            .show(&mut root, |ui| {
+                let Shell {
+                    diffs,
+                    review,
+                    app,
+                    effects,
+                    ..
+                } = &mut *shell;
+                // Summarized once the diff and its areas are read.
+                if !app.summaries_asked()
+                    && diffs.is_read()
+                    && let Some(read) = review.review()
+                    && let Some(effect) = app.ask_summaries(diffs.area_diffs(read))
+                {
+                    effects.push(effect);
+                }
+                let picked = app
+                    .picked_lines()
+                    .map(|(path, first, last)| (path.to_owned(), first, last));
+                let picked = picked
+                    .as_ref()
+                    .map(|(path, first, last)| (path.as_str(), *first, *last));
+                let summaries = app.summaries().cloned();
+                let shown: &App = app;
+                let mut drawn = Vec::new();
+                let mut markdown =
+                    |ui: &mut Ui, text: &str| transcript::markdown(ui, shown, text, &mut drawn);
+                let pick = ScrollArea::vertical()
+                    .id_salt("diff-stream")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        diffs.show(
+                            ui,
+                            review.review(),
+                            summaries.as_ref(),
+                            &mut markdown,
+                            picked,
+                        )
+                    })
+                    .inner;
+                effects.extend(drawn);
+                if let Some(diff_view::Picked::Line(path, line, extend)) = pick {
+                    app.pick_line(&path, line, extend);
+                }
+            });
     } else if shell.app.file().is_some() && !zoomed {
         chat_beside(&mut root, &ctx, shell, pane);
         egui::CentralPanel::default()
@@ -1519,6 +1601,20 @@ fn activity(ui: &mut Ui, app: &App) {
 /// The message box, or the command line in command mode, with who answers
 /// and the team above it.
 fn input(ui: &mut Ui, app: &App) {
+    if let Some((path, first, last)) = app.picked_lines() {
+        let span = if first == last {
+            format!("line {first}")
+        } else {
+            format!("lines {first}-{last}")
+        };
+        ui.label(
+            RichText::new(format!(
+                "The next message is about {path}, {span}: a click on the line again lets it go"
+            ))
+            .small()
+            .color(theme::CYAN),
+        );
+    }
     let (editor, prompt) = match app.mode() {
         Mode::Command => (app.command_line(), ":"),
         Mode::Search => (app.search_line(), "Search ›"),
@@ -1748,7 +1844,13 @@ fn status(ui: &mut Ui, app: &App) {
 }
 
 /// The file tree, the selected row kept in view.
-fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
+fn tree(
+    ui: &mut Ui,
+    app: &mut App,
+    rest: &mut f32,
+    keys: &mut Vec<KeyEvent>,
+    diffs: Option<&mut diff_view::DiffView>,
+) {
     backdrop::paint(ui, app);
     let Some(tree) = app.tree() else {
         return;
@@ -1887,7 +1989,18 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         app.wheel(Focus::Tree, lines);
     }
     if let Some(index) = clicked {
-        app.click_tree(index);
+        let file = app
+            .tree()
+            .and_then(|t| t.rows().get(index))
+            .filter(|row| !row.is_dir && row.unchanged.is_none())
+            .map(|row| row.path.to_string_lossy().into_owned());
+        match (diffs, file) {
+            (Some(diffs), Some(path)) => {
+                diffs.go_to(&path);
+                app.choose_in_tree(index);
+            }
+            _ => app.click_tree(index),
+        }
     }
 }
 

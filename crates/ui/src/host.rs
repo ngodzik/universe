@@ -778,6 +778,20 @@ where
                     let _ = tx.send(universe_tools::check_out_pull(&root, &reviews, number));
                 });
             }
+            Effect::SummarizePull {
+                copy,
+                pull,
+                areas,
+                model: chosen,
+                candidates,
+            } => {
+                let (model, tx) = (Arc::clone(model), tx.clone());
+                tokio::spawn(async move {
+                    let said =
+                        summarize(&*model, &copy, &pull, &areas, chosen, &candidates, &tx).await;
+                    let _ = tx.send(AgentMessage::Summaries(said));
+                });
+            }
             Effect::ShowRules => {
                 rules.refresh_due();
                 let lines = rules.status();
@@ -1090,36 +1104,78 @@ async fn ask_one<M: ChatModel>(
     question: String,
     tx: &mpsc::UnboundedSender<AgentMessage>,
 ) -> Result<String, String> {
+    ask_at(
+        model,
+        chosen,
+        candidates,
+        system,
+        question,
+        universe_core::Effort::Low,
+        tx,
+    )
+    .await
+}
+
+/// As [`ask_one`], at `effort`.
+async fn ask_at<M: ChatModel>(
+    model: &M,
+    chosen: Option<universe_core::ModelId>,
+    candidates: &[universe_core::ModelId],
+    system: &str,
+    question: String,
+    effort: universe_core::Effort,
+    tx: &mpsc::UnboundedSender<AgentMessage>,
+) -> Result<String, String> {
     let observe = |e| {
         let _ = tx.send(AgentMessage::Event(e));
     };
     let answered = match chosen {
-        Some(to) => {
-            universe_agent::ask(
-                model,
-                &to,
-                system,
-                question,
-                universe_core::Effort::Low,
-                observe,
-            )
-            .await
-        }
+        Some(to) => universe_agent::ask(model, &to, system, question, effort, observe).await,
         None => {
-            universe_agent::ask_cheapest(
-                model,
-                candidates,
-                system,
-                question,
-                universe_core::Effort::Low,
-                observe,
-            )
-            .await
+            universe_agent::ask_cheapest(model, candidates, system, question, effort, observe).await
         }
     };
     answered.map(|a| a.text).ok_or_else(|| {
         "No model answered: mark one for fresh work with Ctrl-F, or price one".to_owned()
     })
+}
+
+/// What a model says of a pull request, kept beside its copy per head
+/// commit: asked of the model only when none is kept. Its diff goes to the
+/// model, so the environment's secrets are taken out first.
+async fn summarize<M: ChatModel>(
+    model: &M,
+    copy: &std::path::Path,
+    pull: &universe_tools::PullRequest,
+    areas: &[crate::pull_review::AreaDiff],
+    chosen: Option<universe_core::ModelId>,
+    candidates: &[universe_core::ModelId],
+    tx: &mpsc::UnboundedSender<AgentMessage>,
+) -> Result<crate::pull_review::Summaries, String> {
+    let kept = crate::pull_review::kept_at(copy, &pull.head);
+    if let Some(summaries) = std::fs::read_to_string(&kept)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    {
+        return Ok(summaries);
+    }
+    let (question, _) =
+        universe_tools::redact_secrets(&crate::pull_review::summary_question(pull, areas));
+    let answer = ask_at(
+        model,
+        chosen,
+        candidates,
+        crate::pull_review::SUMMARY_PROMPT,
+        question,
+        universe_core::Effort::High,
+        tx,
+    )
+    .await?;
+    let summaries = crate::pull_review::parse_summaries(&pull.head, &answer);
+    if let Ok(text) = serde_json::to_string(&summaries) {
+        let _ = std::fs::write(&kept, text);
+    }
+    Ok(summaries)
 }
 
 /// Reads a ticket and its comments through its tracker's MCP tools, and has
