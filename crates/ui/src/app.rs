@@ -946,6 +946,8 @@ pub(crate) struct Chat {
     selected_reply: Option<usize>,
     /// How full the context was on the latest call, for the status line.
     context: Option<ContextUse>,
+    /// The context of the member at work, which the gauge shows meanwhile.
+    member_context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
     working_model: Option<ModelId>,
 }
@@ -1004,6 +1006,7 @@ impl Chat {
             expanded: BTreeSet::new(),
             selected_reply: None,
             context: None,
+            member_context: None,
             working_model: None,
         }
     }
@@ -2022,7 +2025,10 @@ impl App {
 
     /// How full the context was on the latest call, when known.
     pub fn context(&self) -> Option<ContextUse> {
-        self.chat.context
+        match &self.chat.member {
+            Some(_) => self.chat.member_context.or(self.chat.context),
+            None => self.chat.context,
+        }
     }
 
     /// Whether a request is running.
@@ -5156,8 +5162,12 @@ impl App {
                     role: purpose.name().to_owned(),
                     rewrite_extra: cache.and_then(|c| c.rewrite_extra).map(|u| u.0),
                 });
-                // The model that answers is back: the member is done.
-                if self.chat.member.as_ref().is_some_and(|m| *m != model) {
+                // The model that answers is back: the member is done. A side
+                // question to another model, such as whether a command only
+                // reads, is not that model.
+                if purpose != universe_agent::Purpose::Other
+                    && self.chat.member.as_ref().is_some_and(|m| *m != model)
+                {
                     self.chat.member = None;
                     self.chat.working_model = Some(model.clone());
                 }
@@ -5196,8 +5206,14 @@ impl App {
                         None => spent.subscription |= subscription,
                     }
                 }
-                if context.is_some() {
-                    self.chat.context = context;
+                // While a member works, the gauge shows its context, which is
+                // what fills; the conversation's comes back after.
+                if context.is_some() && purpose != universe_agent::Purpose::Other {
+                    if self.chat.member.as_ref() == Some(&model) {
+                        self.chat.member_context = context;
+                    } else {
+                        self.chat.context = context;
+                    }
                 }
                 self.chat.usage += usage;
                 match cost {
@@ -5259,6 +5275,7 @@ impl App {
                 self.chat.sub_scroll.set(0);
                 self.chat.working_model = Some(to.clone());
                 self.chat.member = Some(to);
+                self.chat.member_context = None;
                 return;
             }
             Event::Step {
@@ -5933,6 +5950,43 @@ mod tests {
     fn run(app: &mut App, text: &str) -> Option<Effect> {
         type_text(app, text);
         press(app, KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_members_gauge_shows_while_it_works_and_a_side_question_does_not_end_it() {
+        let mut app = ready();
+        let turn = |model: &str, used: u64, purpose: universe_agent::Purpose| {
+            AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: universe_core::Usage::default(),
+                cost: None,
+                subscription: true,
+                context: Some(ContextUse {
+                    used: TokenCount(used),
+                    window: TokenCount(100_000),
+                }),
+                cache: None,
+                purpose,
+            })
+        };
+        app.on_agent(turn("cheap", 10_000, universe_agent::Purpose::Chat));
+        app.on_agent(AgentMessage::Event(Event::Delegating {
+            from: ModelId::new("cheap").unwrap(),
+            to: ModelId::new("strong").unwrap(),
+            task: "read a.py".into(),
+        }));
+        app.on_agent(turn("strong", 60_000, universe_agent::Purpose::Chat));
+        assert_eq!(app.context().unwrap().used, TokenCount(60_000));
+        // Whether a command only reads, asked of the cheapest model: the
+        // member goes on, its pane open.
+        app.on_agent(turn("tiny", 900, universe_agent::Purpose::Other));
+        assert!(app.chat.member.is_some());
+        assert!(app.sub_agent().is_some());
+        assert_eq!(app.context().unwrap().used, TokenCount(60_000));
+        // The model that answers is back: the conversation's gauge again.
+        app.on_agent(turn("cheap", 11_000, universe_agent::Purpose::Chat));
+        assert!(app.chat.member.is_none());
+        assert_eq!(app.context().unwrap().used, TokenCount(11_000));
     }
 
     #[test]

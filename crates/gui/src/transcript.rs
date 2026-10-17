@@ -34,6 +34,11 @@ pub(crate) fn show(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
     let selected = app.selected_reply();
     let reveal = app.take_reveal();
     for (index, entry) in app.transcript().iter().enumerate() {
+        // A member's work is its own pane's (Ctrl-T), out of the
+        // conversation.
+        if matches!(entry, Entry::Member { .. }) {
+            continue;
+        }
         let is_selected = selected == Some(index);
         let frame = Frame::new()
             .inner_margin(Margin::symmetric(10, 6))
@@ -150,6 +155,7 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
         Entry::Delegating { from, to, task, .. } => {
             action(ui, MAGENTA, "Delegate", &format!("{from} → {to}"));
             result(ui, task, DIM);
+            result(ui, "Ctrl-T shows its work", DIM);
         }
         Entry::OverBudget { spent, budget } => marked(
             ui,
@@ -568,37 +574,51 @@ fn table(
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            egui::Grid::new(ui.next_auto_id())
-                .striped(true)
-                .spacing(egui::vec2(18.0, 4.0))
-                .show(ui, |ui| {
-                    let cells = |ui: &mut Ui, row: &[Vec<md::Span>], colour: Color32| {
-                        for (c, cell) in row.iter().enumerate() {
-                            let mut job = LayoutJob::default();
-                            runs(
-                                &mut job,
-                                cell,
-                                BODY_SIZE - 0.5,
-                                colour,
-                                ui.visuals().faint_bg_color,
-                            );
-                            let align = match aligns.get(c).copied().unwrap_or_default() {
-                                md::Align::Left => Align::Min,
-                                md::Align::Center => Align::Center,
-                                md::Align::Right => Align::Max,
-                            };
-                            // A cell keeps to one line: the grid gives each
-                            // column the room its widest cell needs.
-                            job.wrap.max_width = f32::INFINITY;
-                            ui.with_layout(Layout::top_down(align), |ui| citing(ui, app, job));
-                        }
-                        ui.end_row();
+            // Too wide, it scrolls on its card, not the conversation.
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .show(ui, |ui| table_grid(ui, app, header, aligns, rows));
+        });
+}
+
+/// The table's grid, its header bold, its columns aligned as written.
+fn table_grid(
+    ui: &mut Ui,
+    app: &App,
+    header: &[Vec<md::Span>],
+    aligns: &[md::Align],
+    rows: &[Vec<Vec<md::Span>>],
+) {
+    egui::Grid::new(ui.next_auto_id())
+        .striped(true)
+        .spacing(egui::vec2(18.0, 4.0))
+        .show(ui, |ui| {
+            let cells = |ui: &mut Ui, row: &[Vec<md::Span>], colour: Color32| {
+                for (c, cell) in row.iter().enumerate() {
+                    let mut job = LayoutJob::default();
+                    runs(
+                        &mut job,
+                        cell,
+                        BODY_SIZE - 0.5,
+                        colour,
+                        ui.visuals().faint_bg_color,
+                    );
+                    let align = match aligns.get(c).copied().unwrap_or_default() {
+                        md::Align::Left => Align::Min,
+                        md::Align::Center => Align::Center,
+                        md::Align::Right => Align::Max,
                     };
-                    cells(ui, header, Color32::WHITE);
-                    for row in rows {
-                        cells(ui, row, TEXT);
-                    }
-                });
+                    // A cell keeps to one line: the grid gives each
+                    // column the room its widest cell needs.
+                    job.wrap.max_width = f32::INFINITY;
+                    ui.with_layout(Layout::top_down(align), |ui| citing(ui, app, job));
+                }
+                ui.end_row();
+            };
+            cells(ui, header, Color32::WHITE);
+            for row in rows {
+                cells(ui, row, TEXT);
+            }
         });
 }
 
@@ -770,15 +790,23 @@ fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>
                 }
             }
             let diff = language.split_whitespace().next() == Some("diff");
-            for line in code.lines() {
-                let colour = match line.chars().next() {
-                    Some('+') if diff => GREEN,
-                    Some('-') if diff => RED,
-                    Some('@') if diff => CYAN,
-                    _ => CODE,
-                };
-                ui.label(RichText::new(line).monospace().color(colour));
-            }
+            // Too wide, it scrolls on its card, not the conversation.
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .show(ui, |ui| {
+                    for line in code.lines() {
+                        let colour = match line.chars().next() {
+                            Some('+') if diff => GREEN,
+                            Some('-') if diff => RED,
+                            Some('@') if diff => CYAN,
+                            _ => CODE,
+                        };
+                        ui.add(
+                            egui::Label::new(RichText::new(line).monospace().color(colour))
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
+                });
         });
 }
 
