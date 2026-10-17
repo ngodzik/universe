@@ -3873,6 +3873,10 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
             "ran, approved by the person".into()
         };
     }
+    (ctx.observe)(Event::Running {
+        model: model.clone(),
+        command: command.clone(),
+    });
     let before = universe_tools::Snapshot::take(&root);
     let result = universe_tools::run_command(&command, &root, &secrets).await;
     for path in before.created(&root) {

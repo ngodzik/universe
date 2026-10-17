@@ -844,6 +844,8 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        // Shown once it ran.
+        Event::Running { .. } => {}
         Event::Command {
             command,
             status,

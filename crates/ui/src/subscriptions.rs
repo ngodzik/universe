@@ -21,7 +21,7 @@ pub const KEEP_SECS: u64 = 8 * 24 * 60 * 60;
 
 /// How long a prompt cache lives unread: Codex's, about twenty minutes as
 /// measured, and Claude Code's, an hour, as it writes its cache for one.
-fn cache_life(agent: Agent) -> u64 {
+pub(crate) fn cache_life(agent: Agent) -> u64 {
     match agent {
         Agent::Codex => 20 * 60,
         Agent::ClaudeCode => 60 * 60,

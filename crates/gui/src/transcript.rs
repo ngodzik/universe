@@ -221,7 +221,9 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
             complete,
             seconds,
             subscription,
-            ..
+            runs,
+            flight,
+            context,
         } => {
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
@@ -229,16 +231,38 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
+            // Who it cost: each model once, in the order they worked.
+            let mut models: Vec<&str> = Vec::new();
+            for (model, _) in runs {
+                if !models.contains(&model.as_str()) {
+                    models.push(model.as_str());
+                }
+            }
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!("{} · ", models.join(", "))
+            };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let context = context
+                    .map(|c| format!(" · ctx {}%", c.percent()))
+                    .unwrap_or_default();
                 ui.label(
                     RichText::new(format!(
-                        "{cost} · {} in · {} out · {seconds}s",
+                        "{models}{cost} · {} in · {} out · {seconds}s{context}",
                         usage.input, usage.output
                     ))
                     .small()
                     .color(DIM),
                 );
             });
+            // Where the time went, once it went to more than the model.
+            let legs = flight.0.iter().filter(|(_, ms)| *ms >= 1000).count();
+            if legs > 1 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(flight.line()).small().color(DIM));
+                });
+            }
         }
         Entry::Image(path) => {
             ui.label(RichText::new(path).small().color(DIM));

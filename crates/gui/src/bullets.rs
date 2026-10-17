@@ -27,7 +27,7 @@ const ORBIT: f32 = 6.0;
 const LIGHT: Vec2 = vec2(-0.36, -0.42);
 
 /// A body's lit side and its dark one, by depth.
-const BODIES: [(Color32, Color32); 3] = [
+pub(crate) const BODIES: [(Color32, Color32); 3] = [
     (
         Color32::from_rgb(132, 196, 255),
         Color32::from_rgb(16, 36, 84),
@@ -79,20 +79,7 @@ pub(crate) fn shapes(style: Bullets, depth: usize, centre: Pos2, time: f32) -> V
         }
         Bullets::Planets => match depth % 3 {
             // A planet and its moon, which passes behind it and before it.
-            0 => {
-                let radius = 4.2;
-                let angle = time / ORBIT * TAU;
-                let moon = centre + orbit(radius * 1.7, radius * 0.6, -0.3, angle);
-                let behind = angle.sin() < 0.0;
-                if behind {
-                    sphere(&mut out, moon, 1.3, MOON);
-                }
-                sphere(&mut out, centre, radius, colours);
-                rim(&mut out, centre, radius, colours.0);
-                if !behind {
-                    sphere(&mut out, moon, 1.5, MOON);
-                }
-            }
+            0 => with_moon(&mut out, centre, 4.2, colours, time / ORBIT * TAU),
             // A ringed planet: the ring's far half behind it.
             1 => {
                 let radius = 3.6;
@@ -126,9 +113,36 @@ pub(crate) fn shapes(style: Bullets, depth: usize, centre: Pos2, time: f32) -> V
     out
 }
 
+/// A planet `radius` round with its moon `angle` along its orbit, which
+/// passes behind it and before it.
+pub(crate) fn with_moon(
+    out: &mut Vec<Shape>,
+    centre: Pos2,
+    radius: f32,
+    colours: (Color32, Color32),
+    angle: f32,
+) {
+    let moon = centre + orbit(radius * 1.7, radius * 0.6, -0.3, angle);
+    let behind = angle.sin() < 0.0;
+    let size = radius * if behind { 0.31 } else { 0.36 };
+    if behind {
+        sphere(out, moon, size, MOON);
+    }
+    sphere(out, centre, radius, colours);
+    rim(out, centre, radius, colours.0);
+    if !behind {
+        sphere(out, moon, size, MOON);
+    }
+}
+
 /// A sphere lit from [`LIGHT`]: discs ever smaller and brighter toward the
 /// light, and a glint.
-fn sphere(out: &mut Vec<Shape>, centre: Pos2, radius: f32, (lit, dark): (Color32, Color32)) {
+pub(crate) fn sphere(
+    out: &mut Vec<Shape>,
+    centre: Pos2,
+    radius: f32,
+    (lit, dark): (Color32, Color32),
+) {
     const STEPS: usize = 6;
     for i in 0..STEPS {
         let t = i as f32 / (STEPS - 1) as f32;
@@ -172,7 +186,7 @@ fn meridians(out: &mut Vec<Shape>, centre: Pos2, radius: f32, colour: Color32, p
 }
 
 /// A thin glow about a body, its air.
-fn rim(out: &mut Vec<Shape>, centre: Pos2, radius: f32, colour: Color32) {
+pub(crate) fn rim(out: &mut Vec<Shape>, centre: Pos2, radius: f32, colour: Color32) {
     out.push(Shape::circle_stroke(
         centre,
         radius + 0.5,
@@ -182,7 +196,7 @@ fn rim(out: &mut Vec<Shape>, centre: Pos2, radius: f32, colour: Color32) {
 
 /// Where on a tilted ellipse `angle` is, from its centre: `rx` across,
 /// `ry` deep, its near side down.
-fn orbit(rx: f32, ry: f32, tilt: f32, angle: f32) -> Vec2 {
+pub(crate) fn orbit(rx: f32, ry: f32, tilt: f32, angle: f32) -> Vec2 {
     let (x, y) = (rx * angle.cos(), ry * angle.sin());
     let (sin, cos) = tilt.sin_cos();
     vec2(x * cos - y * sin, x * sin + y * cos)

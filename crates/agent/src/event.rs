@@ -153,6 +153,13 @@ pub enum Event {
         /// Why it was refused, when the agent says.
         reason: String,
     },
+    /// A model's command starts: approved, or needing no approval.
+    Running {
+        /// The model.
+        model: ModelId,
+        /// The command.
+        command: String,
+    },
     /// A model ran a command.
     Command {
         /// The model.

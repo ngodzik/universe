@@ -26,6 +26,7 @@ mod error;
 mod fleet_view;
 mod infra;
 mod keys;
+mod orbits;
 mod plan;
 mod review_view;
 mod service_board;
@@ -78,6 +79,7 @@ use crate::plan::Plan;
 use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
 use crate::universe::{Assets3d, Universe};
 use crate::usage::UsageView;
+use universe_ui::flight::Leg;
 
 /// How the window's pixels blend with what is behind it. Metal offers only
 /// `Opaque` and `PostMultiplied`: asked for another, the surface cannot be
@@ -102,9 +104,6 @@ const BLINK: Duration = Duration::from_millis(530);
 /// How long it may sleep while a background moves: about twelve frames a
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
-
-/// The frames of the spinner.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The width of the usage pane, in points.
 const USAGE_WIDTH: f32 = 460.0;
@@ -1620,9 +1619,18 @@ fn activity(ui: &mut Ui, app: &App) {
         }
         return;
     };
+    let leg = app.leg();
+    let asking = leg == Some(Leg::Approvals);
     ui.horizontal(|ui| {
-        let glyph = SPINNER[app.spinner() % SPINNER.len()];
-        ui.label(RichText::new(format!("{glyph} Working…")).color(ACCENT));
+        orbits::working(ui);
+        let doing = match leg {
+            Some(Leg::Approvals) => "Waiting for you…",
+            Some(Leg::Tests) => "Running tests…",
+            Some(Leg::Commands) => "Running a command…",
+            Some(Leg::Checks) => "Checking…",
+            Some(Leg::Model) | None => "Working…",
+        };
+        ui.label(RichText::new(doing).color(if asking { YELLOW } else { ACCENT }));
         if let Some(step) = app.step() {
             ui.label(RichText::new(step.to_lowercase()).color(DIM));
         }
@@ -1633,12 +1641,19 @@ fn activity(ui: &mut Ui, app: &App) {
         if spent.usage.input.0 > 0 {
             ui.label(RichText::new(spent.to_string()).color(DIM));
         }
+        // The person's time is not the request's: its clock waits.
+        let paused = if asking { ", paused" } else { "" };
         ui.label(
-            RichText::new(format!("{}s · Ctrl-C to stop", elapsed.as_secs()))
+            RichText::new(format!("{}s{paused} · Ctrl-C to stop", elapsed.as_secs()))
                 .small()
                 .color(DIM),
         );
     });
+    if let Some((number, of)) = app.step_place() {
+        ui.add_space(2.0);
+        let width = ui.available_width().min(360.0);
+        orbits::steps(ui, number, of, width);
+    }
     ui.add_space(4.0);
 }
 
@@ -1810,6 +1825,7 @@ fn status(ui: &mut Ui, app: &App) {
             None => {}
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            cache_orbit(ui, app);
             let (usage, cost, complete) = app.totals();
             let budget = app
                 .budget()
@@ -1885,6 +1901,37 @@ fn status(ui: &mut Ui, app: &App) {
             });
         });
     });
+}
+
+/// The cache's orbit, at the end of the status line: how full the context
+/// is, and how much of the prompt cache's life is left, said on hover.
+fn cache_orbit(ui: &mut Ui, app: &App) {
+    let context = app.context();
+    let cache = app.cache_left(universe_ui::sessions::now());
+    if context.is_none() && cache.is_none() {
+        return;
+    }
+    let full = context
+        .filter(|c| c.window.0 > 0)
+        .map(|c| (c.used.0 as f32 / c.window.0 as f32).min(1.0));
+    let context_said = context.map_or_else(
+        || "Context: not known yet".to_owned(),
+        |c| format!("Context {}% full: {} of {}", c.percent(), c.used, c.window),
+    );
+    let minutes = |s: u64| s.div_ceil(60);
+    let cache_said = match cache {
+        Some((0, _)) => "Cache cold: the next request writes it again, at full price".to_owned(),
+        Some((left, life)) => format!(
+            "Cache: about {} min left of {}, as long as it is not read again",
+            minutes(left),
+            minutes(life)
+        ),
+        None => "No cache yet: it is written by the first request".to_owned(),
+    };
+    orbits::cache(ui, full, cache).on_hover_text(format!(
+        "{context_said}\n{cache_said}\nThe planet warms as the context fills; the comet goes \
+         round once over the cache's life"
+    ));
 }
 
 /// The file tree, the selected row kept in view.
