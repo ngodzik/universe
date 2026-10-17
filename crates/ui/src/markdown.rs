@@ -8,6 +8,8 @@
 //! (`snake_case`), a `*` between spaces (`2 * 3`), an image within a line,
 //! a marker never closed.
 
+use serde::{Deserialize, Serialize};
+
 /// A run of text in one style.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Span {
@@ -103,6 +105,84 @@ pub enum Block {
     },
     /// An empty line between blocks.
     Blank,
+}
+
+/// How a list's bullets are drawn, as `/bullets` sets it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bullets {
+    /// Small lit spheres that turn.
+    #[default]
+    #[serde(rename = "3d")]
+    Spheres,
+    /// Small planets, a ring or a moon about them.
+    Planets,
+    /// Characters, still.
+    Plain,
+}
+
+impl Bullets {
+    /// Its name, as `/bullets` takes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Spheres => "3d",
+            Self::Planets => "planets",
+            Self::Plain => "plain",
+        }
+    }
+
+    /// The one `/bullets` names.
+    ///
+    /// # Errors
+    ///
+    /// A sentence for the person naming the word not understood.
+    pub fn named(word: &str) -> Result<Self, String> {
+        match word.trim().to_lowercase().as_str() {
+            "3d" | "spheres" => Ok(Self::Spheres),
+            "planets" | "planet" => Ok(Self::Planets),
+            "plain" | "off" => Ok(Self::Plain),
+            other => Err(format!("Unknown bullets {other}: 3d, planets or plain")),
+        }
+    }
+
+    /// Whether they move: the window wakes for them while one is in view.
+    #[must_use]
+    pub fn moves(self) -> bool {
+        self != Self::Plain
+    }
+}
+
+/// The lead of an item that opens with one in bold, `**Name**: what`, and
+/// the rest, separator gone, for the lead to stand on its own line. `None`
+/// when the item does not open so, or holds nothing else.
+#[must_use]
+pub fn lead(spans: &[Span]) -> Option<(Span, Vec<Span>)> {
+    /// Longer, a bold opening is a sentence that insists, not a name.
+    const LONGEST: usize = 60;
+    let (first, rest) = spans.split_first()?;
+    let name = first.text.trim().trim_end_matches(':').trim_end();
+    if !first.bold || first.code || name.is_empty() || name.chars().count() > LONGEST {
+        return None;
+    }
+    let mut rest = rest.to_vec();
+    if let Some(next) = rest.first_mut() {
+        let trimmed = next.text.trim_start();
+        let trimmed = [":", "\u{2014}", "\u{2013}", "-"]
+            .iter()
+            .find_map(|mark| trimmed.strip_prefix(mark))
+            .unwrap_or(trimmed);
+        next.text = trimmed.trim_start().to_owned();
+    }
+    rest.retain(|span| !span.text.is_empty());
+    if rest.is_empty() {
+        return None;
+    }
+    let lead = Span {
+        text: name.to_owned(),
+        ..first.clone()
+    };
+    Some((lead, rest))
 }
 
 /// The blocks of `text`.
@@ -623,5 +703,43 @@ mod tests {
         assert_eq!(plain(&rows[1][0]), "b | c");
         assert!(rows[1][2].is_empty());
         assert!(matches!(&blocks[1], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn an_items_lead_in_bold_stands_apart_from_the_rest() {
+        let item = |text: &str| match &parse(text)[0] {
+            Block::Item { spans, .. } => spans.clone(),
+            other => panic!("an item: {other:?}"),
+        };
+        let (name, rest) = lead(&item("- **Sub-agents**: a member's work, *alone*")).unwrap();
+        assert_eq!(name.text, "Sub-agents");
+        assert!(name.bold);
+        assert_eq!(
+            styled(&rest),
+            [
+                ("a member's work, ".into(), "plain"),
+                ("alone".into(), "italic")
+            ]
+        );
+        let (name, rest) = lead(&item("- **Costs:** every line")).unwrap();
+        assert_eq!(
+            (name.text.as_str(), plain(&rest).as_str()),
+            ("Costs", "every line")
+        );
+        let (_, rest) = lead(&item("- **Costs** \u{2014} every line")).unwrap();
+        assert_eq!(plain(&rest), "every line");
+        // Bold alone, bold later, or a whole sentence in bold: as written.
+        assert!(lead(&item("- **Only this**")).is_none());
+        assert!(lead(&item("- a **word** in bold")).is_none());
+        assert!(lead(&item(&format!("- **{}** then", "long ".repeat(20)))).is_none());
+    }
+
+    #[test]
+    fn bullets_are_named_as_the_command_takes_them() {
+        for bullets in [Bullets::Spheres, Bullets::Planets, Bullets::Plain] {
+            assert_eq!(Bullets::named(bullets.name()), Ok(bullets));
+        }
+        assert!(Bullets::named("squares").is_err());
+        assert!(!Bullets::Plain.moves());
     }
 }

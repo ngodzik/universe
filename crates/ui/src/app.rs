@@ -168,6 +168,8 @@ pub struct Settings {
     pub cache_ttl: CacheTtl,
     /// The pattern behind the window's panels, and whether it moves.
     pub backdrop: crate::backdrop::Backdrop,
+    /// How a reply's bullets are drawn.
+    pub bullets: crate::markdown::Bullets,
     /// The folders a new conversation may work in, as written in the
     /// settings: kept there as written.
     pub workspaces: Vec<String>,
@@ -3431,6 +3433,16 @@ impl App {
                 Ok(said) => self.info(said),
                 Err(e) => self.error(e),
             },
+            Command::Bullets(None) => {
+                self.info(format!("Bullets: {}", self.settings.bullets.name()));
+            }
+            Command::Bullets(Some(word)) => match crate::markdown::Bullets::named(&word) {
+                Ok(bullets) => {
+                    self.settings.bullets = bullets;
+                    self.info(format!("Bullets: {}", bullets.name()));
+                }
+                Err(e) => self.error(e),
+            },
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -4773,6 +4785,8 @@ impl App {
             background: self.settings.backdrop.pattern,
             background_motion: (self.settings.backdrop.motion != crate::backdrop::Motion::Still)
                 .then_some(self.settings.backdrop.motion),
+            bullets: (self.settings.bullets != crate::markdown::Bullets::default())
+                .then_some(self.settings.bullets),
             // Set in the file only: kept as written there.
             workspaces: self.settings.workspaces.clone(),
             context_warning: self.settings.context_warning,
@@ -5055,6 +5069,11 @@ impl App {
     /// The pattern behind the window's panels, and whether it moves.
     pub fn backdrop(&self) -> crate::backdrop::Backdrop {
         self.settings.backdrop
+    }
+
+    /// How a reply's bullets are drawn.
+    pub fn bullets(&self) -> crate::markdown::Bullets {
+        self.settings.bullets
     }
 
     /// How large the window's text is: 1 at first.
@@ -7199,6 +7218,7 @@ mod tests {
                 cache_ttl: None,
                 background: None,
                 background_motion: None,
+                bullets: None,
                 workspaces: vec![],
                 context_warning: None,
                 summarize_when_cold: vec![],

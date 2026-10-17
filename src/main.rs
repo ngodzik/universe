@@ -460,6 +460,7 @@ async fn interface(
             pattern: defaults.background,
             motion: defaults.background_motion.unwrap_or_default(),
         },
+        bullets: defaults.bullets.unwrap_or_default(),
         provider: provider.name(),
         detect_checks,
         notes,

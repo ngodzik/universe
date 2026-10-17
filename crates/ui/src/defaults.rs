@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use universe_core::McpServer;
 
 use crate::backdrop::{Motion, Pattern};
+use crate::markdown::Bullets;
 use serde::{Deserialize, Serialize};
 
 /// What a new session starts with, unless the command line says otherwise.
@@ -118,6 +119,9 @@ pub struct Defaults {
     /// Whether it moves: still (unsaid) or slow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_motion: Option<Motion>,
+    /// How a reply's bullets are drawn: 3d (unsaid), planets or plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bullets: Option<Bullets>,
     /// The folders a new conversation may work in, `~` allowed: asked at
     /// the start, the first chosen. Set in the file only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -387,6 +391,7 @@ mod tests {
             cache_ttl: Some(CacheTtl::OneHour),
             background: Some(Pattern::Rain),
             background_motion: Some(Motion::Slow),
+            bullets: Some(Bullets::Planets),
             workspaces: vec!["~/code/shop".into()],
             context_warning: Some(90),
             summarize_when_cold: vec!["b/strong".into()],

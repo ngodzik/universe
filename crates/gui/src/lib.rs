@@ -17,6 +17,7 @@ mod api_view;
 mod arch_view;
 mod backdrop;
 mod branch_pane;
+mod bullets;
 mod database_view;
 mod diagrams;
 mod diff_view;
@@ -163,6 +164,7 @@ where
         relaunch: Arc::clone(&relaunch),
         diagrams,
         branch: branch_pane::BranchPane::default(),
+        bullets_moving: false,
         tickets: tickets_pane::TicketsPane::default(),
     };
 
@@ -280,6 +282,9 @@ struct Shell<M, D> {
     diagrams: diagrams::Diagrams,
     /// What the branch changed, as its pane shows it.
     branch: branch_pane::BranchPane,
+    /// Whether a moving bullet was in view when the window last drew: it
+    /// wakes then as a moving background does.
+    bullets_moving: bool,
     /// The branch's tickets, as their pane shows them.
     tickets: tickets_pane::TicketsPane,
 }
@@ -516,7 +521,8 @@ fn drive<M, D>(
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
-    let moving = backdrop.pattern.is_some() && backdrop.motion == Motion::Slow;
+    let moving =
+        backdrop.pattern.is_some() && backdrop.motion == Motion::Slow || shell.bullets_moving;
     let focused = if continuous {
         UpdateMode::Continuous
     } else if moving {
@@ -565,12 +571,21 @@ where
         // behind its back.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         *styled = true;
+        // The fonts set take effect on the next pass: text drawn in a
+        // family they add, bold, would find none now.
+        ctx.request_repaint();
+        return Ok(());
     }
     let size = shell.app.text_size();
     if (ctx.zoom_factor() - size).abs() > 0.001 {
         ctx.set_zoom_factor(size);
     }
     let shell = &mut *shell;
+    // Left by the last frame's bullets, and taken: only those drawn again
+    // keep the window awake.
+    shell.bullets_moving = ctx
+        .data_mut(|d| d.remove_temp::<bool>(Id::new(bullets::MOVING)))
+        .unwrap_or(false);
     // The conversation's diagrams, for the Markdown that draws them.
     ctx.data_mut(|d| d.insert_temp(Id::new("diagrams"), shell.diagrams.clone()));
     let mut root = Ui::new(

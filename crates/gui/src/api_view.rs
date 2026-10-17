@@ -22,7 +22,7 @@ use universe_ui::{App, Effect};
 use crate::plan::Plan;
 use crate::review_view::ReviewView;
 use crate::theme::{
-    self, ACCENT, CODE, DIM, EDGE, GREEN, LINK, MAGENTA, PANEL, RED, SELECTED, TEXT, YELLOW,
+    self, ACCENT, CODE, DIM, EDGE, GREEN, LINK, MAGENTA, PANEL, RED, SELECTED, TEXT, YELLOW, mix,
 };
 
 /// The methods to filter by, in the order shown.
@@ -1097,15 +1097,6 @@ fn link(painter: &egui::Painter, a: Pos2, b: Pos2, colour: Color32, width: f32) 
             Stroke::new(w, colour.gamma_multiply(alpha)),
         ));
     }
-}
-
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
-    Color32::from_rgb(
-        channel(a.r(), b.r()),
-        channel(a.g(), b.g()),
-        channel(a.b(), b.b()),
-    )
 }
 
 fn file_name(path: &str) -> &str {
