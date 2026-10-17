@@ -151,6 +151,8 @@ pub struct Host<M, D> {
     awake: crate::awake::Awake,
     /// The rules kept outside the project's repository, from their copies.
     rules: crate::outside_rules::OutsideRules,
+    /// The project's files of instructions, for agents to be told of.
+    guides: crate::guides::Guides,
 }
 
 impl<M, D> Host<M, D>
@@ -183,6 +185,7 @@ where
             servers: Arc::new(Servers::new(workspace_root)),
             awake: crate::awake::Awake::default(),
             rules: crate::outside_rules::OutsideRules::default(),
+            guides: crate::guides::Guides::default(),
         }
     }
 
@@ -203,6 +206,8 @@ where
             app.external_tools(),
         );
         self.rules.refresh_due();
+        // Listed in the background, for the first request to an agent.
+        self.guides.get(self.workspace.root());
         let state = self
             .store
             .as_ref()
@@ -477,6 +482,7 @@ where
             docker_asking,
             servers,
             rules,
+            guides,
             ..
         } = self;
         let store = store.as_ref();
@@ -490,7 +496,9 @@ where
             .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
-                let config = asking(config, app.root(), tx).with_outside_rules(rules.text());
+                let config = asking(config, app.root(), tx)
+                    .with_outside_rules(rules.text())
+                    .with_folder_guides(guides.get(workspace.root()));
                 rules.refresh_due();
                 *task = Some(spawn_agent(
                     Arc::clone(model),
@@ -506,7 +514,9 @@ where
                 config,
                 investigator,
             } => {
-                let config = asking(config, app.root(), tx).with_outside_rules(rules.text());
+                let config = asking(config, app.root(), tx)
+                    .with_outside_rules(rules.text())
+                    .with_folder_guides(guides.get(workspace.root()));
                 rules.refresh_due();
                 let (model, delegate, conversation, tx) = (
                     Arc::clone(model),

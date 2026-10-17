@@ -19,6 +19,7 @@ mod command;
 pub mod defaults;
 pub mod diagrams;
 pub mod editor;
+mod guides;
 mod highlight;
 mod host;
 pub mod input;

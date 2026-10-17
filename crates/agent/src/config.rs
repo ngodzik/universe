@@ -24,6 +24,7 @@ pub struct AgentConfig {
     pub(crate) instructions: Option<String>,
     pub(crate) project_rules: Option<String>,
     pub(crate) outside_rules: Option<String>,
+    pub(crate) folder_guides: Vec<String>,
     pub(crate) approver: Option<Approver>,
     pub(crate) allowed_secrets: Vec<String>,
     pub(crate) strict_commands: bool,
@@ -254,6 +255,14 @@ impl AgentConfig {
         self
     }
 
+    /// The project's files of instructions for coding agents, the root's
+    /// and its folders', from the root: an agent is told where they are, as
+    /// it reads the repository itself.
+    pub fn with_folder_guides(mut self, guides: Vec<String>) -> Self {
+        self.folder_guides = guides;
+        self
+    }
+
     /// The person's own instructions for every model, read again before each
     /// request so that an edit counts at once; `None` or blank adds none.
     pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
@@ -464,6 +473,7 @@ impl AgentConfigBuilder {
             instructions: self.instructions,
             project_rules: self.project_rules,
             outside_rules: None,
+            folder_guides: Vec::new(),
         })
     }
 }
