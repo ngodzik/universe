@@ -387,7 +387,21 @@ where
                 None
             }
             Incoming::PullCheckedOut(checked) => {
-                app.pull_checked_out(checked);
+                // Its conversation: one saved earlier for it, resumed, else
+                // a new one.
+                if let Some(number) = app.pull_checked_out(checked) {
+                    let saved = self.store.as_ref().and_then(|store| {
+                        store
+                            .list()
+                            .into_iter()
+                            .find(|s| s.pull.as_ref().is_some_and(|p| p.number == number))
+                    });
+                    let chat = app.open_chat();
+                    if let Some(saved) = saved {
+                        self.resume_into(app, chat, &saved.id).await;
+                    }
+                    app.bind_to_pull(number);
+                }
                 None
             }
             Incoming::Spin => {
@@ -553,6 +567,10 @@ where
             .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
+                if let Err(e) = work_in(conversation, app.chat_folder(), workspace).await {
+                    app.report_error(e);
+                    return;
+                }
                 let config = asking(config, app.root(), tx)
                     .with_outside_rules(rules.text())
                     .with_folder_guides(guides.get(workspace.root()));
@@ -1290,6 +1308,23 @@ async fn check_progress<M: ChatModel>(
     .await?;
     let verdicts = crate::tickets::parse_verdicts(&answer)?;
     Ok(crate::tickets::progress(tickets, &marked, &verdicts))
+}
+
+/// Puts `conversation`'s tools in `folder`, the copy of a pull request it
+/// reviews, else back in the project's `workspace`, when they are not.
+async fn work_in(
+    conversation: &Arc<Mutex<Conversation>>,
+    folder: Option<std::path::PathBuf>,
+    workspace: &Workspace,
+) -> Result<(), String> {
+    let mut conversation = conversation.lock().await;
+    let wanted = folder.unwrap_or_else(|| workspace.root().to_owned());
+    if conversation.toolbox.workspace().root() != wanted {
+        let elsewhere = Workspace::new(&wanted)
+            .map_err(|e| format!("{} cannot be worked in: {e}", wanted.display()))?;
+        conversation.toolbox = Toolbox::new(elsewhere);
+    }
+    Ok(())
 }
 
 /// Where the quotas the agents reported are kept, beside the settings.

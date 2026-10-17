@@ -935,6 +935,8 @@ pub(crate) struct Chat {
     runs: Vec<(ModelId, Spent)>,
     session_id: String,
     session_name: Option<String>,
+    /// The pull request it reviews, when it is a review's.
+    pull: Option<crate::sessions::PullBinding>,
     created: u64,
     requests: usize,
     /// Replies unfolded by the person, by transcript index. Long replies are
@@ -972,6 +974,7 @@ impl Chat {
     fn new(id: ChatId, transcript: Vec<Entry>) -> Self {
         Self {
             id,
+            pull: None,
             usage_log: UsageLog::default(),
             approval: None,
             compact_picker: None,
@@ -1032,6 +1035,9 @@ pub struct App {
     picked: Option<(String, usize, usize)>,
     /// What a model said of the pull request reviewed, once said.
     summaries: Option<crate::pull_review::Summaries>,
+    /// The conversation shown before a pull request's review took the
+    /// window, shown again when it ends.
+    review_from: Option<ChatId>,
     /// The head commit summaries were asked for, so that they are asked
     /// once.
     summaries_asked: Option<String>,
@@ -1206,6 +1212,7 @@ impl App {
             picked: None,
             summaries: None,
             summaries_asked: None,
+            review_from: None,
             branch: None,
             tickets_open: false,
             tickets_branch: None,
@@ -1621,29 +1628,23 @@ impl App {
     }
 
     /// A pull request checked out for review, or why it could not be: its
-    /// files are read in its copy from now on.
-    pub fn pull_checked_out(&mut self, checked: Result<universe_tools::CheckedOut, String>) {
+    /// files are read in its copy from now on, and it is reviewed in a
+    /// conversation of its own. Returns its number when that conversation
+    /// is not open, for the loop to resume a saved one or to open one.
+    pub fn pull_checked_out(
+        &mut self,
+        checked: Result<universe_tools::CheckedOut, String>,
+    ) -> Option<u64> {
         let changes = match checked.and_then(crate::changes::ChangeSet::of_pull) {
             Ok(changes) => changes,
             Err(e) => {
                 self.error(e);
-                return;
+                return None;
             }
         };
-        let Some(pull) = changes.pull.clone() else {
-            return;
-        };
+        let pull = changes.pull.clone()?;
         let (added, removed) = changes.lines();
         let count = changes.files.len();
-        self.info(format!(
-            "Reviewing #{} by {}: {}. {count} file{} changed, +{added} −{removed}, read in a copy \
-             of its own: the project's branch and files are left as they are. Nothing can be \
-             edited; /review off ends it",
-            pull.number,
-            pull.author,
-            pull.title,
-            if count == 1 { "" } else { "s" },
-        ));
         self.walk_model = None;
         self.walk_asking = false;
         self.changes = Some(changes);
@@ -1651,6 +1652,107 @@ impl App {
         self.unzoom();
         self.tree = Some(self.new_tree());
         self.focus_on(Focus::Tree);
+        // Its own conversation, the one shown before kept to come back to.
+        let bound = |chat: &Chat| chat.pull.as_ref().is_some_and(|p| p.number == pull.number);
+        if !bound(&self.chat) && self.chat.pull.is_none() {
+            self.review_from = Some(self.chat.id);
+        }
+        let open = if bound(&self.chat) {
+            Some(self.chat.id)
+        } else {
+            self.others.iter().find(|c| bound(c)).map(|c| c.id)
+        };
+        if let Some(id) = open {
+            self.show_chat(id);
+        }
+        self.info(format!(
+            "Reviewing #{} by {}: {}. {count} file{} changed, +{added} −{removed}, read in a copy \
+             of its own: the project's branch and files are left as they are. Nothing can be \
+             edited, and requests here only read; /review off ends it",
+            pull.number,
+            pull.author,
+            pull.title,
+            if count == 1 { "" } else { "s" },
+        ));
+        open.is_none().then_some(pull.number)
+    }
+
+    /// Binds the conversation shown to pull request `number`, when it is
+    /// bound to none: the one just opened or resumed for its review.
+    pub fn bind_to_pull(&mut self, number: u64) {
+        if self.chat.pull.is_none() {
+            self.chat.pull = Some(crate::sessions::PullBinding { number, read: None });
+        }
+    }
+
+    /// The folder the conversation shown works in, when it is not the
+    /// project's: the copy of the pull request it reviews.
+    pub fn chat_folder(&self) -> Option<PathBuf> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.as_ref()?;
+        let bound = self.chat.pull.as_ref()?;
+        (bound.number == pull.number).then(|| changes.root.clone())
+    }
+
+    /// The pull request the conversation shown reviews now: it, its copy,
+    /// and where its branch left the one it would be merged into.
+    fn reviewed(&self) -> Option<(universe_tools::PullRequest, PathBuf, String)> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.clone()?;
+        let bound = self.chat.pull.as_ref()?;
+        (bound.number == pull.number).then(|| (pull, changes.root.clone(), changes.base.clone()))
+    }
+
+    /// `text` with what the model must know of the pull request reviewed:
+    /// its title, description, files and diff on the first request; a
+    /// reminder after; what new commits changed when there are some.
+    fn with_pull(&mut self, text: String) -> String {
+        const DIFF_BYTES: usize = 60_000;
+        let Some((pull, copy, base)) = self.reviewed() else {
+            return text;
+        };
+        let read = self.chat.pull.as_ref().and_then(|p| p.read.clone());
+        let context = match read.as_deref() {
+            None => {
+                let files: Vec<String> = self
+                    .changes
+                    .as_ref()
+                    .map(|c| c.files.iter().map(|f| f.path.clone()).collect())
+                    .unwrap_or_default();
+                let diff = universe_tools::diff_between(&copy, &base, &pull.head, DIFF_BYTES)
+                    .unwrap_or_default();
+                format!(
+                    "You are reviewing pull request #{} \"{}\" by {} ({}), read only, in a copy \
+                     of its own checked out at its head; the project's own files are not \
+                     changed.\n\nIts description:\n{}\n\nIts files: {}\n\nIts diff:\n```diff\n{}\n```",
+                    pull.number,
+                    pull.title,
+                    pull.author,
+                    pull.url,
+                    pull.body.trim(),
+                    files.join(", "),
+                    diff.trim_end()
+                )
+            }
+            Some(read) if read == pull.head => format!(
+                "(Still reviewing #{}, read only, in its copy.)",
+                pull.number
+            ),
+            Some(read) => {
+                let diff = universe_tools::diff_between(&copy, read, &pull.head, DIFF_BYTES)
+                    .unwrap_or_default();
+                format!(
+                    "#{} has new commits since you last read it; what they changed:\n```diff\n{}\n```",
+                    pull.number,
+                    diff.trim_end()
+                )
+            }
+        };
+        if let Some(binding) = &mut self.chat.pull {
+            binding.read = Some(pull.head.clone());
+        }
+        let (context, _) = universe_tools::redact_secrets(&context);
+        format!("{context}\n\n{text}")
     }
 
     /// Starts looking at the branch's changes through `lens`, against
@@ -1671,9 +1773,16 @@ impl App {
         if argument.as_deref() == Some("off") {
             self.walk_model = None;
             self.walk_asking = false;
-            // A file open in a pull request's copy closes with it.
+            // A file open in a pull request's copy closes with it, and the
+            // conversation shown before comes back, the review's closed.
             if self.changes.as_ref().is_some_and(|c| c.pull.is_some()) {
                 self.file = None;
+                if let Some(from) = self.review_from.take() {
+                    let review = self.chat.id;
+                    if review != from && self.show_chat(from) {
+                        let _ = self.close_chat(review);
+                    }
+                }
             }
             if self.changes.take().is_some() {
                 self.tree = self.tree.take().map(|_| self.new_tree());
@@ -2832,13 +2941,16 @@ impl App {
             ));
             return None;
         }
+        // A pull request's review only reads, in its copy: no checks, no
+        // pair.
+        let reviewing = self.reviewed().is_some();
         let mut builder = AgentConfig::builder()
             .rounds_per_tier(self.settings.rounds)
             .max_turns(self.settings.max_turns);
         for tier in &tiers {
             builder = builder.tier(tier.clone());
         }
-        for check in &self.settings.checks {
+        for check in self.settings.checks.iter().filter(|_| !reviewing) {
             builder = builder.check(check.clone());
         }
         for member in self.members() {
@@ -2849,14 +2961,14 @@ impl App {
         }
         builder = builder
             .effort(Some(self.settings.effort))
-            .detect_checks(self.settings.detect_checks)
+            .detect_checks(self.settings.detect_checks && !reviewing)
             .context_warning(
                 self.settings
                     .context_warning
                     .unwrap_or(universe_agent::CONTEXT_WARNING),
             );
         let allowed = self.settings.allowed_secrets.clone();
-        if let Some(pair) = pair {
+        if let Some(pair) = pair.filter(|_| !reviewing) {
             builder = builder.pair(pair);
         }
         match builder.build() {
@@ -2873,7 +2985,8 @@ impl App {
                             .collect(),
                     )
                     .with_external_tools(self.settings.external.clone())
-                    .with_strict_commands(self.settings.strict_commands);
+                    .with_strict_commands(self.settings.strict_commands)
+                    .with_reading_only(reviewing);
                 self.input.take();
                 // Lines picked in the diff go with the message, quoted.
                 let text = match self.picked.take() {
@@ -2905,6 +3018,7 @@ impl App {
                         text
                     }
                 };
+                let text = self.with_pull(text);
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.chat.sub_view = None;
@@ -3579,6 +3693,7 @@ impl App {
             transcript: self.chat.transcript.clone(),
             session,
             usage_log: self.chat.usage_log.clone(),
+            pull: self.chat.pull.clone(),
         })
     }
 
@@ -3592,6 +3707,7 @@ impl App {
         self.chat.cost = saved.cost;
         self.chat.cost_complete = saved.cost_complete;
         self.chat.transcript = saved.transcript;
+        self.chat.pull = saved.pull;
         self.learn_all_commits();
         self.chat.usage_log = saved.usage_log;
         self.chat.usage_log.prune(sessions::now());
@@ -6249,6 +6365,8 @@ mod tests {
         let mut app = App::new(
             Settings {
                 tiers: vec![ModelId::new("cheap").unwrap()],
+                rounds: 2,
+                max_turns: 30,
                 ..Settings::default()
             },
             project.path().to_owned(),
@@ -6258,11 +6376,12 @@ mod tests {
             app.run_command("review https://github.com/o/r/pull/5"),
             Some(Effect::FetchPull { number: 5 })
         ));
-        app.pull_checked_out(Ok(universe_tools::CheckedOut {
+        let before = app.chat_id();
+        let checked = universe_tools::CheckedOut {
             pull: universe_tools::PullRequest {
                 number: 5,
                 title: "Two".into(),
-                body: String::new(),
+                body: "Adds a line.".into(),
                 author: "someone".into(),
                 url: String::new(),
                 base: "main".into(),
@@ -6270,7 +6389,76 @@ mod tests {
             },
             copy: copy.path().to_owned(),
             merge_base: base,
-        }));
+        };
+        // No conversation of its own yet: the loop opens one, or resumes a
+        // saved one, and binds it.
+        assert_eq!(app.pull_checked_out(Ok(checked.clone())), Some(5));
+        app.open_chat();
+        app.bind_to_pull(5);
+        assert_eq!(app.chat_folder().as_deref(), Some(copy.path()));
+        // Its first request reads the pull request whole; the next is
+        // reminded only.
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "is it sound?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert!(text.starts_with("You are reviewing pull request #5 \"Two\" by someone"));
+        assert!(text.contains("Adds a line.") && text.contains("+two"));
+        assert!(text.ends_with("is it sound?"));
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "and the tests?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert_eq!(
+            text,
+            "(Still reviewing #5, read only, in its copy.)\n\nand the tests?"
+        );
+        // New commits since it last read: what they changed, not all again.
+        let first = app.change_set().unwrap().base.clone();
+        if let Some(binding) = &mut app.chat.pull {
+            binding.read = Some(first);
+        }
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "and now?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert!(text.starts_with("#5 has new commits since you last read it"));
+        assert!(text.contains("+two") && text.ends_with("and now?"));
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        // Reviewed again: its conversation is the one shown.
+        let review = app.chat_id();
+        app.show_chat(before);
+        assert_eq!(app.pull_checked_out(Ok(checked)), None);
+        assert_eq!(app.chat_id(), review);
         let changes = app.change_set().unwrap();
         assert_eq!(changes.root, copy.path());
         assert_eq!(changes.files[0].path, "a.py");
@@ -6279,10 +6467,14 @@ mod tests {
         let file = app.file().unwrap();
         assert_eq!(file.path(), Path::new("a.py"));
         assert_eq!(file.lines(), ["one", "two"]);
-        // Done: the project again, the copy's file closed.
+        // Done: the project again, the copy's file closed, the conversation
+        // shown before back and the review's closed, its file kept.
         app.run_command("review off");
         assert!(app.change_set().is_none());
         assert!(app.file().is_none());
+        assert_eq!(app.chat_id(), before);
+        assert!(!app.chat_ids().contains(&review));
+        assert_eq!(app.chat_folder(), None);
         // A pull request that could not be fetched says why.
         app.pull_checked_out(Err("gh could not read #9".into()));
         assert!(matches!(app.chat.transcript.last(), Some(Entry::Error(e)) if e.contains("#9")));
@@ -6693,6 +6885,7 @@ mod tests {
             requests: 1,
             cost: Usd(0.0),
             project: PathBuf::from("/p"),
+            pull: None,
         };
         app.show_picker(vec![item("a"), item("b")]);
         press(&mut app, KeyCode::Down);

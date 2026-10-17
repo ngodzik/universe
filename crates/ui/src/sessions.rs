@@ -37,6 +37,21 @@ pub struct Saved {
     /// The calls of the last day, for the usage pane.
     #[serde(default)]
     pub(crate) usage_log: UsageLog,
+    /// The pull request it reviews, when it is a review's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pull: Option<PullBinding>,
+}
+
+/// The pull request a conversation reviews, kept with it: reviewing it again
+/// later resumes that conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullBinding {
+    /// Its number.
+    pub number: u64,
+    /// The head commit the conversation last read, for the next request to
+    /// be told what changed since.
+    #[serde(default)]
+    pub read: Option<String>,
 }
 
 /// What the resume list shows of a conversation. Read from the same file:
@@ -56,6 +71,9 @@ pub struct Summary {
     /// The project it belongs to.
     #[serde(default)]
     pub project: PathBuf,
+    /// The pull request it reviews, when it is a review's.
+    #[serde(default)]
+    pub pull: Option<PullBinding>,
 }
 
 /// universe's own folder, as the rest of it finds it.
@@ -323,6 +341,7 @@ mod tests {
             transcript: vec![Entry::User("hello".into())],
             session: Session::new(),
             usage_log: UsageLog::default(),
+            pull: None,
         }
     }
 

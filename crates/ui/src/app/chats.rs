@@ -124,7 +124,7 @@ impl App {
 
     /// Closes a conversation not shown, when no request runs in it; its
     /// file stays, to resume it later.
-    fn close_chat(&mut self, id: ChatId) -> Result<(), &'static str> {
+    pub(super) fn close_chat(&mut self, id: ChatId) -> Result<(), &'static str> {
         if id == self.chat.id {
             return Err("The conversation shown cannot be closed: show another one first");
         }
@@ -471,6 +471,7 @@ mod tests {
             requests: 2,
             cost: universe_core::Usd(0.0),
             project: project.to_owned(),
+            pull: None,
         };
         assert!(matches!(
             run(&mut app, "/chats"),

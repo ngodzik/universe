@@ -112,6 +112,23 @@ pub fn review_folder(root: &Path, reviews: &Path, number: u64) -> PathBuf {
         .join(format!("pr-{number}"))
 }
 
+/// The diff from `from` to `to` in the repository at `dir`, unified with
+/// three lines around each change, at most `limit` bytes, said so when cut;
+/// `None` when git cannot tell.
+#[must_use]
+pub fn diff_between(dir: &Path, from: &str, to: &str, limit: usize) -> Option<String> {
+    let mut diff = git(dir, &["diff", "--no-color", "-U3", from, to])?;
+    if diff.len() > limit {
+        let end = (0..=limit)
+            .rev()
+            .find(|i| diff.is_char_boundary(*i))
+            .unwrap_or(0);
+        diff.truncate(end);
+        diff.push_str("\n(the rest of the diff was left out: too long)\n");
+    }
+    Some(diff)
+}
+
 /// FNV-1a, 64 bits: a name that stays the same across Rust releases, which
 /// `DefaultHasher` does not promise.
 #[must_use]

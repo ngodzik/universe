@@ -48,7 +48,9 @@ pub use gitview::{
 pub use lsp::{Location, LspError, Servers};
 pub use outline::project_map;
 pub use picture::Picture;
-pub use pulls::{CheckedOut, PullRequest, check_out_pull, pull_number, review_folder, stable_hash};
+pub use pulls::{
+    CheckedOut, PullRequest, check_out_pull, diff_between, pull_number, review_folder, stable_hash,
+};
 pub use rules::{folder_guides, folder_instructions, project_instructions};
 pub use snapshot::Snapshot;
 pub use sources::open_source;
