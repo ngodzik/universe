@@ -22,6 +22,7 @@ use universe_tools::Hunk;
 /// server = "issues"
 /// issue = "get_issue"
 /// comments = "list_comments"
+/// comments_argument = "issueId"
 /// ids = "[A-Z][A-Z0-9]+-[0-9]+"
 /// hosts = ["issues.example.com"]
 /// ```
@@ -38,6 +39,10 @@ pub struct Tracker {
     /// The argument both tools take the ticket's id in.
     #[serde(default = "id_argument")]
     pub argument: String,
+    /// The one its comments tool takes it in, when not the same: `issueId`
+    /// where the issue's tool takes `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_argument: Option<String>,
     /// What its ids look like, as a regular expression.
     pub ids: String,
     /// The hosts of its links: a link to one names one of its tickets.
@@ -112,6 +117,14 @@ pub struct Ticket {
     pub items: Vec<String>,
 }
 
+impl Tracker {
+    /// The argument the comments tool takes the ticket's id in.
+    #[must_use]
+    pub fn comments_argument(&self) -> &str {
+        self.comments_argument.as_deref().unwrap_or(&self.argument)
+    }
+}
+
 /// What a check found of one item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ItemProgress {
@@ -134,6 +147,9 @@ pub struct FileProgress {
     pub items: Vec<(usize, usize)>,
     /// Its changed lines that serve no item.
     pub unattached: usize,
+    /// Whether some of it is common to several items.
+    #[serde(default)]
+    pub common: bool,
     /// Its changed lines.
     pub lines: usize,
     /// Whether it is generated: set apart, never sent.
@@ -145,6 +161,10 @@ pub struct FileProgress {
 pub struct Progress {
     /// For each ticket, for each item.
     pub items: Vec<Vec<Option<ItemProgress>>>,
+    /// What several items need alike, given to none of them: shared code,
+    /// a type, a migration they rely on. Never done or not.
+    #[serde(default)]
+    pub common: Option<ItemProgress>,
     /// The pieces of the diff, as they were numbered.
     pub hunks: Vec<HunkRef>,
     /// Every changed file.
@@ -232,7 +252,7 @@ const LOCK_FILES: [&str; 11] = [
 #[must_use]
 pub fn generated(path: &str, head: &str, package_init: Option<&str>, attributes: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
-    if name.contains("openapi") || name.contains("swagger") {
+    if is_spec(path) {
         return false;
     }
     if LOCK_FILES.iter().any(|l| l.eq_ignore_ascii_case(&name)) {
@@ -266,6 +286,14 @@ pub fn generated(path: &str, head: &str, package_init: Option<&str>, attributes:
     })
 }
 
+/// Whether the file at `path` is an OpenAPI spec, by its name: the API's
+/// contract, whose pieces belong to the item whose endpoint they describe.
+#[must_use]
+pub fn is_spec(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    name.contains("openapi") || name.contains("swagger")
+}
+
 /// Whether `path` matches a `.gitattributes` pattern: `*` within a name,
 /// `**` across folders, a pattern without `/` matching a name anywhere.
 fn glob(pattern: &str, path: &str) -> bool {
@@ -290,6 +318,9 @@ fn glob(pattern: &str, path: &str) -> bool {
 /// serve it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
+    /// Whether it is the common point's, what several items need alike,
+    /// rather than an item's: then `ticket`, `item` and `done` say nothing.
+    pub common: bool,
     /// The ticket, from 0.
     pub ticket: usize,
     /// The item, from 0.
@@ -325,7 +356,8 @@ pub fn parse_items(answer: &str) -> Vec<String> {
 }
 
 /// What a model judged: a JSON array of objects with `ticket`, `item`,
-/// `done`, `why` and `hunks`, each hunk `3` or `"H3"`.
+/// `done`, `why` and `hunks`, each hunk `3` or `"H3"`; and the common
+/// point's, `common` true with `why` and `hunks`.
 ///
 /// # Errors
 ///
@@ -343,9 +375,15 @@ pub fn parse_verdicts(answer: &str) -> Result<Vec<Verdict>, String> {
     Ok(values
         .iter()
         .filter_map(|v| {
+            let common = v["common"].as_bool() == Some(true);
             Some(Verdict {
+                common,
                 ticket: number(&v["ticket"]).unwrap_or(1).saturating_sub(1),
-                item: number(&v["item"])?.saturating_sub(1),
+                item: if common {
+                    0
+                } else {
+                    number(&v["item"])?.saturating_sub(1)
+                },
                 done: v["done"].as_bool().unwrap_or(false),
                 why: v["why"].as_str().unwrap_or("").to_owned(),
                 hunks: v["hunks"]
@@ -369,81 +407,114 @@ fn strip_fence(text: &str) -> &str {
     text.strip_suffix("```").unwrap_or(text).trim()
 }
 
-/// What a check found, counted: each item's share of the changed lines (a
-/// piece serving several items split between them), the files with the
-/// items they serve and what in them serves none, the generated code apart.
-/// The shares of items, of lines serving none and of generated code add up
-/// to 1.
+/// What a check found, counted: each piece of the diff given to one item,
+/// or to the common point when the judge put it there or several items
+/// claim it; each item's share of the changed lines; the files with the
+/// items they serve and what in them serves none; the generated code
+/// apart. The shares of the items, of the common point, of the lines that
+/// serve none and of generated code add up to 1.
 #[must_use]
 pub fn progress(tickets: &[Ticket], hunks: &[(Hunk, bool)], verdicts: &[Verdict]) -> Progress {
     let total: usize = hunks.iter().map(|(h, _)| h.lines()).sum();
     let total = total.max(1) as f64;
     let mut items: Vec<Vec<Option<ItemProgress>>> =
         tickets.iter().map(|t| vec![None; t.items.len()]).collect();
-    // Who each piece serves, numbered from 1 as shown; generated pieces are
-    // never shown.
+    // The pieces as numbered from 1 when shown; generated pieces never are.
     let shown: Vec<usize> = (0..hunks.len()).filter(|i| !hunks[*i].1).collect();
-    let mut serves: Vec<Vec<(usize, usize)>> = vec![Vec::new(); hunks.len()];
+    let pieces_of = |verdict: &Verdict| -> Vec<usize> {
+        verdict
+            .hunks
+            .iter()
+            .filter_map(|n| shown.get(n.wrapping_sub(1)).copied())
+            .collect()
+    };
+    let mut claims: Vec<Vec<(usize, usize)>> = vec![Vec::new(); hunks.len()];
+    let mut common_pieces: BTreeSet<usize> = BTreeSet::new();
+    let mut common_why = String::new();
     for verdict in verdicts {
+        let pieces = pieces_of(verdict);
+        if verdict.common {
+            common_pieces.extend(pieces);
+            if common_why.is_empty() {
+                common_why.clone_from(&verdict.why);
+            }
+            continue;
+        }
         let Some(slot) = items
             .get_mut(verdict.ticket)
             .and_then(|t| t.get_mut(verdict.item))
         else {
             continue;
         };
-        let pieces: Vec<usize> = verdict
-            .hunks
-            .iter()
-            .filter_map(|n| shown.get(n.wrapping_sub(1)).copied())
-            .collect();
-        for piece in &pieces {
-            if !serves[*piece].contains(&(verdict.ticket, verdict.item)) {
-                serves[*piece].push((verdict.ticket, verdict.item));
+        for piece in pieces {
+            if !claims[piece].contains(&(verdict.ticket, verdict.item)) {
+                claims[piece].push((verdict.ticket, verdict.item));
             }
         }
         *slot = Some(ItemProgress {
             done: verdict.done,
             why: verdict.why.clone(),
-            hunks: pieces,
+            hunks: Vec::new(),
             share: 0.0,
         });
     }
+    // One item per piece: what several claim is common to them.
+    for (piece, claimed) in claims.iter_mut().enumerate() {
+        if claimed.len() > 1 || (!claimed.is_empty() && common_pieces.contains(&piece)) {
+            common_pieces.insert(piece);
+            claimed.clear();
+        }
+    }
+    let mut common = (!common_pieces.is_empty()).then(|| ItemProgress {
+        done: false,
+        why: common_why,
+        hunks: common_pieces.iter().copied().collect(),
+        share: 0.0,
+    });
     let mut unattached = 0.0;
     let mut generated = 0.0;
     let mut files: BTreeMap<String, FileProgress> = BTreeMap::new();
     for (i, (hunk, is_generated)) in hunks.iter().enumerate() {
         let lines = hunk.lines();
+        let share = lines as f64 / total;
         let file = files
             .entry(hunk.path.clone())
             .or_insert_with(|| FileProgress {
                 path: hunk.path.clone(),
                 items: Vec::new(),
                 unattached: 0,
+                common: false,
                 lines: 0,
                 generated: *is_generated,
             });
         file.lines += lines;
         if *is_generated {
-            generated += lines as f64 / total;
+            generated += share;
             continue;
         }
-        if serves[i].is_empty() {
-            unattached += lines as f64 / total;
+        if common_pieces.contains(&i) {
+            if let Some(common) = &mut common {
+                common.share += share;
+            }
+            file.common = true;
+            continue;
+        }
+        let Some(&(ticket, item)) = claims[i].first() else {
+            unattached += share;
             file.unattached += lines;
             continue;
+        };
+        if let Some(Some(progress)) = items.get_mut(ticket).and_then(|t| t.get_mut(item)) {
+            progress.share += share;
+            progress.hunks.push(i);
         }
-        let each = lines as f64 / total / serves[i].len() as f64;
-        for (ticket, item) in &serves[i] {
-            if let Some(Some(progress)) = items.get_mut(*ticket).and_then(|t| t.get_mut(*item)) {
-                progress.share += each;
-            }
-            if !file.items.contains(&(*ticket, *item)) {
-                file.items.push((*ticket, *item));
-            }
+        if !file.items.contains(&(ticket, item)) {
+            file.items.push((ticket, item));
         }
     }
     Progress {
         items,
+        common,
         hunks: hunks
             .iter()
             .map(|(h, g)| HunkRef {
@@ -467,20 +538,26 @@ pub fn progress(tickets: &[Ticket], hunks: &[(Hunk, bool)], verdicts: &[Verdict]
 
 /// What the model that lists a ticket's work is told.
 pub const ITEMS_PROMPT: &str = "You read a ticket of a software project, with its comments, and \
-list the work it asks for as short checkable items, each a few words a developer can tick: what \
-must be built or changed, not how. Leave out what the comments settled as not to do. Answer with \
-a JSON array of strings only.";
+group the work it asks for into a few checkable items, six at most, each a part a developer can \
+tick as a whole: what must be built or changed, not how, in a few words. Leave out what the \
+comments settled as not to do. Answer with a JSON array of strings only.";
 
 /// What the judge of the work is told.
 pub const JUDGE_PROMPT: &str = "You judge how far a branch's work is against the items of its \
 tickets. You get the tickets with their numbered items, notes of what was verified elsewhere, \
-and the branch's diff cut into numbered pieces (H1, H2...). For each item, say whether it is \
-done, why in one short line, and which pieces serve it (a piece may serve several items, or \
-none). Answer with a JSON array only, one object per item: {\"ticket\": 1, \"item\": 1, \
-\"done\": true, \"why\": \"...\", \"hunks\": [3, 5]}.";
+the generated files the branch changed, named only, and its diff cut into numbered pieces (H1, \
+H2...). For each item, say whether it is done, why in one short line, and which pieces serve \
+it. Give each piece to one item only, the one it serves most directly. A piece several items \
+need alike (shared code, a common type, a migration they all rely on) goes to the common point \
+instead, and a piece that serves no item to none. A piece of an OpenAPI spec belongs to the \
+item whose endpoint or schema it describes; a regenerated client serves the item that changed \
+the API. Answer with a JSON array only: one object per item, {\"ticket\": 1, \"item\": 1, \
+\"done\": true, \"why\": \"...\", \"hunks\": [3, 5]}, and at most one for the common point, \
+{\"common\": true, \"why\": \"...\", \"hunks\": [2]}.";
 
-/// The judge's question: the tickets and their items, the notes, and the
-/// pieces of the diff numbered, generated ones left out.
+/// The judge's question: the tickets and their items, the notes, the
+/// generated files named, and the pieces of the diff numbered, an OpenAPI
+/// spec's marked, generated ones left out.
 #[must_use]
 pub fn judge_question(tickets: &[Ticket], notes: &[String], hunks: &[(Hunk, bool)]) -> String {
     let mut out = String::new();
@@ -501,6 +578,18 @@ pub fn judge_question(tickets: &[Ticket], notes: &[String], hunks: &[(Hunk, bool
             out.push_str(&format!("- {note}\n"));
         }
     }
+    let mut generated: Vec<&str> = hunks
+        .iter()
+        .filter(|(_, generated)| *generated)
+        .map(|(hunk, _)| hunk.path.as_str())
+        .collect();
+    generated.dedup();
+    if !generated.is_empty() {
+        out.push_str(&format!(
+            "\nGenerated files changed, not shown: {}\n",
+            generated.join(", ")
+        ));
+    }
     out.push_str("\nThe branch's diff:\n");
     let mut number = 0;
     for (hunk, generated) in hunks {
@@ -508,8 +597,13 @@ pub fn judge_question(tickets: &[Ticket], notes: &[String], hunks: &[(Hunk, bool
             continue;
         }
         number += 1;
+        let spec = if is_spec(&hunk.path) {
+            " (OpenAPI spec)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "\nH{number} {} line {}\n",
+            "\nH{number} {} line {}{spec}\n",
             hunk.path,
             hunk.new_start.max(hunk.old_start)
         ));
@@ -535,6 +629,7 @@ mod tests {
                 issue: "get_issue".into(),
                 comments: Some("list_comments".into()),
                 argument: "id".into(),
+                comments_argument: Some("issueId".into()),
                 ids: "[A-Z][A-Z0-9]+-[0-9]+".into(),
                 hosts: vec!["issues.example.com".into()],
             },
@@ -627,23 +722,37 @@ mod tests {
             (hunk("src/upload.py", 40), false),
             (hunk("src/store.py", 20), false),
             (hunk("README.md", 10), false),
-            (hunk("Cargo.lock", 30), true),
+            (hunk("Cargo.lock", 20), true),
+            (hunk("src/routes.py", 5), false),
+            (hunk("docs/openapi.yaml", 5), false),
         ];
         let answer = r#"```json
-[{"ticket": 1, "item": 1, "done": true, "why": "the route takes files", "hunks": ["H1"]},
- {"ticket": 1, "item": 2, "done": false, "why": "half", "hunks": [1, 2]}]
+[{"ticket": 1, "item": 1, "done": true, "why": "the route takes files", "hunks": ["H1", "H4", "H5"]},
+ {"ticket": 1, "item": 2, "done": false, "why": "half", "hunks": [1, 2]},
+ {"common": true, "why": "the route both need", "hunks": ["H4"]}]
 ```"#;
         let verdicts = parse_verdicts(answer).unwrap();
         let progress = progress(&tickets, &hunks, &verdicts);
         let first = progress.items[0][0].as_ref().unwrap();
         let second = progress.items[0][1].as_ref().unwrap();
-        // H1 (40 lines) is split between both items; H2 (20) is the second's.
-        assert!((first.share - 0.2).abs() < 1e-9);
-        assert!((second.share - 0.4).abs() < 1e-9);
+        let common = progress.common.as_ref().unwrap();
+        // H1 (40 lines), claimed by both, is common to them, as H4 (5),
+        // which the judge put there; H2 (20) is the second's, the spec's H5
+        // (5) the first's.
+        assert!((first.share - 0.05).abs() < 1e-9);
+        assert!((second.share - 0.2).abs() < 1e-9);
+        assert!((common.share - 0.45).abs() < 1e-9);
+        assert_eq!(
+            (first.hunks.as_slice(), common.hunks.as_slice()),
+            (&[5][..], &[0, 4][..])
+        );
+        assert_eq!(common.why, "the route both need");
         assert!((progress.unattached - 0.1).abs() < 1e-9);
-        assert!((progress.generated - 0.3).abs() < 1e-9);
+        assert!((progress.generated - 0.2).abs() < 1e-9);
         assert!(
-            (first.share + second.share + progress.unattached + progress.generated - 1.0).abs()
+            (first.share + second.share + common.share + progress.unattached + progress.generated
+                - 1.0)
+                .abs()
                 < 1e-9
         );
         let readme = progress
@@ -657,10 +766,13 @@ mod tests {
             .iter()
             .find(|f| f.path == "src/upload.py")
             .unwrap();
-        assert_eq!(upload.items, [(0, 0), (0, 1)]);
-        // The generated file is never shown to the judge.
+        assert!(upload.items.is_empty() && upload.common);
+        // The generated file is named to the judge, never shown; the spec
+        // is marked.
         let question = judge_question(&tickets, &["checked on staging".into()], &hunks);
-        assert!(!question.contains("Cargo.lock") && question.contains("H3 README.md"));
+        assert!(question.contains("Generated files changed, not shown: Cargo.lock"));
+        assert!(question.contains("H3 README.md") && !question.contains("H6"));
+        assert!(question.contains("H5 docs/openapi.yaml line 1 (OpenAPI spec)"));
         assert!(question.contains("checked on staging"));
     }
 

@@ -749,7 +749,7 @@ where
     }
 
     // The branch's tickets (Ctrl-L) on the right; an item's or a file's
-    // pieces of the diff on the left.
+    // pieces of the diff in the conversation's place, further down.
     if shell.app.tickets_open() {
         let fill = if shell.app.map_view() == Some(MapView::Universe) {
             theme::see(PANEL, 0.62 * opacity)
@@ -771,14 +771,11 @@ where
                     tickets_pane::show(ui, tickets, app, effects);
                 });
             });
-        if shell.app.ticket_view().is_some() && shell.app.map_view().is_none() {
-            let Shell { tickets, app, .. } = &mut *shell;
-            egui::Panel::left("ticket-pieces")
-                .resizable(true)
-                .default_size(560.0)
-                .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
-                .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
-        }
+    }
+    let pieces = shell.app.tickets_open() && shell.app.ticket_view().is_some();
+    if !pieces {
+        // Shown again, they start at the top.
+        shell.tickets.hidden();
     }
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
@@ -956,6 +953,13 @@ where
             .show(&mut root, |ui| {
                 file(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
             });
+    } else if pieces {
+        // A ticket's pieces take the conversation's room: beside it, both
+        // were too narrow to read.
+        let Shell { tickets, app, .. } = &mut *shell;
+        egui::CentralPanel::default()
+            .frame(pane.fill(background))
+            .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
     } else {
         egui::CentralPanel::default()
             .frame(pane.fill(background))

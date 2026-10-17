@@ -1216,10 +1216,14 @@ async fn read_ticket<M: ChatModel>(
         .await
         .map_err(|e| format!("{} could not be read: {e}", named.id))?;
     let comments = match &tracker.comments {
-        Some(tool) => external
-            .call(&format!("{}__{tool}", tracker.server), &arguments)
-            .await
-            .unwrap_or_default(),
+        Some(tool) => {
+            let arguments =
+                serde_json::json!({ tracker.comments_argument(): named.id }).to_string();
+            external
+                .call(&format!("{}__{tool}", tracker.server), &arguments)
+                .await
+                .unwrap_or_default()
+        }
         None => String::new(),
     };
     // What a tracker says is kept and sent to a model: the environment's
@@ -1297,12 +1301,14 @@ async fn check_progress<M: ChatModel>(
     // The diff goes to a model: the environment's secrets are taken out.
     let (question, _) =
         universe_tools::redact_secrets(&crate::tickets::judge_question(tickets, notes, &marked));
-    let answer = ask_one(
+    // Judging each piece is the hard part: high effort.
+    let answer = ask_at(
         model,
         chosen,
         candidates,
         crate::tickets::JUDGE_PROMPT,
         question,
+        universe_core::Effort::High,
         tx,
     )
     .await?;
@@ -1529,13 +1535,17 @@ mod tests {
             arguments: &'a str,
         ) -> universe_core::ExternalCall<'a> {
             Box::pin(async move {
-                assert_eq!(arguments, r#"{"id":"ENG-7"}"#);
                 Ok(match name {
                     "issues__get_issue" => {
+                        assert_eq!(arguments, r#"{"id":"ENG-7"}"#);
                         r#"{"title": "Upload files", "description": "Accept and store files."}"#
                             .to_owned()
                     }
-                    "issues__list_comments" => "Storing can wait.".to_owned(),
+                    // Its own argument for the same id.
+                    "issues__list_comments" => {
+                        assert_eq!(arguments, r#"{"issueId":"ENG-7"}"#);
+                        "Storing can wait.".to_owned()
+                    }
                     other => panic!("no tool {other}"),
                 })
             })
@@ -1583,6 +1593,7 @@ mod tests {
             issue: "get_issue".into(),
             comments: Some("list_comments".into()),
             argument: "id".into(),
+            comments_argument: Some("issueId".into()),
             ids: "[A-Z]+-[0-9]+".into(),
             hosts: Vec::new(),
         };
@@ -1679,8 +1690,9 @@ mod tests {
         let item = progress.items[0][0].as_ref().unwrap();
         assert!(item.done && item.share > 0.0);
         assert!(progress.generated > 0.0);
-        // The lock file was never sent to the judge.
-        assert!(!model.1.lock().unwrap()[0].contains("Cargo.lock"));
+        // The lock file was named to the judge, what it holds never sent.
+        let asked = &model.1.lock().unwrap()[0];
+        assert!(asked.contains("not shown: Cargo.lock") && !asked.contains("lots"));
         assert!(
             progress
                 .files

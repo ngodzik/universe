@@ -410,6 +410,7 @@ mod tests {
                     issue: "get_issue".into(),
                     comments: None,
                     argument: "id".into(),
+                    comments_argument: Some("issueId".into()),
                     ids: "[A-Z]+-[0-9]+".into(),
                     hosts: vec!["issues.example.com".into()],
                 },

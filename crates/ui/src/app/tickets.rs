@@ -13,6 +13,8 @@ pub enum Shown {
     Item(usize, usize),
     /// The pieces of a file.
     File(String),
+    /// The pieces several items need alike.
+    Common,
 }
 
 /// The pieces shown, and how many lines around each.
