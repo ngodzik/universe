@@ -1353,6 +1353,7 @@ fn asking(
     });
     config
         .with_instructions(Defaults::instructions())
+        .with_memory(Defaults::instructions_path())
         .with_audit_log(Defaults::audit_log_path())
         .with_project_rules(universe_tools::project_instructions(root))
         .with_approver(approver)

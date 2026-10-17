@@ -4490,6 +4490,7 @@ impl App {
             | Question::KeepWarm { .. }
             | Question::ColdStart { .. }
             | Question::AddFolder { .. }
+            | Question::Remember { .. }
             | Question::ExternalTool { .. } => (Vec::new(), Vec::new(), Vec::new()),
         };
         let answer = match key.code {
@@ -4546,6 +4547,8 @@ impl App {
                     | Question::ColdStart { .. }
                     | Question::AddFolder { .. }
                     | Question::ExternalTool { .. } => None,
+                    // The rule, to keep elsewhere or edit before it is.
+                    Question::Remember { rule } => Some(Effect::Copy(rule.clone())),
                 });
             }
             _ => return Some(None),

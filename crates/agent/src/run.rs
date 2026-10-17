@@ -2895,7 +2895,21 @@ fn identity(model: &ModelId, leads: bool, config: &AgentConfig) -> String {
     if let Some(instructions) = &config.instructions {
         text.push_str(&person_says(instructions));
     }
+    if leads && remembers(config) {
+        text.push_str(
+            "\n\nWhen the person states a lasting preference about how you should work, one \
+             meant for every conversation (not a fact of this project, not a request for now \
+             only), offer to remember it: call `remember` with the rule as one short sentence. \
+             They approve its exact text.",
+        );
+    }
     text
+}
+
+/// Whether a model may keep a rule for every conversation: somewhere to
+/// write it, and someone to approve it.
+fn remembers(config: &AgentConfig) -> bool {
+    config.remember_in.is_some() && config.approver.is_some() && !config.reading_only
 }
 
 /// The most guides an agent is told of by name.
@@ -3220,6 +3234,9 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
+    if leads && remembers(ctx.config) {
+        tools.push(remember_spec());
+    }
     // An investigator may look at the conversation again.
     if ctx.history.is_some() {
         tools.extend(investigate::History::specs());
@@ -3367,6 +3384,14 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             {
                 let content =
                     external_call(ctx, model_id, external.as_ref(), call, reads_only).await;
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content,
+                });
+                continue;
+            }
+            if leads && call.name == REMEMBER_TOOL {
+                let content = remember(ctx, model_id, &call.arguments).await;
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content,
@@ -3676,6 +3701,94 @@ fn flattened(messages: &[Message]) -> String {
         }
     }
     latest(&out, SUMMARY_INPUT_BYTES)
+}
+
+/// The tool through which a model keeps a rule for every conversation.
+const REMEMBER_TOOL: &str = "remember";
+
+fn remember_spec() -> ToolSpec {
+    ToolSpec {
+        name: REMEMBER_TOOL.into(),
+        description: "Keep a rule about how you should work for every conversation, in every \
+                      project: it goes in the person's own instructions, which every model \
+                      reads, once they approved its exact text. Only for a lasting preference \
+                      the person stated, never for a fact of this project or a one-off request."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "rule": {
+                    "type": "string",
+                    "description": "The rule, one short sentence in the imperative, as it should be written: `Answer in French.`"
+                }
+            },
+            "required": ["rule"]
+        }),
+    }
+}
+
+/// Keeps the rule a model asked for, once the person approved its text;
+/// returns what the model is told.
+async fn remember<M: ChatModel, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    arguments: &str,
+) -> String {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        rule: String,
+    }
+    let rule = match serde_json::from_str::<Args>(arguments) {
+        Ok(args) => args.rule.split_whitespace().collect::<Vec<_>>().join(" "),
+        Err(e) => return format!("error: the arguments could not be read: {e}"),
+    };
+    if rule.is_empty() {
+        return "error: give the rule to remember".to_owned();
+    }
+    let (Some(path), Some(approver)) =
+        (ctx.config.remember_in.clone(), ctx.config.approver.clone())
+    else {
+        return "error: nothing can be remembered here".to_owned();
+    };
+    let answer = approver
+        .ask(Approval {
+            model: model.clone(),
+            question: Question::Remember { rule: rule.clone() },
+        })
+        .await;
+    if !answer.yes() {
+        return "The person did not want it remembered: go on without it.".to_owned();
+    }
+    match keep_rule(&path, &rule) {
+        Ok(()) => {
+            (ctx.observe)(Event::Notice {
+                model: model.clone(),
+                text: format!("remembered for every conversation: {rule}"),
+            });
+            "Remembered: it is in the person's own instructions, given to every model from \
+             the next request on."
+                .to_owned()
+        }
+        Err(e) => format!("error: it could not be written to {}: {e}", path.display()),
+    }
+}
+
+/// Adds `rule` to the instructions at `path` as an item of their list,
+/// the file made when there is none.
+fn keep_rule(path: &std::path::Path, rule: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let before = std::fs::read_to_string(path).unwrap_or_default();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !before.is_empty() && !before.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    writeln!(file, "- {rule}")
 }
 
 /// The tool through which a model runs a shell command.
@@ -5525,6 +5638,89 @@ mod tests {
             Question::AddFolder { folder, .. } if *folder == other.path().canonicalize().unwrap()
         ));
         assert_eq!(toolbox.workspace().folders().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_remembered_once_the_person_approved_its_text() {
+        let (_dir, mut toolbox) = setup();
+        let home = tempfile::tempdir().unwrap();
+        let kept = home.path().join("instructions.md");
+        std::fs::write(&kept, "- Be brief.").unwrap();
+        let model = Scripted::new(vec![
+            calls("remember", json!({"rule": "Answer   in\nFrench."})),
+            calls("remember", json!({"rule": "Use tabs."})),
+            says("Noted."),
+        ]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(VecDeque::from([true, false])));
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_memory(Some(kept.clone()))
+            .with_approver({
+                let asked = Arc::clone(&asked);
+                let answers = Arc::clone(&answers);
+                Approver::new(move |approval: Approval| {
+                    asked.lock().unwrap().push(approval);
+                    let answer = answers.lock().unwrap().pop_front().unwrap();
+                    async move { if answer { Answer::Yes } else { Answer::No } }
+                })
+            });
+        let mut events = Vec::new();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "from now on, always answer in French",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        // The text approved is the text kept, on a line of its own.
+        let asked = asked.lock().unwrap();
+        assert_eq!(
+            asked[0].question,
+            Question::Remember {
+                rule: "Answer in French.".into()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "- Be brief.\n- Answer in French.\n"
+        );
+        assert!(events.iter().any(
+            |e| matches!(e, Event::Notice { text, .. } if text.ends_with("Answer in French."))
+        ));
+        // Refused: nothing written, and the model is told.
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::Tool { content, .. }) if content.starts_with("The person did not want it")
+        ));
+        // Offered, and the model told when to use it.
+        assert!(seen[0].tools.iter().any(|t| t.name == "remember"));
+        assert!(format!("{:?}", seen[0].messages[0]).contains("offer to remember it"));
+    }
+
+    #[tokio::test]
+    async fn without_a_place_to_keep_rules_none_is_offered() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("Hi.")]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_approver(Approver::new(|_| async { Answer::Yes }));
+        Session::new()
+            .send(&model, &NoDelegate, &mut toolbox, &config, "hi", "", |_| {})
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        assert!(seen[0].tools.iter().all(|t| t.name != "remember"));
     }
 
     #[cfg(unix)]

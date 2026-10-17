@@ -34,6 +34,7 @@ pub struct AgentConfig {
     pub(crate) summarize_when_cold: Vec<ModelId>,
     pub(crate) external: Option<Arc<dyn ExternalTools>>,
     pub(crate) audit_log: Option<std::path::PathBuf>,
+    pub(crate) remember_in: Option<std::path::PathBuf>,
 }
 
 /// A question put to the person while a model works.
@@ -99,6 +100,12 @@ pub enum Question {
         /// The folder that would be added: the repository holding it, else
         /// its nearest existing folder.
         folder: std::path::PathBuf,
+    },
+    /// Whether to keep a rule for every conversation, in the person's own
+    /// instructions, as the model wrote it.
+    Remember {
+        /// The rule, as it would be written.
+        rule: String,
     },
     /// Whether the model may go on, having used all its turns.
     MoreTurns {
@@ -299,6 +306,14 @@ impl AgentConfig {
         self
     }
 
+    /// Where a rule the model is asked to keep for every conversation goes,
+    /// once the person approved its text: the person's own instructions,
+    /// which every model reads. `None` offers no `remember` tool.
+    pub fn with_memory(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.remember_in = path;
+        self
+    }
+
     /// The servers the person allowed commands to reach, besides those the
     /// project and its tools already use.
     pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
@@ -479,6 +494,7 @@ impl AgentConfigBuilder {
             allowed_hosts: Vec::new(),
             allowed_programs: Vec::new(),
             audit_log: None,
+            remember_in: None,
             instructions: self.instructions,
             project_rules: self.project_rules,
             outside_rules: None,
