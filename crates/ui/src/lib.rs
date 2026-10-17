@@ -24,6 +24,7 @@ mod host;
 pub mod input;
 pub mod keymap;
 pub mod markdown;
+pub mod outside_rules;
 pub mod references;
 pub mod review;
 mod search;

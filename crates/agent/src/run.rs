@@ -2866,10 +2866,24 @@ fn identity(model: &ModelId, leads: bool, config: &AgentConfig) -> String {
             rules.trim()
         ));
     }
+    if let Some(rules) = &config.outside_rules {
+        text.push_str(&outside_rules_say(rules));
+    }
     if let Some(instructions) = &config.instructions {
         text.push_str(&person_says(instructions));
     }
     text
+}
+
+/// The rules the person keeps for the project outside its repository, as
+/// added to a model's instructions.
+fn outside_rules_say(rules: &str) -> String {
+    format!(
+        "\n\nThe person's own rules for this project, kept outside its repository; they come \
+         before the project's own instructions when the two differ, and those for some files \
+         only apply to those files:\n{}",
+        rules.trim()
+    )
 }
 
 /// The person's own instructions, as added to a model's.
@@ -2881,13 +2895,17 @@ fn person_says(instructions: &str) -> String {
     )
 }
 
-/// Instructions for an agent such as Claude Code: `base`, and the person's
-/// own when there are some.
+/// Instructions for an agent such as Claude Code: `base`, the rules kept
+/// outside the repository, which it does not read, and the person's own.
 fn agent_instructions(base: &str, config: &AgentConfig) -> String {
-    match &config.instructions {
-        Some(instructions) => format!("{base}{}", person_says(instructions)),
-        None => base.to_owned(),
+    let mut text = base.to_owned();
+    if let Some(rules) = &config.outside_rules {
+        text.push_str(&outside_rules_say(rules));
     }
+    if let Some(instructions) = &config.instructions {
+        text.push_str(&person_says(instructions));
+    }
+    text
 }
 
 /// The `delegate` tool, offering the team to `lead`; `None` when nobody
@@ -4526,8 +4544,10 @@ mod tests {
             .build()
             .unwrap()
             .with_instructions(Some("Answer in French.".into()))
-            .with_project_rules(Some("## CLAUDE.md\nUse tabs.".into()));
-        Session::new()
+            .with_project_rules(Some("## CLAUDE.md\nUse tabs.".into()))
+            .with_outside_rules(Some("## file:~/rules.md\nName tests by behaviour.".into()));
+        let mut session = Session::new();
+        session
             .send(
                 &model,
                 &NoDelegate,
@@ -4547,6 +4567,17 @@ mod tests {
         assert!(
             system.contains("The person's own instructions")
                 && system.contains("Answer in French.")
+        );
+        // The rules kept outside the repository, between the two, and only
+        // in what was sent: the conversation kept never holds them.
+        let outside = system.find("Name tests by behaviour.").unwrap();
+        assert!(system.find("Use tabs.").unwrap() < outside);
+        assert!(outside < system.find("Answer in French.").unwrap());
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| !format!("{m:?}").contains("Name tests by behaviour."))
         );
         // Blank instructions add nothing.
         let config = AgentConfig::builder()
@@ -4673,6 +4704,37 @@ mod tests {
             })
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_gets_the_rules_kept_outside_the_repository() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_outside_rules(Some("## file:~/rules.md\nName tests by behaviour.".into()))
+            .with_instructions(Some("Answer in French.".into()));
+        Session::new()
+            .send(
+                &Scripted::new(Vec::new()),
+                &claude,
+                &mut toolbox,
+                &config,
+                "make done.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = claude.requests.lock().unwrap();
+        let given = &requests[0].instructions;
+        let outside = given.find("Name tests by behaviour.").unwrap();
+        assert!(outside < given.find("Answer in French.").unwrap());
     }
 
     #[tokio::test]

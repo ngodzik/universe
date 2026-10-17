@@ -23,6 +23,7 @@ pub struct AgentConfig {
     pub(crate) detect_checks: bool,
     pub(crate) instructions: Option<String>,
     pub(crate) project_rules: Option<String>,
+    pub(crate) outside_rules: Option<String>,
     pub(crate) approver: Option<Approver>,
     pub(crate) allowed_secrets: Vec<String>,
     pub(crate) strict_commands: bool,
@@ -245,6 +246,14 @@ impl AgentConfig {
         self
     }
 
+    /// The rules the person keeps for this project outside its repository,
+    /// from the copies kept of them, read again before each request. Agents
+    /// get them too: they read the repository's files, not these.
+    pub fn with_outside_rules(mut self, rules: Option<String>) -> Self {
+        self.outside_rules = rules.filter(|r| !r.trim().is_empty());
+        self
+    }
+
     /// The person's own instructions for every model, read again before each
     /// request so that an edit counts at once; `None` or blank adds none.
     pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
@@ -454,6 +463,7 @@ impl AgentConfigBuilder {
             audit_log: None,
             instructions: self.instructions,
             project_rules: self.project_rules,
+            outside_rules: None,
         })
     }
 }

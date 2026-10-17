@@ -408,6 +408,7 @@ async fn interface(
         summarize_when_cold: defaults.summarize_when_cold.clone(),
         mcp: defaults.mcp.clone(),
         trackers: defaults.trackers.clone(),
+        rules: defaults.rules.clone(),
         // Each server starts on a task of its own; its tools are offered
         // once it answers.
         external: (!defaults.mcp.is_empty()).then(|| {

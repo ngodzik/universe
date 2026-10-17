@@ -7,11 +7,15 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod document;
 mod error;
 mod external;
 mod traits;
 mod types;
 
+pub use document::{
+    DocumentRead, DocumentSource, DocumentWrite, SourceError, SourceSpec, SourceTool,
+};
 pub use error::CoreError;
 pub use external::{ExternalCall, ExternalTools, McpServer};
 pub use traits::{ChatModel, Delegate};

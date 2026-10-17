@@ -6,9 +6,9 @@
 
 ## Read this first
 
-This is a personal experiment, not a product.
+This is a personal experiment, not a product, and it is not ready for production use.
 
-- **It is not stable.** Commands, keys, views, settings and file formats change from one commit to the next, without notice and without a way back. Features appear, get rewritten or disappear.
+- **It is not stable.** Commands, keys, views, settings and file formats change from one commit to the next, without notice and without a way back. Features appear, get rewritten or disappear: whatever is described here may be changed or removed at any time, as the terminal interface was.
 - **It is barely tested in real use.** There are tests and CI, but few real sessions, on Linux mostly. macOS is only built and tested by CI; Windows is not supported.
 - **It changes your files without asking.** Work in a git repository, commit before you start, and read every diff.
 - **It spends money.** Requests go to a paid API, within a budget you set.
@@ -21,18 +21,15 @@ Deterministic tools before models: compilers, tests, linters, language servers a
 
 ## What is there today
 
-All of it experimental, all of it likely to change.
+Roughly, and all of it experimental:
 
-- **A conversation with a model**, in a window, its changes shown as diffs. Any OpenAI compatible endpoint works, Requesty by default; Claude Code and Codex can work as sub-agents.
-- **A safety net for commands**: what cannot be undone, leaves the machine or cannot be read waits for your approval, secrets are never shown to a model, and every command is logged. A net, not a sandbox.
-- **Costs and context in view**, per request and per conversation, with a budget per request.
-- **Views of the codebase** (Ctrl-N), read from the code with no model: its design in layers, its API, its services, its database tables, and its files as a universe of stars.
-- **Where it runs**: the deployment read from Compose, Helm, Kustomize, Flux and Terraform, each environment rendered by `kustomize` and `helm`, every environment shown at once as galaxies, and each service laid out flat with its objects and its values layer by layer. Secrets are never read or shown.
-- **Fresh contexts**: `/debug <question>` has an investigator, the model marked ◆ in the picker (Ctrl-F) or the conversation's, look into a question from a brief and the list of exchanges; only its report comes back, so a long conversation does not pay for the investigation.
-- **The branch and its tickets**: Ctrl-R shows what the branch changed since it left the main one, each route a click away from all of it compared before and after. `/ticket <id or link>` links a ticket of any tracker whose MCP server can read it; a model lists its work, and "Check progress" judges the branch's diff against each item, the rest counted: each item's share of the changed lines, every file with the items it serves (Ctrl-L).
-- **Reviewing and walking a branch**: `/review` shows what a branch changed, `/walk` what is not committed yet, with questions about it sent to the cheapest model.
+- a conversation with a model in a window, its changes shown as diffs, with Claude Code and Codex as possible sub-agents;
+- a safety net for commands, which is not a sandbox;
+- costs and context in view;
+- views of the codebase, of where it runs, and of what a branch changed;
+- tools of MCP servers, and rules kept outside a repository.
 
-`/help` lists the commands and Ctrl-S every shortcut. They follow the code; this page does not always.
+`/help` lists the commands and Ctrl-S every shortcut. They follow the code; this page does not.
 
 ## Usage
 
@@ -42,20 +39,7 @@ cd your-project
 universe                           # opens the window
 ```
 
-Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.
-
-With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking. MCP servers are declared there too, as `[mcp.<name>]` with a `url` (and `headers`) or a `command`: `/mcp` says how each answered, their tools that only read run at once, the others are asked first.
-
-A tracker is declared with the MCP server that reads its tickets:
-
-```toml
-[trackers.issues]
-server = "issues"            # the [mcp.<name>] that reads them
-issue = "get_issue"          # its tool that reads a ticket
-comments = "list_comments"   # its tool that lists the comments, if any
-ids = "[A-Z][A-Z0-9]+-[0-9]+"
-hosts = ["issues.example.com"]
-```
+Settings live in `~/.universe/config.toml`. Their names and meaning change often; the code's documentation of `Defaults` is the reference.
 
 ## Building
 
