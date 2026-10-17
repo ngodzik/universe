@@ -188,7 +188,9 @@ impl Session {
             .filter(|(i, _)| keep.contains(i) && Some(*i) != last)
             .flat_map(|(_, (start, end))| self.messages[*start..*end].iter().cloned())
             .collect();
-        let mut compacted = vec![self.messages[0].clone()];
+        // Universe's prompt as it is now, not the one the conversation
+        // started with, which a saved one keeps from an older universe.
+        let mut compacted = vec![Message::system(super::CHAT_PROMPT)];
         if !kept.is_empty() {
             let text = latest(&catch_up_all(&kept), SUMMARY_INPUT_BYTES);
             let mut ctx = Ctx::quiet(model, delegate, toolbox, config, observe);
@@ -464,6 +466,8 @@ mod tests {
             .build()
             .unwrap();
         let mut session = Session::new();
+        // Saved by an older universe, with the prompt it had.
+        session.messages[0] = Message::system("An older prompt.");
         for (asked, said) in [
             ("fix the parser", "Fixed."),
             ("add a test", "Added."),
@@ -509,6 +513,11 @@ mod tests {
         );
         assert!(matches!(&session.messages[3], Message::User(t) if t == "and the docs?"));
         assert_eq!(session.messages.len(), 5);
+        // The conversation goes on with universe's prompt of today.
+        assert_eq!(
+            session.messages[0],
+            Message::system(super::super::CHAT_PROMPT)
+        );
         // The summary was written from what was kept, the last left out.
         let asked = model.1.lock().unwrap();
         assert!(
