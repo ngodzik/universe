@@ -264,6 +264,11 @@ pub enum Effect {
     /// Say which rules kept outside the repository the project's models
     /// get, and how fresh their copies are.
     ShowRules,
+    /// Check out pull request `number` apart, for review.
+    FetchPull {
+        /// Its number.
+        number: u64,
+    },
     /// Read the latest conversations of every project, for `/chats`.
     ListEverywhere,
     /// Read a ticket through its tracker's MCP server, and have a model
@@ -1498,12 +1503,53 @@ impl App {
 
     /// The file tree, showing only the branch's changes while they are
     /// looked at.
+    /// The folder files are read in: the copy of a pull request while it
+    /// is reviewed, else the project's.
+    fn view_root(&self) -> PathBuf {
+        self.changes
+            .as_ref()
+            .map_or_else(|| self.root.clone(), |c| c.root.clone())
+    }
+
     fn new_tree(&self) -> FileTree {
-        let mut tree = FileTree::new(self.root.clone());
+        let mut tree = FileTree::new(self.view_root());
         if let Some(changes) = &self.changes {
             tree.show_changes(changes.letters());
         }
         tree
+    }
+
+    /// A pull request checked out for review, or why it could not be: its
+    /// files are read in its copy from now on.
+    pub fn pull_checked_out(&mut self, checked: Result<universe_tools::CheckedOut, String>) {
+        let changes = match checked.and_then(crate::changes::ChangeSet::of_pull) {
+            Ok(changes) => changes,
+            Err(e) => {
+                self.error(e);
+                return;
+            }
+        };
+        let Some(pull) = changes.pull.clone() else {
+            return;
+        };
+        let (added, removed) = changes.lines();
+        let count = changes.files.len();
+        self.info(format!(
+            "Reviewing #{} by {}: {}. {count} file{} changed, +{added} −{removed}, read in a copy \
+             of its own: the project's branch and files are left as they are. Nothing can be \
+             edited; /review off ends it",
+            pull.number,
+            pull.author,
+            pull.title,
+            if count == 1 { "" } else { "s" },
+        ));
+        self.walk_model = None;
+        self.walk_asking = false;
+        self.changes = Some(changes);
+        self.file = None;
+        self.unzoom();
+        self.tree = Some(self.new_tree());
+        self.focus_on(Focus::Tree);
     }
 
     /// Starts looking at the branch's changes through `lens`, against
@@ -1513,10 +1559,23 @@ impl App {
         lens: crate::changes::Lens,
         argument: Option<String>,
     ) -> Option<Effect> {
+        // A pull request of GitHub, by its number or its link: checked out
+        // apart by the loop, the project's branch and files left alone.
+        if lens == crate::changes::Lens::Review
+            && let Some(number) = argument.as_deref().and_then(universe_tools::pull_number)
+        {
+            self.info(format!("Fetching #{number}…"));
+            return Some(Effect::FetchPull { number });
+        }
         if argument.as_deref() == Some("off") {
             self.walk_model = None;
             self.walk_asking = false;
+            // A file open in a pull request's copy closes with it.
+            if self.changes.as_ref().is_some_and(|c| c.pull.is_some()) {
+                self.file = None;
+            }
             if self.changes.take().is_some() {
+                self.tree = self.tree.take().map(|_| self.new_tree());
                 if let Some(tree) = &mut self.tree {
                     tree.show_everything();
                 }
@@ -1698,7 +1757,7 @@ impl App {
         };
         let path = file.path();
         let path = path
-            .strip_prefix(&self.root)
+            .strip_prefix(&changes.root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned();
@@ -2354,7 +2413,9 @@ impl App {
             return *known;
         }
         let exists = match reference {
-            Reference::File { path, .. } => !path.contains("..") && self.root.join(path).is_file(),
+            Reference::File { path, .. } => {
+                !path.contains("..") && self.view_root().join(path).is_file()
+            }
             Reference::Commit(_) => false,
         };
         self.known_references
@@ -2396,8 +2457,14 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
-        let mut editor = Editor::open(&self.root, self.root.join(path), highlighter);
-        if let Some(base) = universe_tools::branch_base(&self.root) {
+        let root = self.view_root();
+        let mut editor = Editor::open(&root, root.join(path), highlighter);
+        if let Some(base) = self
+            .changes
+            .as_ref()
+            .map(|c| c.base.clone())
+            .or_else(|| universe_tools::branch_base(&root))
+        {
             editor.compare_with(base);
         }
         if let Some(line) = line {
@@ -2512,7 +2579,7 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
-        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.file = Some(Editor::open(&self.view_root(), path, highlighter));
         self.as_changes_want();
         self.focus_on(Focus::File);
     }
@@ -2543,7 +2610,7 @@ impl App {
             return;
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
-        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.file = Some(Editor::open(&self.view_root(), path, highlighter));
         self.as_changes_want();
         self.focus_on(Focus::File);
     }
@@ -6013,6 +6080,75 @@ mod tests {
             dir.path().to_owned(),
         );
         (dir, app)
+    }
+
+    #[test]
+    fn a_pull_request_is_reviewed_in_its_copy_the_project_left_alone() {
+        let project = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(copy.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(copy.path().join("a.py"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(copy.path().join("a.py"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-am", "head"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(project.path().join("a.py"), "the project's own\n").unwrap();
+
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            project.path().to_owned(),
+        );
+        // By its number or its link: fetched by the loop.
+        assert!(matches!(
+            app.run_command("review https://github.com/o/r/pull/5"),
+            Some(Effect::FetchPull { number: 5 })
+        ));
+        app.pull_checked_out(Ok(universe_tools::CheckedOut {
+            pull: universe_tools::PullRequest {
+                number: 5,
+                title: "Two".into(),
+                body: String::new(),
+                author: "someone".into(),
+                url: String::new(),
+                base: "main".into(),
+                head,
+            },
+            copy: copy.path().to_owned(),
+            merge_base: base,
+        }));
+        let changes = app.change_set().unwrap();
+        assert_eq!(changes.root, copy.path());
+        assert_eq!(changes.files[0].path, "a.py");
+        // The tree and the editor read the copy, read only.
+        app.click_tree(0);
+        let file = app.file().unwrap();
+        assert_eq!(file.path(), Path::new("a.py"));
+        assert_eq!(file.lines(), ["one", "two"]);
+        // Done: the project again, the copy's file closed.
+        app.run_command("review off");
+        assert!(app.change_set().is_none());
+        assert!(app.file().is_none());
+        // A pull request that could not be fetched says why.
+        app.pull_checked_out(Err("gh could not read #9".into()));
+        assert!(matches!(app.chat.transcript.last(), Some(Entry::Error(e)) if e.contains("#9")));
     }
 
     #[test]

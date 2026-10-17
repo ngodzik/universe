@@ -122,6 +122,8 @@ pub enum Incoming {
     WarmDue,
     /// The agents' calls under their subscriptions, read from their files.
     SubscriptionCalls(Vec<universe_core::SubscriptionCall>),
+    /// A pull request checked out for review, or why it could not be.
+    PullCheckedOut(Result<universe_tools::CheckedOut, String>),
 }
 
 /// Carries out the effects the state returns, holds the conversation the
@@ -160,6 +162,9 @@ pub struct Host<M, D> {
     calls_rx: mpsc::UnboundedReceiver<Vec<universe_core::SubscriptionCall>>,
     /// They are being read: another read waits for it to end.
     calls_reading: bool,
+    /// Pull requests checked out, on a thread each as they need the network.
+    pulls_tx: mpsc::UnboundedSender<Result<universe_tools::CheckedOut, String>>,
+    pulls_rx: mpsc::UnboundedReceiver<Result<universe_tools::CheckedOut, String>>,
 }
 
 impl<M, D> Host<M, D>
@@ -174,6 +179,7 @@ where
         let (tx, rx) = mpsc::unbounded_channel();
         let (docker_tx, docker_rx) = mpsc::unbounded_channel();
         let (calls_tx, calls_rx) = mpsc::unbounded_channel();
+        let (pulls_tx, pulls_rx) = mpsc::unbounded_channel();
         let store = Store::for_project(workspace.root());
         let workspace_root = &workspace.root().to_owned();
         Self {
@@ -197,6 +203,8 @@ where
             calls_tx,
             calls_rx,
             calls_reading: false,
+            pulls_tx,
+            pulls_rx,
         }
     }
 
@@ -338,6 +346,7 @@ where
             _ = self.spin.tick(), if waiting.running => Incoming::Spin,
             _ = self.warm_tick.tick() => Incoming::WarmDue,
             Some(calls) = self.calls_rx.recv() => Incoming::SubscriptionCalls(calls),
+            Some(checked) = self.pulls_rx.recv() => Incoming::PullCheckedOut(checked),
         }
     }
 
@@ -375,6 +384,10 @@ where
             Incoming::SubscriptionCalls(calls) => {
                 self.calls_reading = false;
                 app.subscription_calls_read(calls);
+                None
+            }
+            Incoming::PullCheckedOut(checked) => {
+                app.pull_checked_out(checked);
                 None
             }
             Incoming::Spin => {
@@ -526,6 +539,7 @@ where
             servers,
             rules,
             guides,
+            pulls_tx: self_pulls_tx,
             ..
         } = self;
         let store = store.as_ref();
@@ -751,6 +765,18 @@ where
                     }
                     Err(e) => app.report_error(e),
                 }
+            }
+            Effect::FetchPull { number } => {
+                let Some(reviews) = Defaults::path().map(|p| p.with_file_name("reviews")) else {
+                    app.report_error(
+                        "No folder to check pull requests out in: HOME is not set".to_owned(),
+                    );
+                    return;
+                };
+                let (root, tx) = (workspace.root().to_owned(), self_pulls_tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(universe_tools::check_out_pull(&root, &reviews, number));
+                });
             }
             Effect::ShowRules => {
                 rules.refresh_due();

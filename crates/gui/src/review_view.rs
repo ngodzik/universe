@@ -64,7 +64,12 @@ impl ReviewView {
         if self.key.as_deref() != Some(key.as_str()) {
             self.key = Some(key);
             let (send, receive) = mpsc::channel();
-            let root = root.to_owned();
+            // A pull request's files are read in its copy.
+            let root = if changes.pull.is_some() {
+                changes.root.clone()
+            } else {
+                root.to_owned()
+            };
             let base = changes.base.clone();
             let files: Vec<(String, Change)> = changes
                 .files
