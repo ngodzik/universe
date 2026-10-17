@@ -1832,17 +1832,24 @@ fn status(ui: &mut Ui, app: &App) {
                     );
                 });
             let (added, removed) = changes.lines();
+            // The base's commit alone: with its subject, the line ran over
+            // what the right of the status line says. Whole on hover.
+            let base = changes
+                .base_line
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
             ui.label(
                 RichText::new(format!(
-                    "{} files · +{added} −{removed} · since {}",
+                    "{} files · +{added} −{removed} · since {base}",
                     changes.files.len(),
-                    changes.base_line
                 ))
                 .small()
                 .color(DIM),
             )
             .on_hover_text(format!(
-                "/{} off ends it",
+                "since {}\n/{} off ends it",
+                changes.base_line,
                 changes.lens.name().to_lowercase()
             ));
             // Who answers while walking: never a surprise.

@@ -18,7 +18,7 @@ mod error;
 mod event;
 mod run;
 
-pub use ask::{Answered, ask, ask_cheapest, cheapest};
+pub use ask::{Answered, ask, ask_agent, ask_cheapest, cheapest};
 pub use config::{
     AgentConfig, AgentConfigBuilder, Answer, Approval, Approver, CONTEXT_WARNING, Member, Pair,
     Question,
