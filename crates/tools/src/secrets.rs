@@ -3,6 +3,11 @@
 //! or their look. Never whether a value matches a guess, so that no
 //! question a model chooses can tell a secret.
 
+use std::fs;
+use std::path::Path;
+
+use ignore::WalkBuilder;
+
 /// Files that hold secrets: reading them shows them.
 const SECRET_FILES: [&str; 16] = [
     ".aws/credentials",
@@ -53,18 +58,42 @@ pub(crate) enum Value {
     Secret,
 }
 
-/// The variables `text`, a file of variables, sets, in its order: each name
-/// and what may be known of its value. Comments, and lines that set
-/// nothing, are left out, and so are the lines of a quoted value that runs
-/// over several, such as a key: one of them may look like `NAME=`.
-pub(crate) fn variables(text: &str) -> Vec<(String, Value)> {
-    let mut variables: Vec<(String, Value)> = Vec::new();
-    // The quote a value opened and has not closed yet.
-    let mut open: Option<char> = None;
+/// A value as a file of variables writes it.
+enum Written {
+    /// On the variable's line, its quotes kept.
+    Line(String),
+    /// Over several lines, between the quotes that open and close it.
+    Lines(Vec<String>),
+}
+
+/// The variables `text` sets, in its order, each with its value as written;
+/// one set again keeps its place and takes its last value. Comments, and
+/// lines that set nothing, are left out, and so are the lines of a quoted
+/// value that runs over several, such as a key: one of them may look like
+/// `NAME=`.
+fn parse(text: &str) -> Vec<(String, Written)> {
+    let mut variables: Vec<(String, Written)> = Vec::new();
+    let mut set =
+        |name: String, written: Written| match variables.iter_mut().find(|(n, _)| *n == name) {
+            Some(seen) => seen.1 = written,
+            None => variables.push((name, written)),
+        };
+    // A value over several lines not closed yet: its quote, its variable's
+    // name if it is one, its lines so far.
+    let mut pending: Option<(char, Option<String>, Vec<String>)> = None;
     for line in text.lines() {
-        if let Some(quote) = open {
-            if closes(line, quote).is_some() {
-                open = None;
+        if let Some((quote, name, mut lines)) = pending.take() {
+            match closes(line, quote) {
+                Some(end) => {
+                    lines.push(line[..end].to_owned());
+                    if let Some(name) = name {
+                        set(name, Written::Lines(lines));
+                    }
+                }
+                None => {
+                    lines.push(line.to_owned());
+                    pending = Some((quote, name, lines));
+                }
             }
             continue;
         }
@@ -82,34 +111,172 @@ pub(crate) fn variables(text: &str) -> Vec<(String, Value)> {
             .chars()
             .next()
             .filter(|c| matches!(c, '"' | '\'' | '`'));
-        let value = match quote {
+        let written = match quote {
             Some(quote) => match closes(&value[1..], quote) {
-                Some(end) => Some(&value[..end + 2]),
+                Some(end) => value[..end + 2].to_owned(),
                 None => {
-                    open = Some(quote);
-                    None
+                    let name = is_name(name).then(|| name.to_owned());
+                    pending = Some((quote, name, vec![value[1..].to_owned()]));
+                    continue;
                 }
             },
             // What follows ` #` is a comment.
-            None => Some(value.split(" #").next().unwrap_or(value).trim_end()),
+            None => value
+                .split(" #")
+                .next()
+                .unwrap_or(value)
+                .trim_end()
+                .to_owned(),
         };
-        if !is_name(name) {
-            continue;
-        }
-        let value = match value {
-            Some("" | "\"\"" | "''" | "``") => Value::Empty,
-            Some(written) if !secret_name(name) && !looks_secret(unquoted(written)) => {
-                Value::Plain(written.to_owned())
-            }
-            _ => Value::Secret,
-        };
-        match variables.iter_mut().find(|(n, _)| n == name) {
-            // Set again: the last value is the one read.
-            Some(seen) => seen.1 = value,
-            None => variables.push((name.to_owned(), value)),
+        if is_name(name) {
+            set(name.to_owned(), Written::Line(written));
         }
     }
+    // A value never closed is still its variable's, and a secret.
+    if let Some((_, Some(name), lines)) = pending {
+        set(name, Written::Lines(lines));
+    }
     variables
+}
+
+/// Whether the value `written` of the variable `name` holds a secret.
+fn holds_secret(name: &str, written: &Written) -> bool {
+    match written {
+        Written::Lines(_) => true,
+        Written::Line(value) => secret_name(name) || looks_secret(unquoted(value)),
+    }
+}
+
+/// The variables `text`, a file of variables, sets, in its order: each name
+/// and what may be known of its value.
+pub(crate) fn variables(text: &str) -> Vec<(String, Value)> {
+    parse(text)
+        .into_iter()
+        .map(|(name, written)| {
+            let value = match &written {
+                Written::Line(value) if matches!(value.as_str(), "" | "\"\"" | "''" | "``") => {
+                    Value::Empty
+                }
+                Written::Line(value) if !holds_secret(&name, &written) => {
+                    Value::Plain(value.clone())
+                }
+                _ => Value::Secret,
+            };
+            (name, value)
+        })
+        .collect()
+}
+
+/// The secrets `text`, a file of variables, holds, each with its
+/// variable's name: a value written on its line without its quotes, and
+/// each line of one over several. For taking them out of what commands
+/// print, never for a model.
+fn secret_values(text: &str) -> Vec<(String, String)> {
+    parse(text)
+        .into_iter()
+        .filter(|(name, written)| holds_secret(name, written))
+        .flat_map(|(name, written)| {
+            let values = match written {
+                Written::Line(value) => vec![unquoted(&value).to_owned()],
+                Written::Lines(lines) => lines.iter().map(|l| l.trim().to_owned()).collect(),
+            };
+            values
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .map(move |value| (name.clone(), value))
+        })
+        .collect()
+}
+
+/// Folders no file of variables is looked for in: what tools download or
+/// build.
+const NOT_SEARCHED: [&str; 12] = [
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".next",
+    "vendor",
+    ".terraform",
+    ".cache",
+];
+
+/// How deep under the project files of variables are looked for.
+const DEPTH: usize = 4;
+
+/// The largest file of variables read.
+const LARGEST: u64 = 256 * 1024;
+
+/// The secrets the project's files of variables hold, git ignored ones
+/// first of all, each with its variable's name.
+pub(crate) fn project_secrets(root: &Path) -> Vec<(String, String)> {
+    WalkBuilder::new(root)
+        .standard_filters(false)
+        .max_depth(Some(DEPTH))
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|t| t.is_dir())
+                && NOT_SEARCHED.iter().any(|name| entry.file_name() == *name))
+        })
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| variables_file(&entry.file_name().to_string_lossy()))
+        // Through a link too: a command reads through it.
+        .filter(|entry| fs::metadata(entry.path()).is_ok_and(|m| m.is_file() && m.len() <= LARGEST))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .flat_map(|text| secret_values(&text))
+        .collect()
+}
+
+/// `text` with the values of `secrets` taken out, the longest first so
+/// that a part of one is not left over: one of 8 characters or more
+/// wherever it stands, a shorter one, too common to be told from ordinary
+/// words, where it follows its name.
+pub(crate) fn redact_values(text: &str, secrets: &[(String, String)]) -> String {
+    let mut secrets: Vec<&(String, String)> = secrets.iter().collect();
+    secrets.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
+    let mut out = text.to_owned();
+    for (name, value) in secrets {
+        let hidden = format!("<redacted:{name}>");
+        if value.len() >= 8 {
+            if out.contains(value.as_str()) {
+                out = out.replace(value.as_str(), &hidden);
+            }
+            continue;
+        }
+        for between in ["=", " = ", "= ", " ="] {
+            for quote in ["", "\"", "'"] {
+                out = replace_whole(
+                    &out,
+                    &format!("{name}{between}{quote}{value}{quote}"),
+                    &format!("{name}{between}{quote}{hidden}{quote}"),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `text` with `from` replaced by `to` where it is not the start of a
+/// longer value: `PASS=abc` is not in `PASS=abcd`.
+fn replace_whole(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let after = &rest[at + from.len()..];
+        let whole = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || "_-.+/=@:".contains(c)));
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { to } else { from });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether a variable's name says it holds a secret: as an environment's
@@ -252,6 +419,26 @@ API_KEY=
         ] {
             assert!(!all.contains(value), "{value} in {all}");
         }
+    }
+
+    #[test]
+    fn a_short_secret_is_taken_out_only_after_its_name() {
+        let secrets = secret_values("PASS=abc\nTOKEN='t0k3n-0123456789'\nPORT=80\n");
+        assert_eq!(
+            secrets,
+            [
+                ("PASS".to_owned(), "abc".to_owned()),
+                ("TOKEN".to_owned(), "t0k3n-0123456789".to_owned()),
+            ]
+        );
+        assert_eq!(
+            redact_values(
+                "PASS=abc PASS=abcd PASS = 'abc' abc PORT=80 x t0k3n-0123456789",
+                &secrets
+            ),
+            "PASS=<redacted:PASS> PASS=abcd PASS = '<redacted:PASS>' abc PORT=80 x \
+             <redacted:TOKEN>"
+        );
     }
 
     #[test]

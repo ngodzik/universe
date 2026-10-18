@@ -2159,6 +2159,14 @@ pub fn redact_secrets(text: &str) -> (String, Vec<String>) {
     (redacted, names)
 }
 
+/// `text`, which a program run in the project `root` printed, without the
+/// secrets of the environment nor those of the project's files of
+/// variables.
+pub(crate) fn redact_output(text: &str, root: &Path) -> String {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    crate::secrets::redact_values(&redact(text, &env), &crate::secrets::project_secrets(root))
+}
+
 /// `text` with the value of every secret of `env` replaced by its name, the
 /// longest first, so that a part of one is not left over. Values shorter
 /// than 8 characters are too common to be told from ordinary words.
@@ -2206,6 +2214,9 @@ async fn run_in(
         }
     };
     let text = redact(&String::from_utf8_lossy(&output.stdout), secrets);
+    // A command may read a file of variables without naming it, as
+    // `grep -rn KEY .` does.
+    let text = crate::secrets::redact_values(&text, &crate::secrets::project_secrets(dir));
     Ok(CommandOutput {
         status: output.status.code(),
         output: tail(&text, OUTPUT_BYTES),
@@ -2865,6 +2876,46 @@ mod tests {
         assert!(aws.iter().any(|(n, _)| n == "AWS_SECRET_ACCESS_KEY"));
         let other = environment(&all, "ls", Path::new("/nonexistent"), &[]);
         assert!(!other.iter().any(|(n, _)| n == "AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_a_command_prints_of_the_projects_files_of_variables_is_taken_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("api")).unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "DB_PASS=hunter2\nAPI_KEY=\"sk-live-0123456789\"\nPORT=8080\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("api/.env.local"),
+            "PRIVATE_KEY=\"-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END KEY-----\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.txt"), "not the same: hunter2x\n").unwrap();
+        // Named, a file of variables is refused; here a search reads them all.
+        let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let out = run_in("grep -rn . . | sort", root, env, &[])
+            .await
+            .unwrap()
+            .output;
+        for line in [
+            "./.env:1:DB_PASS=<redacted:DB_PASS>",
+            "./.env:2:API_KEY=\"<redacted:API_KEY>\"",
+            "./.env:3:PORT=8080",
+            "./api/.env.local:2:<redacted:PRIVATE_KEY>",
+            // A short secret is too common a word to be taken out anywhere
+            // but after its name.
+            "./notes.txt:1:not the same: hunter2x",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in {out}");
+        }
+        assert!(
+            !out.contains("sk-live") && !out.contains("BEGIN KEY"),
+            "{out}"
+        );
     }
 
     #[test]
