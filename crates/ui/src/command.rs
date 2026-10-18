@@ -53,6 +53,9 @@ pub(crate) enum Command {
     Hosts(Option<String>),
     /// `/mcp` lists the MCP servers of the settings and how they answered.
     Mcp,
+    /// `/rules` lists the rules kept outside the project's repository and
+    /// how fresh their copies are.
+    Rules,
     /// `/debug <question>`: the question investigated in a fresh context,
     /// only the report coming back.
     Debug(Option<String>),
@@ -148,6 +151,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "strict" => Ok(Command::Strict(rest_opt)),
         "hosts" => Ok(Command::Hosts(rest_opt)),
         "mcp" => Ok(Command::Mcp),
+        "rules" => Ok(Command::Rules),
         "debug" => Ok(Command::Debug(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
@@ -391,6 +395,7 @@ Type a question or a change and press Enter. Changes are checked before they are
 /hosts               servers allowed besides those already used; /hosts forget
                      (every command is written down in ~/.universe/audit.log)
 /mcp                 the MCP servers of the settings, [mcp.<name>], and how they answered
+/rules               the rules kept outside the repository, [[rules]], and how fresh they are
 /ticket <id or link> link a ticket of a tracker of the settings to the branch, its work
                      listed (Ctrl-L shows them); /ticket note <text>, /ticket check
 /debug <question>    investigate in a fresh context, with the model marked ◆ for fresh work;

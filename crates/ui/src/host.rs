@@ -149,6 +149,10 @@ pub struct Host<M, D> {
     /// The machine kept from idle sleep while ticks run; released when
     /// they stop, and when the host goes, however the loop ends.
     awake: crate::awake::Awake,
+    /// The rules kept outside the project's repository, from their copies.
+    rules: crate::outside_rules::OutsideRules,
+    /// The project's files of instructions, for agents to be told of.
+    guides: crate::guides::Guides,
 }
 
 impl<M, D> Host<M, D>
@@ -180,6 +184,8 @@ where
             warm_tick: tokio::time::interval(Duration::from_secs(30)),
             servers: Arc::new(Servers::new(workspace_root)),
             awake: crate::awake::Awake::default(),
+            rules: crate::outside_rules::OutsideRules::default(),
+            guides: crate::guides::Guides::default(),
         }
     }
 
@@ -189,6 +195,19 @@ where
     pub async fn start(&mut self, app: &mut App, start: Start) {
         let shown = app.chat_id();
         self.slot(shown);
+        // The copies from the last session serve at once; their sources are
+        // read again in the background.
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        self.rules = crate::outside_rules::OutsideRules::for_project(
+            app.rules_entries(),
+            self.workspace.root(),
+            home.as_deref(),
+            crate::outside_rules::cache().as_deref(),
+            app.external_tools(),
+        );
+        self.rules.refresh_due();
+        // Listed in the background, for the first request to an agent.
+        self.guides.get(self.workspace.root());
         let state = self
             .store
             .as_ref()
@@ -408,6 +427,12 @@ where
         }
         // What needs the conversation waits while a request has it, rather
         // than freeze the interface until its end.
+        // What the MCP servers have to say, such as a page to consent on.
+        if let Some(external) = app.external_tools().cloned() {
+            for notice in external.notices() {
+                app.report_info(&notice);
+            }
+        }
         let effect = match effect {
             Some(Effect::Save) if app.is_running() => {
                 self.slot(shown).save_pending = true;
@@ -456,6 +481,8 @@ where
             docker_tx,
             docker_asking,
             servers,
+            rules,
+            guides,
             ..
         } = self;
         let store = store.as_ref();
@@ -469,7 +496,10 @@ where
             .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
-                let config = asking(config, app.root(), tx);
+                let config = asking(config, app.root(), tx)
+                    .with_outside_rules(rules.text())
+                    .with_folder_guides(guides.get(workspace.root()));
+                rules.refresh_due();
                 *task = Some(spawn_agent(
                     Arc::clone(model),
                     Arc::clone(delegate),
@@ -484,7 +514,10 @@ where
                 config,
                 investigator,
             } => {
-                let config = asking(config, app.root(), tx);
+                let config = asking(config, app.root(), tx)
+                    .with_outside_rules(rules.text())
+                    .with_folder_guides(guides.get(workspace.root()));
+                rules.refresh_due();
                 let (model, delegate, conversation, tx) = (
                     Arc::clone(model),
                     Arc::clone(delegate),
@@ -675,6 +708,17 @@ where
                     }
                     Err(e) => app.report_error(e),
                 }
+            }
+            Effect::ShowRules => {
+                rules.refresh_due();
+                let lines = rules.status();
+                app.report_info(&if lines.is_empty() {
+                    "No rules kept outside this project's repository: [[rules]] in \
+                     ~/.universe/config.toml, with project and source"
+                        .to_owned()
+                } else {
+                    format!("Rules kept outside the repository\n{}", lines.join("\n"))
+                });
             }
             Effect::ShowCommit(hash) => {
                 let shown = std::process::Command::new("git")

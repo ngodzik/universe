@@ -139,6 +139,10 @@ pub struct Defaults {
     /// server's tools. Set in the file only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trackers: BTreeMap<String, crate::tickets::Tracker>,
+    /// Rules a project's models get from documents kept outside its
+    /// repository, `[[rules]]`. Set in the file only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::outside_rules::RulesEntry>,
 }
 
 impl Defaults {
@@ -405,6 +409,18 @@ mod tests {
                     hosts: vec!["issues.example.com".into()],
                 },
             )]),
+            rules: vec![crate::outside_rules::RulesEntry {
+                project: "~/code/shop".into(),
+                only: Some("api/**".into()),
+                refresh_secs: Some(300),
+                source: serde_json::from_value(serde_json::json!({
+                    "kind": "mcp",
+                    "server": "tracker",
+                    "read": { "tool": "fetch", "arguments": { "id": "p1", "depth": 2 } },
+                    "write": { "tool": "update", "arguments": { "id": "p1", "text": "{text}" } }
+                }))
+                .unwrap(),
+            }],
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

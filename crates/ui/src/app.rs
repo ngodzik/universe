@@ -177,6 +177,9 @@ pub struct Settings {
     pub external: Option<std::sync::Arc<dyn universe_core::ExternalTools>>,
     /// The ticket trackers, as written in the settings.
     pub trackers: std::collections::BTreeMap<String, crate::tickets::Tracker>,
+    /// The rules kept outside the projects' repositories, as written in the
+    /// settings: every project's, so that saving keeps them all.
+    pub rules: Vec<crate::outside_rules::RulesEntry>,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -249,6 +252,9 @@ pub enum Effect {
     Copy(String),
     /// Show what a commit did, as a reply cited it.
     ShowCommit(String),
+    /// Say which rules kept outside the repository the project's models
+    /// get, and how fresh their copies are.
+    ShowRules,
     /// Read the latest conversations of every project, for `/chats`.
     ListEverywhere,
     /// Read a ticket through its tracker's MCP server, and have a model
@@ -2878,6 +2884,7 @@ impl App {
                     other => other,
                 };
             }
+            Command::Rules => return Some(Effect::ShowRules),
             Command::Mcp => {
                 let servers = self
                     .settings
@@ -3495,6 +3502,17 @@ impl App {
     /// The project's root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The rules the settings keep outside the projects' repositories,
+    /// every project's.
+    pub fn rules_entries(&self) -> &[crate::outside_rules::RulesEntry] {
+        &self.settings.rules
+    }
+
+    /// The tools of the MCP servers, when the settings declare some.
+    pub fn external_tools(&self) -> Option<&std::sync::Arc<dyn universe_core::ExternalTools>> {
+        self.settings.external.as_ref()
     }
 
     /// How hard models think before answering.
@@ -4375,6 +4393,7 @@ impl App {
             summarize_when_cold: self.settings.summarize_when_cold.clone(),
             mcp: self.settings.mcp.clone(),
             trackers: self.settings.trackers.clone(),
+            rules: self.settings.rules.clone(),
         }
     }
 
@@ -6587,8 +6606,45 @@ mod tests {
                 summarize_when_cold: vec![],
                 mcp: Default::default(),
                 trackers: Default::default(),
+                rules: vec![],
             }
         );
+    }
+
+    #[test]
+    fn the_rules_written_in_the_settings_are_kept_when_they_are_saved() {
+        // The settings file is written again from the state: an entry the
+        // state did not carry would be erased by the next save.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+project = "~/code/app"
+only = "backend/**"
+refresh_secs = 600
+source = { kind = "mcp", server = "docs", read = { tool = "fetch", arguments = { id = "p1" } } }
+
+[[rules]]
+project = "~/code/app"
+source = { kind = "file", path = "~/notes/app-rules.md" }
+"#,
+        )
+        .unwrap();
+        let written = Defaults::load(&path).unwrap();
+        assert_eq!(written.rules.len(), 2);
+        let mut app = App::new(
+            Settings {
+                rules: written.rules.clone(),
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.settings.budget = Some(Usd(0.5));
+        let kept = app.defaults_to_keep().unwrap();
+        kept.save(&path).unwrap();
+        assert_eq!(Defaults::load(&path).unwrap().rules, written.rules);
     }
 
     #[test]

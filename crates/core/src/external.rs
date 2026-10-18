@@ -28,10 +28,17 @@ pub trait ExternalTools: Send + Sync + fmt::Debug {
 
     /// Each server, and how it answered, in a few words.
     fn status(&self) -> Vec<(String, String)>;
+
+    /// What the person should hear of since this was last asked, such as a
+    /// page to consent on; each is said once.
+    fn notices(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// An MCP server declared in the settings: reached at a URL (streamable
-/// HTTP, with headers such as a token), or started as a command (stdio).
+/// HTTP, with headers such as a token, or OAuth), or started as a command
+/// (stdio).
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
@@ -41,6 +48,10 @@ pub struct McpServer {
     /// Headers sent with each request, such as `Authorization`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Whether the server at `url` is reached with OAuth: the person
+    /// consents once in the browser, and the grant is kept and renewed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oauth: bool,
     /// The program and its arguments, for stdio.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
@@ -61,6 +72,7 @@ impl fmt::Debug for McpServer {
         f.debug_struct("McpServer")
             .field("url", &self.url)
             .field("headers", &names(&self.headers))
+            .field("oauth", &self.oauth)
             .field("command", &self.command)
             .field("env", &names(&self.env))
             .finish()
@@ -76,6 +88,7 @@ mod tests {
         let server = McpServer {
             url: Some("https://mcp.example.com/mcp".into()),
             headers: BTreeMap::from([("Authorization".into(), "Bearer secret-token".into())]),
+            oauth: false,
             command: Vec::new(),
             env: BTreeMap::from([("API_KEY".into(), "key-value".into())]),
         };

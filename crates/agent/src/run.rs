@@ -2866,10 +2866,47 @@ fn identity(model: &ModelId, leads: bool, config: &AgentConfig) -> String {
             rules.trim()
         ));
     }
+    if let Some(rules) = &config.outside_rules {
+        text.push_str(&outside_rules_say(rules));
+    }
     if let Some(instructions) = &config.instructions {
         text.push_str(&person_says(instructions));
     }
     text
+}
+
+/// The most guides an agent is told of by name.
+const GUIDES_NAMED: usize = 60;
+
+/// Where the project keeps instructions for coding agents, for an agent:
+/// Codex reads no CLAUDE.md, and neither reads a folder's before it works
+/// there unless told.
+fn guides_say(guides: &[String]) -> String {
+    let mut named = guides
+        .iter()
+        .take(GUIDES_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if guides.len() > GUIDES_NAMED {
+        named.push_str(&format!(" and {} more", guides.len() - GUIDES_NAMED));
+    }
+    format!(
+        "\n\nThe project keeps instructions for coding agents in these files: {named}. Before \
+         working on the files of a folder, read the instructions of that folder and of the \
+         folders above it, and follow them."
+    )
+}
+
+/// The rules the person keeps for the project outside its repository, as
+/// added to a model's instructions.
+fn outside_rules_say(rules: &str) -> String {
+    format!(
+        "\n\nThe person's own rules for this project, kept outside its repository; they come \
+         before the project's own instructions when the two differ, and those for some files \
+         only apply to those files:\n{}",
+        rules.trim()
+    )
 }
 
 /// The person's own instructions, as added to a model's.
@@ -2881,13 +2918,20 @@ fn person_says(instructions: &str) -> String {
     )
 }
 
-/// Instructions for an agent such as Claude Code: `base`, and the person's
-/// own when there are some.
+/// Instructions for an agent such as Claude Code: `base`, the rules kept
+/// outside the repository, which it does not read, and the person's own.
 fn agent_instructions(base: &str, config: &AgentConfig) -> String {
-    match &config.instructions {
-        Some(instructions) => format!("{base}{}", person_says(instructions)),
-        None => base.to_owned(),
+    let mut text = base.to_owned();
+    if !config.folder_guides.is_empty() {
+        text.push_str(&guides_say(&config.folder_guides));
     }
+    if let Some(rules) = &config.outside_rules {
+        text.push_str(&outside_rules_say(rules));
+    }
+    if let Some(instructions) = &config.instructions {
+        text.push_str(&person_says(instructions));
+    }
+    text
 }
 
 /// The `delegate` tool, offering the team to `lead`; `None` when nobody
@@ -3347,9 +3391,20 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                     .map(|o| o.summary.clone())
                     .map_err(ToString::to_string),
             });
+            let content = match result {
+                Ok(output) => {
+                    let mut text = output.for_model;
+                    if let Some(path) = path_argument(&call.arguments) {
+                        let root = ctx.toolbox.workspace().root();
+                        text.push_str(&folder_guidance(root, &path, messages));
+                    }
+                    text
+                }
+                Err(e) => format!("error: {e}"),
+            };
             messages.push(Message::Tool {
                 call_id: call.id.clone(),
-                content: result.map_or_else(|e| format!("error: {e}"), |o| o.for_model),
+                content,
             });
         }
         // A tool result cannot carry an image in the OpenAI format: each
@@ -4026,6 +4081,26 @@ fn describe(failure: &CheckFailure) -> String {
     )
 }
 
+/// The instructions of the folders `path` is in that the conversation was
+/// not given yet, as they are added to a tool's result: a monorepo's guides
+/// come with the first file read in their part of it, and the system
+/// prompt, which the provider caches, stays as it was. Whether one was given
+/// is read from the conversation itself, so that what drops a result, such
+/// as compaction, forgets it too.
+fn folder_guidance(root: &std::path::Path, path: &str, messages: &[Message]) -> String {
+    let mut out = String::new();
+    for (file, text) in universe_tools::folder_instructions(root, std::path::Path::new(path)) {
+        let opening = format!("This part of the project has its own instructions, in {file};");
+        let given = messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains(&opening)));
+        if !given {
+            out.push_str(&format!("\n\n{opening} follow them for its files:\n{text}"));
+        }
+    }
+    out
+}
+
 fn path_argument(arguments: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()?
@@ -4526,8 +4601,10 @@ mod tests {
             .build()
             .unwrap()
             .with_instructions(Some("Answer in French.".into()))
-            .with_project_rules(Some("## CLAUDE.md\nUse tabs.".into()));
-        Session::new()
+            .with_project_rules(Some("## CLAUDE.md\nUse tabs.".into()))
+            .with_outside_rules(Some("## file:~/rules.md\nName tests by behaviour.".into()));
+        let mut session = Session::new();
+        session
             .send(
                 &model,
                 &NoDelegate,
@@ -4547,6 +4624,17 @@ mod tests {
         assert!(
             system.contains("The person's own instructions")
                 && system.contains("Answer in French.")
+        );
+        // The rules kept outside the repository, between the two, and only
+        // in what was sent: the conversation kept never holds them.
+        let outside = system.find("Name tests by behaviour.").unwrap();
+        assert!(system.find("Use tabs.").unwrap() < outside);
+        assert!(outside < system.find("Answer in French.").unwrap());
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| !format!("{m:?}").contains("Name tests by behaviour."))
         );
         // Blank instructions add nothing.
         let config = AgentConfig::builder()
@@ -4673,6 +4761,125 @@ mod tests {
             })
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_folders_instructions_come_with_the_first_file_read_there_once() {
+        let (dir, mut toolbox) = setup();
+        std::fs::create_dir_all(dir.path().join("api/routes")).unwrap();
+        std::fs::write(dir.path().join("api/CLAUDE.md"), "Handlers are async.").unwrap();
+        std::fs::write(dir.path().join("api/routes/a.py"), "a = 1\n").unwrap();
+        std::fs::write(dir.path().join("api/routes/b.py"), "b = 2\n").unwrap();
+        let model = Scripted::new(vec![
+            calls("read_file", json!({"path": "api/routes/a.py"})),
+            calls("read_file", json!({"path": "api/routes/b.py"})),
+            says("Read."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read them",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let results: Vec<&str> = session
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        let opening = "This part of the project has its own instructions, in api/CLAUDE.md;";
+        assert!(results[0].contains(opening) && results[0].contains("Handlers are async."));
+        assert!(!results[1].contains(opening));
+        // The system prompt stays as it was, for the provider's cache.
+        let seen = model.seen.lock().unwrap();
+        let Message::System(system) = &seen[0].messages[0] else {
+            panic!("instructions come first");
+        };
+        assert!(!system.contains("Handlers are async."));
+        // Once the result is gone, as compaction drops it, they come again.
+        let root = dir.path();
+        assert!(folder_guidance(root, "api/routes/a.py", &session.messages).is_empty());
+        assert!(folder_guidance(root, "api/routes/a.py", &[]).contains(opening));
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_told_where_the_projects_instructions_are() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_folder_guides(vec!["CLAUDE.md".into(), "api/CLAUDE.md".into()]);
+        Session::new()
+            .send(
+                &Scripted::new(Vec::new()),
+                &claude,
+                &mut toolbox,
+                &config,
+                "make done.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = claude.requests.lock().unwrap();
+        assert!(
+            requests[0].instructions.contains(
+                "instructions for coding agents in these files: CLAUDE.md, api/CLAUDE.md."
+            )
+        );
+        let many: Vec<String> = (0..GUIDES_NAMED + 3)
+            .map(|i| format!("s{i}/AGENTS.md"))
+            .collect();
+        assert!(guides_say(&many).contains("and 3 more"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_gets_the_rules_kept_outside_the_repository() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_outside_rules(Some("## file:~/rules.md\nName tests by behaviour.".into()))
+            .with_instructions(Some("Answer in French.".into()));
+        Session::new()
+            .send(
+                &Scripted::new(Vec::new()),
+                &claude,
+                &mut toolbox,
+                &config,
+                "make done.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = claude.requests.lock().unwrap();
+        let given = &requests[0].instructions;
+        let outside = given.find("Name tests by behaviour.").unwrap();
+        assert!(outside < given.find("Answer in French.").unwrap());
     }
 
     #[tokio::test]

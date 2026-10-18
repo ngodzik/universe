@@ -3,14 +3,18 @@
 //! and their tools offered to models as `<server>__<tool>`.
 //!
 //! Servers are reached two ways: streamable HTTP, a JSON-RPC message per
-//! POST answered as JSON or as server-sent events; and stdio, a JSON-RPC
-//! message per line. Nothing waits on a server that does not answer: its
-//! tools are offered once it does, and `/mcp` says how each answered.
+//! POST answered as JSON or as server-sent events, with fixed headers or
+//! OAuth; and stdio, a JSON-RPC message per line. Nothing waits on a server
+//! that does not answer: its tools are offered once it does, and `/mcp`
+//! says how each answered.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod oauth;
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,6 +46,8 @@ struct RemoteTool {
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     Connecting,
+    /// Waiting for the person's consent, on this page.
+    Consenting(String),
     Ready(Vec<RemoteTool>),
     Failed(String),
 }
@@ -58,6 +64,10 @@ enum Link {
         client: reqwest::Client,
         url: String,
         headers: BTreeMap<String, String>,
+        /// The OAuth token sent, when the server takes one.
+        bearer: Option<String>,
+        /// The server's last answer was 401: what was sent is not taken.
+        refused: bool,
         session: Option<String>,
         initialized: bool,
     },
@@ -71,6 +81,8 @@ impl Link {
                 client: reqwest::Client::new(),
                 url: url.clone(),
                 headers: config.headers.clone(),
+                bearer: None,
+                refused: false,
                 session: None,
                 initialized: false,
             });
@@ -95,6 +107,18 @@ impl Link {
             stdin,
             lines: BufReader::new(stdout).lines(),
         })
+    }
+
+    /// The OAuth token sent from now on.
+    fn set_bearer(&mut self, token: String) {
+        if let Self::Http { bearer, .. } = self {
+            *bearer = Some(token);
+        }
+    }
+
+    /// Whether the server refused what was sent, with a 401.
+    fn was_refused(&self) -> bool {
+        matches!(self, Self::Http { refused: true, .. })
     }
 
     /// Sends a request and waits for its answer's result.
@@ -151,6 +175,8 @@ impl Link {
                 client,
                 url,
                 headers,
+                bearer,
+                refused,
                 session,
                 initialized,
             } => {
@@ -160,6 +186,9 @@ impl Link {
                     .json(message);
                 for (name, value) in headers.iter() {
                     post = post.header(name.as_str(), value.as_str());
+                }
+                if let Some(token) = bearer.as_deref() {
+                    post = post.bearer_auth(token);
                 }
                 if let Some(session) = session.as_deref() {
                     post = post.header("Mcp-Session-Id", session);
@@ -176,6 +205,7 @@ impl Link {
                     *session = Some(given.to_owned());
                 }
                 let status = response.status();
+                *refused = status == reqwest::StatusCode::UNAUTHORIZED;
                 let events = response
                     .headers()
                     .get("Content-Type")
@@ -299,6 +329,12 @@ struct Server {
     state: Mutex<State>,
     link: tokio::sync::Mutex<Option<Link>>,
     next_id: AtomicU64,
+    /// Where its OAuth grant is kept, when it takes OAuth.
+    grants: Option<oauth::Grants>,
+    /// What opens the consent page: the browser, but in tests.
+    open: fn(&str) -> bool,
+    /// What the person should hear of, shared by every server.
+    notices: Arc<Mutex<Vec<String>>>,
 }
 
 impl Server {
@@ -318,45 +354,24 @@ impl Server {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Opens the link, says hello, and lists the tools.
+    /// Opens the link, says hello, and lists the tools. A grant the server
+    /// no longer takes is forgotten, and the person asked once more.
     async fn connect(&self) {
         let outcome = async {
             let mut link = Link::open(&self.config)?;
-            link.request(
-                self.id(),
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL,
-                    "capabilities": {},
-                    "clientInfo": {"name": "universe", "version": env!("CARGO_PKG_VERSION")},
-                }),
-            )
-            .await?;
-            link.notify("notifications/initialized").await?;
-            let mut tools = Vec::new();
-            let mut cursor: Option<String> = None;
-            loop {
-                let params = cursor.map_or_else(|| json!({}), |c| json!({"cursor": c}));
-                let page = link.request(self.id(), "tools/list", params).await?;
-                for tool in page["tools"].as_array().into_iter().flatten() {
-                    let Some(name) = tool["name"].as_str() else {
-                        continue;
-                    };
-                    tools.push(RemoteTool {
-                        name: name.to_owned(),
-                        description: tool["description"].as_str().unwrap_or("").to_owned(),
-                        schema: tool
-                            .get("inputSchema")
-                            .cloned()
-                            .unwrap_or_else(|| json!({"type": "object"})),
-                        read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
-                    });
-                }
-                cursor = page["nextCursor"].as_str().map(str::to_owned);
-                if cursor.is_none() {
-                    break;
-                }
+            if self.config.oauth {
+                link.set_bearer(self.token(false).await?);
             }
+            let tools = match self.hello(&mut link).await {
+                Err(_) if self.config.oauth && link.was_refused() => {
+                    if let Some(grants) = &self.grants {
+                        grants.forget(&self.name);
+                    }
+                    link.set_bearer(self.token(true).await?);
+                    self.hello(&mut link).await?
+                }
+                other => other?,
+            };
             Ok::<_, String>((link, tools))
         }
         .await;
@@ -369,12 +384,128 @@ impl Server {
         }
     }
 
-    /// Calls one of its tools.
+    /// The OAuth token to send: the grant kept, renewed when it is about
+    /// to end, or the person's consent asked for when there is none, it
+    /// cannot be renewed, or `again`.
+    async fn token(&self, again: bool) -> Result<String, String> {
+        let grants = self
+            .grants
+            .as_ref()
+            .ok_or("no folder to keep its grant in")?;
+        let url = self.config.url.as_deref().ok_or("OAuth needs a url")?;
+        let client = reqwest::Client::new();
+        if !again && let Some(grant) = grants.load(&self.name) {
+            if !grant.is_ending(oauth::now()) {
+                return Ok(grant.access_token);
+            }
+            if let Ok(renewed) = oauth::renew(&client, &grant).await {
+                grants.save(&self.name, &renewed)?;
+                return Ok(renewed.access_token);
+            }
+        }
+        let grant = oauth::consent(
+            &client,
+            url,
+            |page| {
+                self.set(State::Consenting(page.to_owned()));
+                if let Ok(mut notices) = self.notices.lock() {
+                    notices.push(format!(
+                        "The MCP server {} waits for your consent in the browser; if it did not \
+                         open: {page}",
+                        self.name
+                    ));
+                }
+            },
+            self.open,
+        )
+        .await?;
+        self.set(State::Connecting);
+        grants.save(&self.name, &grant)?;
+        Ok(grant.access_token)
+    }
+
+    /// The token renewed, when the grant kept is about to end.
+    async fn renewed(&self) -> Option<String> {
+        let grants = self.grants.as_ref()?;
+        let grant = grants.load(&self.name)?;
+        if !grant.is_ending(oauth::now()) {
+            return None;
+        }
+        let renewed = oauth::renew(&reqwest::Client::new(), &grant).await.ok()?;
+        grants.save(&self.name, &renewed).ok()?;
+        Some(renewed.access_token)
+    }
+
+    /// Says hello on `link` and lists the tools.
+    async fn hello(&self, link: &mut Link) -> Result<Vec<RemoteTool>, String> {
+        link.request(
+            self.id(),
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL,
+                "capabilities": {},
+                "clientInfo": {"name": "universe", "version": env!("CARGO_PKG_VERSION")},
+            }),
+        )
+        .await?;
+        link.notify("notifications/initialized").await?;
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = cursor.map_or_else(|| json!({}), |c| json!({"cursor": c}));
+            let page = link.request(self.id(), "tools/list", params).await?;
+            for tool in page["tools"].as_array().into_iter().flatten() {
+                let Some(name) = tool["name"].as_str() else {
+                    continue;
+                };
+                tools.push(RemoteTool {
+                    name: name.to_owned(),
+                    description: tool["description"].as_str().unwrap_or("").to_owned(),
+                    schema: tool
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object"})),
+                    read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
+                });
+            }
+            cursor = page["nextCursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(tools)
+    }
+
+    /// Calls one of its tools. A call the server refuses with a 401
+    /// reconnects, renewing or asking for the grant, and is tried once
+    /// more.
     async fn call(&self, tool: &str, arguments: Value) -> Result<String, String> {
+        let first = self.call_once(tool, arguments.clone()).await;
+        let refused = self.config.oauth
+            && first.is_err()
+            && self
+                .link
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(Link::was_refused);
+        if !refused {
+            return first;
+        }
+        self.connect().await;
+        self.call_once(tool, arguments).await
+    }
+
+    async fn call_once(&self, tool: &str, arguments: Value) -> Result<String, String> {
         let mut link = self.link.lock().await;
         let Some(open) = link.as_mut() else {
             return Err(format!("{} is not connected", self.name));
         };
+        if self.config.oauth
+            && let Some(token) = self.renewed().await
+        {
+            open.set_bearer(token);
+        }
         let id = self.id();
         match open
             .request(
@@ -394,6 +525,7 @@ impl Server {
 #[derive(Clone)]
 pub struct Mcp {
     servers: Vec<Arc<Server>>,
+    notices: Arc<Mutex<Vec<String>>>,
 }
 
 impl std::fmt::Debug for Mcp {
@@ -406,9 +538,21 @@ impl std::fmt::Debug for Mcp {
 
 impl Mcp {
     /// Starts every server of `declared`, each on a task of its own: their
-    /// tools are offered as each answers. Needs a Tokio runtime.
+    /// tools are offered as each answers. The OAuth grants of those that
+    /// take it are kept in `grants`, one file each, readable by their owner
+    /// only. Needs a Tokio runtime.
     #[must_use]
-    pub fn start(declared: &BTreeMap<String, McpServer>) -> Self {
+    pub fn start(declared: &BTreeMap<String, McpServer>, grants: Option<PathBuf>) -> Self {
+        Self::start_with(declared, grants, oauth::open_browser)
+    }
+
+    /// As [`Mcp::start`], the consent page opened by `open`.
+    fn start_with(
+        declared: &BTreeMap<String, McpServer>,
+        grants: Option<PathBuf>,
+        open: fn(&str) -> bool,
+    ) -> Self {
+        let notices = Arc::new(Mutex::new(Vec::new()));
         let servers: Vec<Arc<Server>> = declared
             .iter()
             .map(|(name, config)| {
@@ -418,6 +562,9 @@ impl Mcp {
                     state: Mutex::new(State::Connecting),
                     link: tokio::sync::Mutex::new(None),
                     next_id: AtomicU64::new(1),
+                    grants: grants.clone().map(oauth::Grants::new),
+                    open,
+                    notices: Arc::clone(&notices),
                 })
             })
             .collect();
@@ -425,7 +572,7 @@ impl Mcp {
             let server = Arc::clone(server);
             tokio::spawn(async move { server.connect().await });
         }
-        Self { servers }
+        Self { servers, notices }
     }
 
     /// Whether the settings declare any server.
@@ -500,6 +647,9 @@ impl ExternalTools for Mcp {
             .map(|server| {
                 let how = match server.state() {
                     State::Connecting => "connecting".to_owned(),
+                    State::Consenting(page) => format!(
+                        "waiting for your consent in the browser; if it did not open: {page}"
+                    ),
                     State::Ready(tools) => {
                         let read = tools.iter().filter(|t| t.read_only).count();
                         format!(
@@ -513,6 +663,13 @@ impl ExternalTools for Mcp {
                 (server.name.clone(), how)
             })
             .collect()
+    }
+
+    fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
     }
 }
 
@@ -607,7 +764,7 @@ mod tests {
                 ..McpServer::default()
             },
         )]);
-        let mcp = Mcp::start(&declared);
+        let mcp = Mcp::start(&declared, None);
         mcp.settled(Duration::from_secs(5)).await;
         assert_eq!(
             mcp.status(),
@@ -624,6 +781,255 @@ mod tests {
         );
     }
 
+    /// How many times a test's consent page was opened.
+    static CONSENTS: AtomicU64 = AtomicU64::new(0);
+
+    /// The person consenting at once: the browser goes back to the
+    /// callback with the PKCE challenge as its code, for the token
+    /// endpoint to check against the verifier.
+    fn consent_at_once(page: &str) -> bool {
+        CONSENTS.fetch_add(1, Ordering::SeqCst);
+        let page = reqwest::Url::parse(page).unwrap();
+        let param = |name: &str| {
+            page.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap()
+        };
+        let redirect = reqwest::Url::parse(&param("redirect_uri")).unwrap();
+        let target = format!(
+            "{}?code={}&state={}",
+            redirect.path(),
+            param("code_challenge"),
+            param("state")
+        );
+        let address = format!("127.0.0.1:{}", redirect.port().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut socket = std::net::TcpStream::connect(address).unwrap();
+            write!(socket, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+            let mut answer = String::new();
+            let _ = socket.read_to_string(&mut answer);
+        });
+        true
+    }
+
+    /// One request read whole: its first line, headers in lower case, body.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, String, String) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            buffer.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buffer).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if body.len() >= length || n == 0 {
+                    let first = head.lines().next().unwrap_or("").to_owned();
+                    return (
+                        first,
+                        head.to_lowercase(),
+                        body[..length.min(body.len())].to_owned(),
+                    );
+                }
+            }
+            if n == 0 {
+                return (String::new(), String::new(), String::new());
+            }
+        }
+    }
+
+    /// An MCP server that takes OAuth only, and its authorization server,
+    /// at one address: discovery, registration, the token endpoint, and the
+    /// MCP endpoint, which takes the tokens in `accepted`.
+    async fn serve_oauth(accepted: &'static [&'static str]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let origin = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let base = origin.clone();
+                tokio::spawn(async move {
+                    let (first, head, body) = read_request(&mut socket).await;
+                    let target = first.split(' ').nth(1).unwrap_or("").to_owned();
+                    let field = |name: &str| {
+                        body.split('&')
+                            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                            .map(|v| v.replace("%3A", ":").replace("%2F", "/"))
+                    };
+                    let json = |value: Value| (200, "application/json", value.to_string());
+                    let (status, content_type, reply) = match target.as_str() {
+                        "/.well-known/oauth-protected-resource" => json(json!({
+                            "resource": format!("{base}/mcp"),
+                            "authorization_servers": [base],
+                        })),
+                        "/.well-known/oauth-authorization-server" => json(json!({
+                            "issuer": base,
+                            "authorization_endpoint": format!("{base}/authorize"),
+                            "token_endpoint": format!("{base}/token"),
+                            "registration_endpoint": format!("{base}/register"),
+                            "code_challenge_methods_supported": ["S256"],
+                        })),
+                        "/register" => {
+                            let asked: Value = serde_json::from_str(&body).unwrap();
+                            assert_eq!(asked["token_endpoint_auth_method"], "none");
+                            json(json!({"client_id": "c-1"}))
+                        }
+                        "/token" => match field("grant_type").as_deref() {
+                            Some("authorization_code") => {
+                                let verifier = field("code_verifier").unwrap();
+                                assert_eq!(field("code"), Some(oauth::challenge_of(&verifier)));
+                                assert_eq!(field("client_id").as_deref(), Some("c-1"));
+                                assert_eq!(field("resource"), Some(format!("{base}/mcp")));
+                                json(
+                                    json!({"access_token": "t-1", "refresh_token": "r-1", "expires_in": 3600}),
+                                )
+                            }
+                            Some("refresh_token") => {
+                                assert_eq!(field("refresh_token").as_deref(), Some("r-old"));
+                                json(json!({"access_token": "t-2", "expires_in": 3600}))
+                            }
+                            other => panic!("grant {other:?}"),
+                        },
+                        "/mcp" => {
+                            let taken = accepted
+                                .iter()
+                                .any(|t| head.contains(&format!("authorization: bearer {t}")));
+                            if taken {
+                                let message: Value = serde_json::from_str(&body).unwrap();
+                                let id = message["id"].clone();
+                                match message["method"].as_str().unwrap() {
+                                    "initialize" => {
+                                        json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                                    }
+                                    "tools/list" => json(
+                                        json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
+                                            {"name": "fetch", "inputSchema": {"type": "object"}}
+                                        ]}}),
+                                    ),
+                                    "tools/call" => {
+                                        json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                                            "content": [{"type": "text", "text": "a page"}]
+                                        }}))
+                                    }
+                                    _ => (202, "application/json", String::new()),
+                                }
+                            } else {
+                                (401, "application/json", String::new())
+                            }
+                        }
+                        _ => (404, "text/plain", String::new()),
+                    };
+                    let reason = match status {
+                        200 => "OK",
+                        202 => "Accepted",
+                        401 => "Unauthorized",
+                        _ => "Not Found",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        base
+    }
+
+    /// Waits until the server is ready or failed, past the consent that
+    /// `settled` does not wait for.
+    async fn ready(mcp: &Mcp) -> String {
+        for _ in 0..500 {
+            let how = mcp.status()[0].1.clone();
+            if !how.starts_with("waiting") && how != "connecting" {
+                return how;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mcp.status()[0].1.clone()
+    }
+
+    fn oauth_server(url: String) -> BTreeMap<String, McpServer> {
+        BTreeMap::from([(
+            "docs".to_owned(),
+            McpServer {
+                url: Some(url),
+                oauth: true,
+                ..McpServer::default()
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = dir.path().join("mcp-auth");
+
+        // No grant yet: the person consents once, and the grant is kept.
+        let base = serve_oauth(&["t-1", "t-2"]).await;
+        let before = CONSENTS.load(Ordering::SeqCst);
+        let mcp = Mcp::start_with(
+            &oauth_server(format!("{base}/mcp")),
+            Some(grants.clone()),
+            consent_at_once,
+        );
+        mcp.settled(Duration::from_secs(10)).await;
+        assert_eq!(ready(&mcp).await, "1 tool, 0 only reading");
+        assert_eq!(CONSENTS.load(Ordering::SeqCst), before + 1);
+        // Said once, for the person to open the page if no browser did.
+        let notices = mcp.notices();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].starts_with("The MCP server docs waits for your consent"));
+        assert!(mcp.notices().is_empty());
+        assert_eq!(mcp.call("docs__fetch", "{}").await, Ok("a page".to_owned()));
+        let kept = oauth::Grants::new(grants.clone()).load("docs").unwrap();
+        assert_eq!(kept.access_token, "t-1");
+
+        // A grant about to end is renewed, without asking.
+        let ending = oauth::Grant::for_test(&base, "t-old", "r-old", oauth::now() + 10);
+        oauth::Grants::new(grants.clone())
+            .save("docs", &ending)
+            .unwrap();
+        let before = CONSENTS.load(Ordering::SeqCst);
+        let mcp = Mcp::start_with(
+            &oauth_server(format!("{base}/mcp")),
+            Some(grants.clone()),
+            consent_at_once,
+        );
+        assert_eq!(ready(&mcp).await, "1 tool, 0 only reading");
+        assert_eq!(CONSENTS.load(Ordering::SeqCst), before);
+        let kept = oauth::Grants::new(grants.clone()).load("docs").unwrap();
+        assert_eq!(kept.access_token, "t-2");
+
+        // A grant the server no longer takes is forgotten, and the person
+        // asked once more.
+        let refused = oauth::Grant::for_test(&base, "t-revoked", "r-x", oauth::now() + 3600);
+        oauth::Grants::new(grants.clone())
+            .save("docs", &refused)
+            .unwrap();
+        let before = CONSENTS.load(Ordering::SeqCst);
+        let mcp = Mcp::start_with(
+            &oauth_server(format!("{base}/mcp")),
+            Some(grants.clone()),
+            consent_at_once,
+        );
+        assert_eq!(ready(&mcp).await, "1 tool, 0 only reading");
+        assert_eq!(CONSENTS.load(Ordering::SeqCst), before + 1);
+        let kept = oauth::Grants::new(grants).load("docs").unwrap();
+        assert_eq!(kept.access_token, "t-1");
+    }
+
     #[tokio::test]
     async fn a_server_that_cannot_start_says_why() {
         let declared = BTreeMap::from([(
@@ -633,7 +1039,7 @@ mod tests {
                 ..McpServer::default()
             },
         )]);
-        let mcp = Mcp::start(&declared);
+        let mcp = Mcp::start(&declared, None);
         mcp.settled(Duration::from_secs(5)).await;
         let status = mcp.status();
         assert!(

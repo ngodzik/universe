@@ -76,6 +76,9 @@ syntect    = { version = "5.3.0", default-features = false, features = ["default
 # refuses them as too large. The version Bevy already brings.
 image      = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 base64     = "0.22.1"
+# The cryptography rustls already brings: SHA-256 and random bytes for the
+# PKCE of MCP servers' OAuth, with no crate of its own.
+aws-lc-rs  = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 
 [package]
 name    = "universe"
