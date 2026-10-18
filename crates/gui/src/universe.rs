@@ -594,6 +594,7 @@ fn language_colour(language: Language) -> LinearRgba {
         Language::TypeScript => LinearRgba::rgb(0.2, 0.5, 1.0),
         Language::JavaScript => LinearRgba::rgb(1.0, 0.85, 0.25),
         Language::Dart => LinearRgba::rgb(0.1, 0.8, 0.95),
+        Language::Go => LinearRgba::rgb(0.4, 0.95, 0.3),
         Language::Markdown => LinearRgba::rgb(0.85, 0.9, 1.0),
         Language::Config => LinearRgba::rgb(0.2, 0.95, 0.75),
         Language::Other => LEFT_OUT,

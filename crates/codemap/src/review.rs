@@ -219,7 +219,7 @@ fn area_of(path: &str) -> Area {
     }
     match Language::of(file) {
         Language::TypeScript | Language::JavaScript | Language::Dart => Area::FrontEnd,
-        Language::Python | Language::Rust => Area::Backend,
+        Language::Python | Language::Rust | Language::Go => Area::Backend,
         Language::Markdown => Area::Documents,
         _ if name.ends_with(".rst") || name.ends_with(".txt") => Area::Documents,
         _ => Area::Other,
@@ -231,7 +231,7 @@ fn area_of(path: &str) -> Area {
 fn in_api(path: &str) -> bool {
     let back_end = matches!(
         Language::of(Path::new(path)),
-        Language::Python | Language::Rust
+        Language::Python | Language::Rust | Language::Go
     );
     back_end
         && path.split('/').rev().skip(1).any(|folder| {

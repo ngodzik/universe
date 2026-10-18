@@ -178,7 +178,7 @@ impl Toolbox {
                 name: "outline".into(),
                 description: "The map of a file or directory: its functions, classes, methods \
                     and types with their line numbers, without their code. Knows Rust, Python, \
-                    TypeScript and JavaScript. Cheaper than reading: look at the map, then read \
+                    TypeScript, JavaScript and Go. Cheaper than reading: look at the map, then read \
                     only the lines you need."
                     .into(),
                 parameters: json!({
@@ -358,7 +358,7 @@ impl Toolbox {
                 let path = self.workspace.resolve(&args.path)?;
                 let text = if path.is_file() {
                     crate::outline::outline_file(&path).unwrap_or_else(|| {
-                        "not a Rust, Python, TypeScript or JavaScript file: use search, or read \
+                        "not a Rust, Python, TypeScript, JavaScript or Go file: use search, or read \
                          a range of lines"
                             .into()
                     })

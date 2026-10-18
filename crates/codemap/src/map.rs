@@ -25,6 +25,8 @@ pub enum Language {
     JavaScript,
     /// `.dart`
     Dart,
+    /// `.go`
+    Go,
     /// `.md`
     Markdown,
     /// Settings: `.toml`, `.json`, `.yaml`, `.yml`
@@ -43,6 +45,7 @@ impl Language {
             Some("ts" | "tsx") => Self::TypeScript,
             Some("js" | "jsx" | "mjs" | "cjs") => Self::JavaScript,
             Some("dart") => Self::Dart,
+            Some("go") => Self::Go,
             Some("md") => Self::Markdown,
             Some("toml" | "json" | "yaml" | "yml") => Self::Config,
             _ => Self::Other,
@@ -58,6 +61,7 @@ impl Language {
             Self::TypeScript => "TypeScript",
             Self::JavaScript => "JavaScript",
             Self::Dart => "Dart",
+            Self::Go => "Go",
             Self::Markdown => "Markdown",
             Self::Config => "Settings",
             Self::Other => "Other",
@@ -155,7 +159,15 @@ impl CodeMap {
 /// Whether a file is a test, by its folders' names or its own: by name or
 /// by part of it, `kubernetes-tests` as well as `tests`.
 pub(crate) fn is_test(path: &Path) -> bool {
-    const TESTS: [&str; 6] = ["tests", "test", "__tests__", "testing", "spec", "e2e"];
+    const TESTS: [&str; 7] = [
+        "tests",
+        "test",
+        "__tests__",
+        "testing",
+        "spec",
+        "e2e",
+        "testdata",
+    ];
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -167,6 +179,7 @@ pub(crate) fn is_test(path: &Path) -> bool {
         .any(|f| TESTS.contains(&f) || f.ends_with("-tests") || f.ends_with("_tests"))
         || name.starts_with("test_")
         || name.ends_with("_test.py")
+        || name.ends_with("_test.go")
         || name.contains(".test.")
         || name.contains(".spec.")
 }
@@ -412,6 +425,16 @@ mod tests {
                 .count();
             assert_eq!(holders, 1, "{}", map.nodes[node].path);
         }
+    }
+
+    #[test]
+    fn go_files_are_code_and_their_tests_and_test_data_are_tests() {
+        assert_eq!(Language::of(Path::new("pkg/api/pod.go")), Language::Go);
+        assert!(!is_test(Path::new("pkg/api/pod.go")));
+        assert!(is_test(Path::new("pkg/api/pod_test.go")));
+        assert!(is_test(Path::new("pkg/api/testdata/pod.yaml")));
+        assert_eq!(worth(Path::new("pkg/api/pod.go")), 0);
+        assert_eq!(worth(Path::new("vendor/github.com/acme/y/y.go")), 1);
     }
 
     #[test]

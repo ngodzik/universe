@@ -252,7 +252,7 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "gd Ctrl-click",
                 "go to where the name under the cursor is defined, as its language server says \
-                 (pyright, typescript-language-server, rust-analyzer), else git grep; several: \
+                 (pyright, typescript-language-server, rust-analyzer, gopls), else git grep; several: \
                  choose with ↑ ↓ Enter",
             ),
             ("gr", "list where the name under the cursor is used"),
