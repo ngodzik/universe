@@ -1,0 +1,432 @@
+//! What the simulated back end answers, made from a schema, the same for
+//! the same schema and place: values that look like what the field names
+//! (an id like an id, a date like a date, an email like an email), each
+//! item of a list its own, every value of an enumeration in a list of them
+//! (a session's permissions all granted), flags off, a date of something
+//! that may not have happened (`canceled_at`) not set.
+//!
+//! A [`Tone`] bends it to a state worth seeing: lists empty, rights
+//! withheld, every flag on.
+
+use serde_json::{Map, Value, json};
+
+use crate::spec::Spec;
+
+/// How deep it goes into nested schemas before it stops.
+const DEEPEST: usize = 8;
+
+/// How many items a list has.
+const ITEMS: usize = 3;
+
+/// A state the answers are bent to, beyond what the spec says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Tone {
+    /// Every list empty, its counts at nothing.
+    pub empty: bool,
+    /// No permission granted, no role above the least.
+    pub no_rights: bool,
+    /// Every flag of a feature on.
+    pub flags_on: bool,
+}
+
+/// The fields that hold a page of a list.
+const LISTS: [&str; 8] = [
+    "items", "data", "results", "records", "entries", "nodes", "rows", "edges",
+];
+
+/// The fields that count a list.
+const COUNTS: [&str; 7] = [
+    "total_count",
+    "total",
+    "count",
+    "total_items",
+    "max_page",
+    "total_pages",
+    "totalcount",
+];
+
+/// People, for the names and emails of a list's items.
+const PEOPLE: [(&str, &str); 4] = [
+    ("Ada Lovelace", "ada@example.com"),
+    ("Grace Hopper", "grace@example.com"),
+    ("Alan Turing", "alan@example.com"),
+    ("Edsger Dijkstra", "edsger@example.com"),
+];
+
+/// A picture any page may show, its policy of content allowing `data:`.
+const PICTURE: &str = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'><rect width='40' height='40' rx='20' fill='%236366f1'/><text x='20' y='26' font-size='15' text-anchor='middle' fill='white' font-family='sans-serif'>U</text></svg>";
+
+/// A body made from `schema`, `key` naming where it is asked for (the
+/// operation and its status), so that two places differ.
+#[must_use]
+pub(crate) fn body(spec: &Spec, schema: &Value, key: &str, tone: Tone) -> Value {
+    let mut maker = Maker {
+        spec,
+        tone,
+        stack: Vec::new(),
+    };
+    maker.make(schema, key, "", 0)
+}
+
+struct Maker<'a> {
+    spec: &'a Spec,
+    tone: Tone,
+    /// The schemas named on the way down, so that one that holds itself
+    /// stops.
+    stack: Vec<String>,
+}
+
+impl Maker<'_> {
+    fn make(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
+        if depth > DEEPEST {
+            return Value::Null;
+        }
+        let named = Spec::reference(schema).map(str::to_owned);
+        if let Some(name) = &named {
+            if self.stack.iter().filter(|n| *n == name).count() >= 2 {
+                return Value::Null;
+            }
+            self.stack.push(name.clone());
+        }
+        let schema = self.spec.resolve(schema).clone();
+        let made = self.made(&schema, key, field, depth);
+        if named.is_some() {
+            self.stack.pop();
+        }
+        made
+    }
+
+    fn made(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
+        let lower = field.to_lowercase();
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        if let Some(choices) = schema["enum"].as_array() {
+            if self.tone.no_rights && lower == "role" {
+                return choices.last().cloned().unwrap_or(Value::Null);
+            }
+            return choices.first().cloned().unwrap_or(Value::Null);
+        }
+        for choice in ["anyOf", "oneOf"] {
+            if let Some(options) = schema[choice].as_array() {
+                let nullable = options
+                    .iter()
+                    .any(|o| self.spec.resolve(o)["type"] == "null");
+                // What may not have happened has not: a date of ending,
+                // of cancelling.
+                let happened =
+                    ["created_at", "modified_at", "updated_at"].contains(&lower.as_str());
+                if nullable && lower.ends_with("_at") && !happened {
+                    return Value::Null;
+                }
+                let Some(first) = options
+                    .iter()
+                    .find(|o| self.spec.resolve(o)["type"] != "null")
+                else {
+                    return Value::Null;
+                };
+                return self.make(first, key, field, depth + 1);
+            }
+        }
+        if let Some(parts) = schema["allOf"].as_array() {
+            let mut whole = Map::new();
+            for part in parts {
+                if let Value::Object(fields) = self.make(part, key, field, depth + 1) {
+                    whole.extend(fields);
+                }
+            }
+            return Value::Object(whole);
+        }
+        let kind = match &schema["type"] {
+            Value::String(kind) => kind.clone(),
+            // `["string", "null"]`: the first that is not null.
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|k| *k != "null")
+                .unwrap_or("null")
+                .to_owned(),
+            _ if schema.get("properties").is_some() => "object".to_owned(),
+            _ if schema.get("items").is_some() => "array".to_owned(),
+            _ => String::new(),
+        };
+        if let Some(example) = schema
+            .get("example")
+            .filter(|_| kind != "object" && kind != "array")
+        {
+            return example.clone();
+        }
+        if let Some(example) = schema["examples"].as_array().and_then(|e| e.first())
+            && kind != "object"
+            && kind != "array"
+        {
+            return example.clone();
+        }
+        match kind.as_str() {
+            "object" => {
+                let mut fields = Map::new();
+                if let Some(properties) = schema["properties"].as_object() {
+                    for (name, property) in properties {
+                        let value = self.make(property, &format!("{key}.{name}"), name, depth + 1);
+                        fields.insert(name.clone(), value);
+                    }
+                }
+                Value::Object(fields)
+            }
+            "array" => self.list(schema, key, &lower, depth),
+            "integer" => self.integer(key, &lower),
+            "number" => json!(f64::from(seed(key) % 10_000) / 100.0),
+            "boolean" => Value::Bool(self.boolean(&lower)),
+            "string" => self.string(schema, key, &lower),
+            _ => Value::Null,
+        }
+    }
+
+    fn list(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
+        if self.tone.empty && LISTS.contains(&field) {
+            return Value::Array(Vec::new());
+        }
+        let rights = ["permission", "scope", "right", "grant", "capabilit"]
+            .iter()
+            .any(|w| field.contains(w));
+        if self.tone.no_rights && rights {
+            return Value::Array(Vec::new());
+        }
+        let items = &schema["items"];
+        let resolved = self.spec.resolve(items);
+        // A list of an enumeration's values holds them all: a session's
+        // permissions, all granted.
+        if let Some(choices) = resolved["enum"].as_array() {
+            return Value::Array(choices.clone());
+        }
+        let mut made = Vec::new();
+        for i in 0..ITEMS {
+            let item_key = format!("{key}[{i}]");
+            let value = self.make(items, &item_key, "", depth + 1);
+            made.push(distinct(value, &item_key, i));
+        }
+        Value::Array(made)
+    }
+
+    fn integer(&self, key: &str, field: &str) -> Value {
+        if self.tone.empty && COUNTS.contains(&field) {
+            return json!(0);
+        }
+        if ["amount", "price", "revenue", "balance", "cost"]
+            .iter()
+            .any(|w| field.contains(w))
+        {
+            return json!(1900 + seed(key) % 8000);
+        }
+        match field {
+            "page" | "max_page" | "total_pages" => json!(1),
+            "total_count" | "count" | "total" | "total_items" => json!(ITEMS),
+            _ => json!(seed(key) % 100),
+        }
+    }
+
+    fn boolean(&self, field: &str) -> bool {
+        if self.tone.no_rights
+            && ["is_admin", "admin", "is_owner", "is_superuser", "is_staff"].contains(&field)
+        {
+            return false;
+        }
+        if self.tone.flags_on
+            && (field.ends_with("_enabled") || field.contains("feature") || field.contains("flag"))
+        {
+            return true;
+        }
+        false
+    }
+
+    fn string(&self, schema: &Value, key: &str, field: &str) -> Value {
+        let format = schema["format"].as_str().unwrap_or_default();
+        let id = format == "uuid" || field == "id" || field.ends_with("_id");
+        if id {
+            return Value::String(uuid(key));
+        }
+        if format == "date-time" || field.ends_with("_at") {
+            return Value::String(format!(
+                "2026-09-{:02}T{:02}:00:00Z",
+                1 + seed(key) % 28,
+                8 + seed(&format!("{key}h")) % 10
+            ));
+        }
+        if format == "date" || field.ends_with("_date") || field == "date" {
+            return Value::String(format!("2026-09-{:02}", 1 + seed(key) % 28));
+        }
+        if format == "email" || field.contains("email") {
+            return Value::String(PEOPLE[0].1.to_owned());
+        }
+        if ["avatar", "image", "logo", "picture", "photo", "icon"]
+            .iter()
+            .any(|w| field.contains(w))
+        {
+            return Value::String(PICTURE.to_owned());
+        }
+        if format == "uri" || format == "url" || field.ends_with("url") || field == "website" {
+            return Value::String(format!("https://example.com/{}", field.replace('_', "-")));
+        }
+        let word = match field {
+            "slug" | "handle" | "username" | "login" => "demo",
+            "currency" => "usd",
+            "country" => "US",
+            "locale" | "language" => "en",
+            "timezone" => "Europe/Paris",
+            "status" | "state" => "active",
+            "first_name" | "firstname" => "Ada",
+            "last_name" | "lastname" => "Lovelace",
+            "title" => "Pro plan",
+            "description" | "summary" | "bio" => "Everything a growing team needs.",
+            "phone" => "+1 555 0100",
+            "color" | "colour" => "#6366f1",
+            _ if field.contains("name") => "Demo",
+            _ => "",
+        };
+        if !word.is_empty() {
+            return Value::String(word.to_owned());
+        }
+        let shown = field.replace(['_', '-'], " ");
+        let mut letters = shown.chars();
+        Value::String(match letters.next() {
+            Some(first) => first.to_uppercase().chain(letters).collect(),
+            None => "Text".to_owned(),
+        })
+    }
+}
+
+/// An item of a list made its own: an id of its own, and a person's name
+/// and email when it has them.
+fn distinct(item: Value, key: &str, i: usize) -> Value {
+    let Value::Object(mut fields) = item else {
+        return item;
+    };
+    if fields.get("id").is_some_and(Value::is_string) {
+        fields.insert("id".to_owned(), Value::String(uuid(key)));
+    }
+    let (name, email) = PEOPLE[i % PEOPLE.len()];
+    if fields.get("email").is_some_and(Value::is_string) {
+        fields.insert("email".to_owned(), Value::String(email.to_owned()));
+        if fields.get("name").is_some_and(Value::is_string) {
+            fields.insert("name".to_owned(), Value::String(name.to_owned()));
+        }
+    } else if let Some(Value::String(own)) = fields.get("name")
+        && i > 0
+    {
+        let numbered = format!("{own} {}", i + 1);
+        fields.insert("name".to_owned(), Value::String(numbered));
+    }
+    Value::Object(fields)
+}
+
+/// A number from a place, the same each time.
+fn seed(key: &str) -> u32 {
+    // FNV-1a: small, and the same everywhere.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in key.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// An id that looks like one, from a place.
+fn uuid(key: &str) -> String {
+    let a = seed(key);
+    let b = seed(&format!("{key}#"));
+    let c = seed(&format!("{key}##"));
+    format!(
+        "{a:08x}-{:04x}-4{:03x}-a{:03x}-{:08x}{:04x}",
+        b >> 16,
+        b & 0xfff,
+        c >> 20,
+        c,
+        a & 0xffff
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> Spec {
+        Spec::read(
+            r##"{"paths": {"/me": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Session"}}}}}}}},
+              "components": {"schemas": {
+                "Session": {"type": "object", "properties": {
+                    "user": {"$ref": "#/components/schemas/User"},
+                    "role": {"enum": ["owner", "admin", "member"]},
+                    "is_admin": {"type": "boolean"},
+                    "permissions": {"type": "array", "items": {"$ref": "#/components/schemas/Permission"}},
+                    "compass_enabled": {"type": "boolean"},
+                    "canceled_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+                    "created_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+                    "customers": {"$ref": "#/components/schemas/Page"}}},
+                "User": {"type": "object", "properties": {"id": {"type": "string"}, "email": {"type": "string"}, "avatar_url": {"type": "string"}, "manager": {"$ref": "#/components/schemas/User"}}},
+                "Permission": {"type": "string", "enum": ["products:read", "products:write"]},
+                "Page": {"type": "object", "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/Customer"}}, "total_count": {"type": "integer"}}},
+                "Customer": {"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}, "name": {"type": "string", "example": "John Doe"}, "email": {"type": "string", "example": "john@example.com"}}}}}}"##,
+        )
+        .unwrap()
+    }
+
+    fn session(tone: Tone) -> Value {
+        let spec = spec();
+        let schema = spec.schema(0, "200").unwrap().clone();
+        body(&spec, &schema, "GET /me 200", tone)
+    }
+
+    #[test]
+    fn a_body_looks_like_what_its_fields_name() {
+        let made = session(Tone::default());
+        assert_eq!(made, session(Tone::default()));
+        assert_eq!(made["role"], "owner");
+        assert_eq!(made["is_admin"], false);
+        assert_eq!(made["compass_enabled"], false);
+        assert_eq!(
+            made["permissions"],
+            json!(["products:read", "products:write"])
+        );
+        assert_eq!(made["canceled_at"], Value::Null);
+        assert!(made["created_at"].as_str().unwrap().starts_with("2026-09-"));
+        assert_eq!(made["user"]["email"], "ada@example.com");
+        assert!(
+            made["user"]["avatar_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/svg+xml")
+        );
+        assert_eq!(made["user"]["id"].as_str().unwrap().len(), 36);
+        // A schema that holds itself stops.
+        assert!(made["user"]["manager"]["manager"]["manager"].is_null());
+        // Each customer its own.
+        let items = made["customers"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_ne!(items[0]["id"], items[1]["id"]);
+        assert_eq!(items[0]["name"], "Ada Lovelace");
+        assert_eq!(items[1]["email"], "grace@example.com");
+        assert_eq!(made["customers"]["total_count"], 3);
+    }
+
+    #[test]
+    fn a_tone_bends_the_body_to_a_state() {
+        let empty = session(Tone {
+            empty: true,
+            ..Tone::default()
+        });
+        assert_eq!(empty["customers"]["items"], json!([]));
+        assert_eq!(empty["customers"]["total_count"], 0);
+        let no_rights = session(Tone {
+            no_rights: true,
+            ..Tone::default()
+        });
+        assert_eq!(no_rights["permissions"], json!([]));
+        assert_eq!(no_rights["role"], "member");
+        let flags = session(Tone {
+            flags_on: true,
+            ..Tone::default()
+        });
+        assert_eq!(flags["compass_enabled"], true);
+        assert_eq!(flags["is_admin"], false);
+    }
+}
