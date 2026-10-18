@@ -17,7 +17,7 @@ version     = "0.1.0"
 edition     = "2024"
 # The oldest toolchain the code is known to build on. CI holds it to this, so
 # the promise is checked rather than asserted.
-rust-version = "1.95"
+rust-version = "1.99.1"
 authors     = ["Nicolas Godzik"]
 license     = "MIT"
 
@@ -34,9 +34,9 @@ universe-mcp   = { path = "crates/mcp", version = "0.1.0" }
 thiserror  = "2.0.21"
 anyhow     = "1.0.104"
 serde      = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 yaml-rust2 = "0.13.0"
-tokio      = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio      = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
 clap       = { version = "4.6.7", features = ["derive", "env"] }
 # The default TLS backend verifies against the operating system trust store, so
 # a corporate proxy whose root is installed on the machine just works, where a
@@ -44,14 +44,14 @@ clap       = { version = "4.6.7", features = ["derive", "env"] }
 reqwest    = { version = "0.13.5", features = ["json"] }
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-proptest   = "1.11.0"
+proptest   = "1.12.0"
 tempfile   = "3.27.0"
 regex      = "1.13.1"
 similar    = "3.2.0"
-toml       = "1.1.6"
+toml       = "1.1.8"
 # Local time for when a subscription's window starts again, the system's
 # time zone read as the platform keeps it.
-jiff       = { version = "0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jiff       = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # The directory walker of ripgrep: it skips what .gitignore skips.
 ignore     = "0.4.33"
 # Parsers for the code map.
@@ -63,25 +63,25 @@ tree-sitter-javascript = "0.25.0"
 # Pure Rust regex engine instead of the default C Oniguruma: nothing to build
 # in C, the same on every platform.
 # The window: Bevy draws it on the GPU, egui the panels, egui_plot the
-# charts. bevy_egui 0.42 is the release for Bevy 0.19 and egui 0.36, which
+# charts. bevy_egui 0.43 is the release for Bevy 0.20 and egui 0.36, which
 # egui_plot 0.37 is built on. Only what a desktop window needs is enabled:
 # no audio, no gamepads, no glTF.
-bevy       = { version = "0.19.1", default-features = false, features = [
+bevy       = { version = "0.20.0", default-features = false, features = [
     "std", "async_executor", "multi_threaded", "bevy_log", "bevy_winit", "bevy_window",
     "x11", "wayland", "bevy_render", "bevy_core_pipeline", "bevy_asset", "bevy_color", "hdr",
     "bevy_post_process", "bevy_camera", "bevy_mesh", "bevy_image", "bevy_shader", "bevy_material",
     "bevy_pbr", "bevy_light", "bevy_gizmos", "bevy_gizmos_render",
 ] }
-bevy_egui  = { version = "0.42.0", default-features = false, features = ["render", "default_fonts"] }
+bevy_egui  = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
 egui_plot  = "0.37.0"
 syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 # Images a model is shown: read to know their size, halved when a provider
 # refuses them as too large. The version Bevy already brings.
 image      = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-base64     = "0.22.1"
+base64     = "0.23.1"
 # The cryptography rustls already brings: SHA-256 and random bytes for the
 # PKCE of MCP servers' OAuth, with no crate of its own.
-aws-lc-rs  = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-rs  = { version = "1.18.2", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 
 [package]
 name    = "universe"
