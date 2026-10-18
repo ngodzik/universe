@@ -70,9 +70,10 @@ pub enum ToolError {
 
     /// The file holds secrets, which a model neither reads nor changes:
     /// what it holds, or whether a guess matches it, would be told. Of a
-    /// file of variables, `read_file` gives the names it sets.
+    /// file of variables, `read_file` gives the names it sets, then the
+    /// values that are no secret.
     #[error(
-        "{0} holds secrets, which models neither read nor change: read_file gives the names a .env file sets, and the person sets their values"
+        "{0} holds secrets, which models neither read nor change: read_file gives the names a .env file sets, then with `name` the value of one that is no secret, and the person sets the others"
     )]
     Secret(PathBuf),
 

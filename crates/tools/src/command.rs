@@ -2216,7 +2216,7 @@ async fn run_in(
 /// Whether an environment variable's name says it holds a secret: one of
 /// its words, between underscores, is a token, a key, a password, a session
 /// or a cookie. Sockets and the desktop's own variables are not.
-fn is_secret(name: &str) -> bool {
+pub(crate) fn is_secret(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.ends_with("_SOCK") || upper.starts_with("XDG_") || upper.starts_with("DBUS_") {
         return false;

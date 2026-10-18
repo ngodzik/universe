@@ -85,6 +85,8 @@ struct ReadArgs {
     start: Option<usize>,
     /// Last line to read, included.
     end: Option<usize>,
+    /// Of a file of variables, the one whose value to read.
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -190,7 +192,8 @@ impl Toolbox {
                 description: "Read a text file, or only lines `start` to `end` of it, numbered \
                     from 1. Read only the lines you need when you know where they are, from \
                     `search` or `outline`: every line read is paid for again on each later turn. \
-                    Of a `.env` file, only the names of the variables it sets."
+                    Of a `.env` file, read first the names of the variables it sets, which is all \
+                    you get without `name`; then `name` gives one's value, unless it is a secret."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -198,6 +201,7 @@ impl Toolbox {
                         "path": path,
                         "start": {"type": "integer", "minimum": 1},
                         "end": {"type": "integer", "minimum": 1},
+                        "name": {"type": "string", "description": "Of a .env file only: the variable whose value to read."},
                     },
                     "required": ["path"],
                 }),
@@ -286,7 +290,7 @@ impl Toolbox {
             "read_file" => {
                 let args: ReadArgs = parse(call)?;
                 match self.secrets(&args.path) {
-                    Some(Secrets::Names) => return self.names(args.path),
+                    Some(Secrets::Names) => return self.names(args.path, args.name.as_deref()),
                     Some(Secrets::Nothing) => return Err(ToolError::Secret(args.path.into())),
                     None => {}
                 }
@@ -440,24 +444,43 @@ impl Toolbox {
         }
     }
 
-    /// The names of the variables the file `path` sets, never their values.
-    fn names(&self, path: String) -> Result<ToolOutput, ToolError> {
-        let names = crate::secrets::names_set(&self.workspace.read(&path)?);
-        let for_model = if names.is_empty() {
+    /// The names of the variables the file `path` sets, or the value of the
+    /// one `name` names when it is no secret.
+    fn names(&self, path: String, name: Option<&str>) -> Result<ToolOutput, ToolError> {
+        use crate::secrets::Value;
+        let variables = crate::secrets::variables(&self.workspace.read(&path)?);
+        if let Some(name) = name {
+            let for_model = match variables.iter().find(|(n, _)| n == name) {
+                Some((_, Value::Plain(value))) => format!("{name}={value}"),
+                Some((_, Value::Empty)) => format!("{name} is set, and empty"),
+                Some((_, Value::Secret)) => {
+                    format!("{name}'s value is a secret: it is not shown, and the person sets it")
+                }
+                None => format!("{path} does not set {name}"),
+            };
+            return Ok(ToolOutput {
+                picture: None,
+                summary: ToolSummary::Ran {
+                    label: format!("Value({path}, {name})"),
+                    lines: 1,
+                },
+                for_model,
+            });
+        }
+        let for_model = if variables.is_empty() {
             format!("{path} sets no variable.")
         } else {
-            let listed: Vec<String> = names
+            let listed: Vec<String> = variables
                 .iter()
-                .map(|(name, empty)| {
-                    if *empty {
-                        format!("{name} (empty)")
-                    } else {
-                        name.clone()
-                    }
+                .map(|(name, value)| match value {
+                    Value::Plain(_) => name.clone(),
+                    Value::Empty => format!("{name} (empty)"),
+                    Value::Secret => format!("{name} (secret)"),
                 })
                 .collect();
             format!(
-                "{path} sets these variables; their values are secrets, not shown:\n{}",
+                "{path} sets these variables. With `name`, read_file gives the value of one \
+                 not marked secret:\n{}",
                 listed.join("\n")
             )
         };
@@ -465,7 +488,7 @@ impl Toolbox {
             picture: None,
             summary: ToolSummary::Ran {
                 label: format!("Names({path})"),
-                lines: names.len(),
+                lines: variables.len(),
             },
             for_model,
         })
@@ -737,9 +760,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             read.for_model,
-            ".env sets these variables; their values are secrets, not shown:\n\
-             API_KEY\nPORT\nTOKEN (empty)"
+            ".env sets these variables. With `name`, read_file gives the value of one not \
+             marked secret:\nAPI_KEY (secret)\nPORT\nTOKEN (empty)"
         );
+        // Then the value of one that is no secret, and only of such a one.
+        let value = |tools: &mut Toolbox, name: &str| {
+            tools
+                .call(&call("read_file", json!({"path": ".env", "name": name})))
+                .unwrap()
+                .for_model
+        };
+        assert_eq!(value(&mut tools, "PORT"), "PORT=8080");
+        assert_eq!(value(&mut tools, "TOKEN"), "TOKEN is set, and empty");
+        assert_eq!(
+            value(&mut tools, "API_KEY"),
+            "API_KEY's value is a secret: it is not shown, and the person sets it"
+        );
+        assert_eq!(value(&mut tools, "HOST"), ".env does not set HOST");
         // A range of lines is no way round it.
         let range = tools
             .call(&call(
