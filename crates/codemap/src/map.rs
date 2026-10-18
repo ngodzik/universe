@@ -148,6 +148,9 @@ pub struct CodeMap {
     pub operations: Vec<crate::api::Operation>,
     /// The services it runs, what each serves, and who reaches whom.
     pub services: crate::services::Services,
+    /// Its front ends: their screens, how they link and what they call,
+    /// and what a person does on them.
+    pub front_ends: Vec<crate::screens::FrontEnd>,
 }
 
 impl CodeMap {
@@ -318,6 +321,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         left_out,
         operations: Vec::new(),
         services: crate::services::Services::default(),
+        front_ends: Vec::new(),
     };
     let mut index: HashMap<String, usize> = HashMap::from([(String::new(), 0)]);
     let mut sources: Vec<(usize, String)> = Vec::new();
@@ -404,6 +408,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         }
     }
     map.services = crate::services::read(root, &map, &sources);
+    map.front_ends = crate::screens::read(&map, &sources);
     map
 }
 
