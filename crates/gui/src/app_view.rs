@@ -18,7 +18,7 @@ use bevy_egui::egui::{
 };
 use universe_codemap::{Cache, CodeMap, FrontEnd, Workflow, cache_folder, example_url};
 use universe_preview::{Answer, Button, Pointer, Source, Status};
-use universe_ui::app_preview::Change;
+use universe_ui::app_preview::{Change, Shown};
 use universe_ui::{App, Effect};
 
 use crate::plan::Plan;
@@ -60,6 +60,8 @@ pub(crate) struct AppView {
     dragged: Option<f32>,
     /// The room for the page, in its pixels, and the scale it is drawn at.
     room: (u32, u32, f32),
+    /// How the chosen front end runs: its folder, its command, its spec.
+    how: Option<(String, String, String)>,
 }
 
 impl AppView {
@@ -81,6 +83,7 @@ impl AppView {
             pointer: None,
             dragged: None,
             room: (1280, 800, 1.0),
+            how: None,
         }
     }
 
@@ -300,14 +303,13 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
     let preview = app.app_preview();
     let painter = ui.painter_at(area);
     painter.rect_filled(area, CornerRadius::same(8), Color32::from_rgb(8, 9, 12));
-    let Some(frame) = preview.frame().filter(|_| preview.is_on()) else {
+    if !preview.is_on() {
         let (title, said) = match preview.status() {
             Some(Status::Failed(why)) => ("It stopped", why.clone()),
-            Some(Status::Stopped) | None => (
+            _ => (
                 "Not running",
-                "Start it in the pilot: its command shows on the button".to_owned(),
+                "Start it in the pilot, on the right".to_owned(),
             ),
-            Some(_) => ("Starting…", status_line(app)),
         };
         painter.text(
             area.center() - vec2(0.0, 18.0),
@@ -327,13 +329,21 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
             galley,
             DIM,
         );
-        if preview.is_on() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(200));
-        }
         return;
+    }
+    // A blank frame is never drawn: what the page showed last, there or
+    // before, shows as it loads; nothing yet, the wait is drawn instead.
+    let (frame, stale) = match preview.shown() {
+        Shown::Live(frame) => (frame, false),
+        Shown::Stale(frame) => (frame, true),
+        Shown::Waiting => {
+            let deep = app.bullets() != universe_ui::markdown::Bullets::Plain;
+            waiting(ui, &painter, area, app, deep);
+            ui.ctx().request_repaint();
+            return;
+        }
     };
-    // The frame's texture, made again only for a new frame.
+    // The frame's texture, made again only for another frame.
     let size = [frame.width as usize, frame.height as usize];
     match &mut view.page {
         Some((seq, texture)) if *seq != frame.seq => {
@@ -366,6 +376,40 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+    }
+    // A load of more than a moment says so, over what shows meanwhile; a
+    // quick one shows nothing, so that nothing flickers.
+    if let Some(waited) = preview.loading_for()
+        && waited > std::time::Duration::from_millis(500)
+    {
+        if stale {
+            painter.rect_filled(drawn, CornerRadius::same(2), Color32::from_black_alpha(90));
+        }
+        let said = format!(
+            "Loading {} · {:.0} s{}",
+            preview.loading_page(),
+            waited.as_secs_f32(),
+            if stale { " · as it last showed" } else { "" }
+        );
+        let galley = painter.layout_no_wrap(said, FontId::proportional(12.0), TEXT);
+        let chip = Rect::from_min_size(
+            pos2(drawn.max.x - galley.size().x - 26.0, drawn.min.y + 10.0),
+            galley.size() + vec2(16.0, 8.0),
+        );
+        painter.rect_filled(
+            chip,
+            CornerRadius::same(6),
+            Color32::from_rgba_unmultiplied(16, 19, 26, 230),
+        );
+        let dot = (ui.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5;
+        painter.circle_filled(
+            chip.left_center() + vec2(-8.0, 0.0),
+            3.0,
+            ACCENT.gamma_multiply(0.4 + dot * 0.6),
+        );
+        painter.galley(chip.min + vec2(8.0, 4.0), galley, TEXT);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
     }
     let focused = preview.is_focused();
     painter.rect_stroke(
@@ -457,6 +501,113 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
     }
 }
 
+/// The wait while a page is built and nothing shows yet: stars that come
+/// near, the calls the back end answers flying out among them; flat when
+/// the window draws nothing in depth (`/bullets plain`).
+fn waiting(ui: &Ui, painter: &egui::Painter, area: Rect, app: &App, deep: bool) {
+    let time = ui.input(|i| i.time);
+    let centre = area.center();
+    let preview = app.app_preview();
+    // A number from a place, the same each time.
+    let noise = |i: u32, salt: u32| {
+        let mut h = i.wrapping_mul(0x9E37_79B9) ^ salt.wrapping_mul(0x85EB_CA6B);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2C1B_3C6D);
+        h ^= h >> 12;
+        (h % 10_000) as f32 / 10_000.0
+    };
+    if deep {
+        let half = area.size() * 0.5;
+        for i in 0..220u32 {
+            let (x, y) = (noise(i, 1) * 2.0 - 1.0, noise(i, 2) * 2.0 - 1.0);
+            let speed = 0.12 + noise(i, 3) * 0.1;
+            let z = 1.0 - ((time as f32 * speed + noise(i, 4)) % 1.0);
+            let project = |z: f32| centre + vec2(x * half.x, y * half.y) * (0.18 / (z + 0.08));
+            let (near, far) = (project(z), project((z + 0.04).min(1.0)));
+            if !area.contains(near) {
+                continue;
+            }
+            let light = ((1.0 - z) * 1.4).min(1.0);
+            let colour = if i % 7 == 0 { CYAN } else { TEXT };
+            painter.line_segment(
+                [far, near],
+                Stroke::new(0.6 + light * 1.6, colour.gamma_multiply(light)),
+            );
+        }
+    } else {
+        for ring in 0..3 {
+            let phase = ((time as f32 * 0.6) + ring as f32 / 3.0) % 1.0;
+            painter.circle_stroke(
+                centre,
+                30.0 + phase * 120.0,
+                Stroke::new(1.5, ACCENT.gamma_multiply(1.0 - phase)),
+            );
+        }
+    }
+    // The calls answered, the newest flying out from the middle.
+    let calls: Vec<&universe_ui::app_preview::Activity> = preview
+        .activity()
+        .filter(|a| a.kind == universe_ui::app_preview::ActivityKind::Call)
+        .collect();
+    let now = preview
+        .activity()
+        .last()
+        .map_or(std::time::Duration::ZERO, |a| a.at);
+    for (n, call) in calls.iter().rev().take(10).enumerate() {
+        let age = now.saturating_sub(call.at).as_secs_f32() + (time as f32 % 1.0) * 0.0;
+        let angle = noise(n as u32 + call.at.as_millis() as u32, 9) * std::f32::consts::TAU;
+        let out = if deep { 60.0 + n as f32 * 26.0 } else { 0.0 };
+        let at = if deep {
+            centre + vec2(angle.cos(), angle.sin()) * out
+        } else {
+            centre + vec2(0.0, 70.0 + n as f32 * 18.0)
+        };
+        let fade = (1.0 - n as f32 / 10.0) * if age > 30.0 { 0.4 } else { 1.0 };
+        painter.text(
+            at,
+            Align2::CENTER_CENTER,
+            &call.text,
+            FontId::monospace(11.0),
+            LINK.gamma_multiply(fade),
+        );
+    }
+    let title = if calls.is_empty() {
+        "Building the page"
+    } else {
+        "Building the page, its data simulated"
+    };
+    let detail = format!(
+        "{} · {:.0} s · {} calls answered",
+        preview.loading_page(),
+        preview.loading_for().map_or(0.0, |d| d.as_secs_f32()),
+        calls.len()
+    );
+    // On a backdrop of their own, read over what moves behind them.
+    let title = painter.layout_no_wrap(title.to_owned(), FontId::proportional(19.0), TEXT);
+    let detail = painter.layout_no_wrap(detail, FontId::proportional(12.5), DIM);
+    let gap = 6.0;
+    let block = vec2(
+        title.size().x.max(detail.size().x),
+        title.size().y + gap + detail.size().y,
+    );
+    let backdrop = Rect::from_center_size(centre, block + vec2(36.0, 22.0));
+    painter.rect_filled(
+        backdrop,
+        CornerRadius::same(10),
+        Color32::from_rgba_unmultiplied(8, 9, 12, 210),
+    );
+    let top = backdrop.top() + 11.0;
+    painter.galley(pos2(centre.x - title.size().x / 2.0, top), title, TEXT);
+    painter.galley(
+        pos2(
+            centre.x - detail.size().x / 2.0,
+            top + block.y - detail.size().y,
+        ),
+        detail,
+        DIM,
+    );
+}
+
 /// A heading of the pilot.
 fn heading(ui: &mut Ui, text: &str) {
     ui.add_space(10.0);
@@ -487,10 +638,15 @@ fn pilot(
             }
         });
     });
+    running(ui, view, map, app, effects);
+    banner(ui, app, effects);
+    // The log keeps the bottom; the rest scrolls above it.
+    let room = (ui.available_height() - LOG_HEIGHT - 10.0).max(80.0);
     ScrollArea::vertical()
+        .id_salt("pilot")
+        .max_height(room)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            running(ui, view, map, app, effects);
             if app.app_preview().is_running() {
                 address(ui, app, effects);
                 states(ui, app, effects);
@@ -500,7 +656,142 @@ fn pilot(
             if app.app_preview().is_running() {
                 calls(ui, view, map, app, effects);
             }
-            errors(ui, app);
+            errors(ui, app, effects);
+            how_it_runs(ui, view, app);
+        });
+    log(ui, app);
+}
+
+/// The log's height at the pilot's bottom.
+const LOG_HEIGHT: f32 = 150.0;
+
+/// What happens, a line each, the latest at the bottom: the front end
+/// starting, pages loading and built, each call answered, what failed.
+fn log(ui: &mut Ui, app: &App) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("LOG").size(11.0).color(DIM).strong());
+    egui::Frame::NONE
+        .fill(Color32::from_rgb(10, 12, 16))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(6))
+        .show(ui, |ui| {
+            ui.set_min_height(LOG_HEIGHT - 30.0);
+            ScrollArea::vertical()
+                .id_salt("log")
+                .max_height(LOG_HEIGHT - 30.0)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    // Its lines are copied, as text is.
+                    ui.style_mut().interaction.selectable_labels = true;
+                    for line in app.app_preview().activity() {
+                        let colour = match line.kind {
+                            universe_ui::app_preview::ActivityKind::Step => TEXT,
+                            universe_ui::app_preview::ActivityKind::Call => LINK,
+                            universe_ui::app_preview::ActivityKind::Done => GREEN,
+                            universe_ui::app_preview::ActivityKind::Built => YELLOW,
+                            universe_ui::app_preview::ActivityKind::Failed => RED,
+                        };
+                        // Its time apart, so that a long line wraps beside it.
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new(format!("{:>5.1}", line.at.as_secs_f32()))
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(DIM),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&line.text)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(colour),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+                });
+        });
+}
+
+/// What the page met, said at the top while it shows: the error, and the
+/// way to copy it.
+fn banner(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
+    let errors: Vec<String> = app.app_preview().page_errors().cloned().collect();
+    let Some(first) = errors.first() else {
+        return;
+    };
+    ui.add_space(6.0);
+    egui::Frame::NONE
+        .fill(Color32::from_rgb(52, 20, 24))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.style_mut().interaction.selectable_labels = true;
+            let said = if errors.len() > 1 {
+                format!("The page met {} errors", errors.len())
+            } else {
+                "The page met an error".to_owned()
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(said).size(12.5).color(RED).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Every error of the page, to paste")
+                        .clicked()
+                    {
+                        effects.push(Effect::Copy(errors.join("\n\n")));
+                    }
+                });
+            });
+            let line = first.lines().next().unwrap_or_default();
+            ui.add(egui::Label::new(RichText::new(line).monospace().size(11.0).color(TEXT)).wrap());
+        });
+}
+
+/// How the front end runs, folded at the bottom: its folder, its command,
+/// the spec, and what its server printed.
+fn how_it_runs(ui: &mut Ui, view: &AppView, app: &App) {
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(RichText::new("HOW IT RUNS").size(12.0).color(DIM).strong())
+        .id_salt("how-it-runs")
+        .default_open(matches!(
+            app.app_preview().status(),
+            Some(Status::Failed(_))
+        ))
+        .show(ui, |ui| {
+            ui.style_mut().interaction.selectable_labels = true;
+            if let Some((folder, line, spec)) = &view.how {
+                ui.label(RichText::new(format!("in {folder}")).size(11.5).color(DIM));
+                ui.add(
+                    egui::Label::new(RichText::new(line).monospace().size(11.5).color(YELLOW))
+                        .wrap(),
+                );
+                ui.label(RichText::new(spec).size(11.5).color(DIM));
+            }
+            let said: Vec<&String> = app.app_preview().said().collect();
+            if !said.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Its server's last lines")
+                        .size(11.0)
+                        .color(DIM),
+                );
+                for line in said.iter().rev().take(40).rev() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(line.as_str())
+                                .monospace()
+                                .size(10.5)
+                                .color(DIM),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
         });
 }
 
@@ -557,27 +848,21 @@ fn running(
     let config = config(view, &front, &settings, map);
     let on = app.app_preview().is_on();
     ui.add_space(6.0);
-    match &config {
-        Ok(config) => {
-            let line = universe_preview::command_shown(&config.run);
-            let folder = if front.folder.is_empty() {
-                ".".to_owned()
-            } else {
-                front.folder.clone()
-            };
-            ui.label(RichText::new(format!("in {folder}")).size(11.5).color(DIM));
-            ui.label(RichText::new(&line).monospace().size(12.0).color(YELLOW));
-            ui.label(
-                RichText::new(spec_said(&config.spec, &view.root))
-                    .size(11.5)
-                    .color(DIM),
-            );
-        }
-        Err(why) => {
-            ui.label(RichText::new(why).size(12.0).color(RED));
-        }
+    view.how = config.as_ref().ok().map(|config| {
+        let folder = if front.folder.is_empty() {
+            "the project's root".to_owned()
+        } else {
+            front.folder.clone()
+        };
+        (
+            folder,
+            universe_preview::command_shown(&config.run),
+            spec_said(&config.spec, &view.root),
+        )
+    });
+    if let Err(why) = &config {
+        ui.label(RichText::new(why).size(12.0).color(RED));
     }
-    ui.add_space(4.0);
     ui.horizontal(|ui| {
         if on {
             if ui.button(RichText::new("■ Stop").color(RED)).clicked() {
@@ -586,7 +871,10 @@ fn running(
         } else if let Ok(config) = config
             && ui
                 .button(RichText::new("▶ Start").color(GREEN))
-                .on_hover_text("Runs the command above, a back end simulated from the spec, and a headless browser")
+                .on_hover_text(format!(
+                    "Runs its front end ({}), a back end simulated from its spec, and a headless browser: How it runs, at the bottom, says how",
+                    view.how.as_ref().map_or("", |(_, line, _)| line.as_str())
+                ))
                 .clicked()
         {
             view.page = None;
@@ -709,6 +997,10 @@ fn config(
             .base
             .as_ref()
             .map(|b| cache_folder(b, root).join("app-tests")),
+        pages: view
+            .base
+            .as_ref()
+            .map(|b| cache_folder(b, root).join("app-pages")),
     })
 }
 
@@ -1230,26 +1522,31 @@ fn calls(
     }
 }
 
-/// The page's errors, and the front end's last lines.
-fn errors(ui: &mut Ui, app: &App) {
-    let preview = app.app_preview();
-    let errors: Vec<&String> = preview.errors().collect();
-    if !errors.is_empty() {
-        heading(ui, &format!("ERRORS OF THE PAGE · {}", errors.len()));
-        // The same error again is counted, not written again.
-        let mut counted: Vec<(&String, usize)> = Vec::new();
-        for error in errors.iter().rev() {
-            match counted.iter_mut().find(|(e, _)| e == error) {
-                Some((_, n)) => *n += 1,
-                None => counted.push((error, 1)),
-            }
+/// The page's errors, each to copy, the same one counted.
+fn errors(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
+    let errors: Vec<&String> = app.app_preview().errors().collect();
+    if errors.is_empty() {
+        return;
+    }
+    heading(ui, &format!("ERRORS SEEN · {}", errors.len()));
+    let mut counted: Vec<(&String, usize)> = Vec::new();
+    for error in errors.iter().rev() {
+        match counted.iter_mut().find(|(e, _)| e == error) {
+            Some((_, n)) => *n += 1,
+            None => counted.push((error, 1)),
         }
+    }
+    ui.scope(|ui| {
+        ui.style_mut().interaction.selectable_labels = true;
         for (error, times) in counted.into_iter().take(20) {
-            let error = if times > 1 {
-                format!("×{times}  {error}")
-            } else {
-                error.clone()
-            };
+            ui.horizontal(|ui| {
+                if ui.small_button("Copy").clicked() {
+                    effects.push(Effect::Copy(error.clone()));
+                }
+                if times > 1 {
+                    ui.label(RichText::new(format!("×{times}")).size(11.0).color(DIM));
+                }
+            });
             ui.add(
                 egui::Label::new(
                     RichText::new(error.as_str())
@@ -1260,29 +1557,5 @@ fn errors(ui: &mut Ui, app: &App) {
                 .wrap(),
             );
         }
-    }
-    let said: Vec<&String> = preview.said().collect();
-    if !said.is_empty() {
-        egui::CollapsingHeader::new(
-            RichText::new(format!("FRONT END'S OUTPUT · {}", said.len()))
-                .size(12.0)
-                .color(DIM)
-                .strong(),
-        )
-        .id_salt("said")
-        .default_open(matches!(preview.status(), Some(Status::Failed(_))))
-        .show(ui, |ui| {
-            for line in said.iter().rev().take(40).rev() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(line.as_str())
-                            .monospace()
-                            .size(10.5)
-                            .color(DIM),
-                    )
-                    .wrap(),
-                );
-            }
-        });
-    }
+    });
 }

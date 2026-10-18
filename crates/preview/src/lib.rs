@@ -19,6 +19,7 @@ mod kept;
 mod leftovers;
 mod made;
 mod mock;
+mod pages;
 mod spec;
 
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ pub use kept::{Kept, KeptState, KeptTest, difference, keep_test, kept_tests, png
 pub use leftovers::{leftovers_file, stop_leftovers};
 pub use made::Tone;
 pub use mock::{Answer, Call, SLOW, Source, State, fixture_name};
+pub use pages::{keep_page, kept_pages};
 pub use spec::{Operation, Spec};
 
 use browser::{Browser, Request};
@@ -74,6 +76,9 @@ pub struct Config {
     pub leftovers: Option<PathBuf>,
     /// The folder its workflows are kept in as tests.
     pub tests: Option<PathBuf>,
+    /// The folder the last frame of each page is kept in, between
+    /// sessions.
+    pub pages: Option<PathBuf>,
 }
 
 /// Where a preview is.
@@ -140,6 +145,8 @@ pub enum Event {
     },
     /// The page's network went quiet: it is loaded.
     Quiet,
+    /// The page has shown the same frame for a moment.
+    Still,
     /// An error the page met.
     Console(String),
     /// A photograph compared with the one kept: the share of its pixels
@@ -161,6 +168,9 @@ pub enum Event {
     Kept(PathBuf),
     /// The browser went away.
     Gone,
+    /// The pages kept from before, the latest last: each its key and its
+    /// last frame.
+    Pages(Vec<(String, Frame)>),
 }
 
 /// What a preview tells its events to.
@@ -171,6 +181,7 @@ enum Order {
     Browser(Request),
     Change(Box<dyn FnOnce(&mut State) + Send>),
     Keep(usize),
+    KeepPage(String, Box<Frame>),
 }
 
 /// A preview, starting or running, stopped when dropped.
@@ -254,6 +265,12 @@ impl Preview {
     pub fn keep(&self, index: usize) {
         self.order(Order::Keep(index));
     }
+
+    /// Keeps `frame` as the last of page `key`, to show at once as the
+    /// page loads in a later session.
+    pub fn keep_page(&self, key: &str, frame: Frame) {
+        self.order(Order::KeepPage(key.to_owned(), Box::new(frame)));
+    }
 }
 
 impl Drop for Preview {
@@ -272,6 +289,7 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
         stop_leftovers(file);
     }
     let record = leftovers::Record::new(config.leftovers.clone());
+    let pages = config.pages.clone().map(|folder| pages_kept(folder, sink));
     let parts = match start(&config, sink, &record) {
         Ok(parts) => parts,
         Err(error) => {
@@ -302,6 +320,11 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
                 Ok(path) => sink(Event::Kept(path)),
                 Err(error) => sink(Event::Console(said(&error))),
             },
+            Order::KeepPage(key, frame) => {
+                if let Some(pages) = &pages {
+                    let _ = pages.send((key, frame));
+                }
+            }
         }
     }
     drop(browser);
@@ -310,6 +333,30 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
     record.clear();
     sink(Event::Status(Status::Stopped));
 }
+
+/// The pages kept in `folder`, told at once, then kept again as asked, on a
+/// thread of their own: a picture takes a moment to read and to write.
+fn pages_kept(folder: PathBuf, sink: &Sink) -> Sender<(String, Box<Frame>)> {
+    let (keep, asked) = mpsc::channel::<(String, Box<Frame>)>();
+    let sink = Arc::clone(sink);
+    std::thread::spawn(move || {
+        sink(Event::Pages(kept_pages(&folder, SHOWN_PAGES)));
+        while let Ok(first) = asked.recv() {
+            // Only the latest frame of each page asked meanwhile.
+            let mut latest = vec![first];
+            latest.extend(asked.try_iter());
+            for (i, (key, frame)) in latest.iter().enumerate() {
+                if !latest[i + 1..].iter().any(|(k, _)| k == key) {
+                    keep_page(&folder, key, frame);
+                }
+            }
+        }
+    });
+    keep
+}
+
+/// How many of the pages kept are shown again: the latest.
+const SHOWN_PAGES: usize = 12;
 
 /// Starts the back end, the front end and the browser, in that order.
 fn start(
@@ -360,6 +407,7 @@ fn start(
         Arc::clone(sink),
     )?;
     record.add(false, browser.pid(), &browser.program());
+    record.add_profile(browser.profile());
     sink(Event::Status(Status::Running { address }));
     Ok((mock, server, browser))
 }
@@ -440,6 +488,7 @@ mod tests {
             size: (800, 600, 1.0),
             leftovers: None,
             tests: None,
+            pages: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let failed = wait_for(&events, |e| matches!(e, Event::Status(Status::Failed(_))));
@@ -490,6 +539,7 @@ mod tests {
             size: (640, 400, 1.0),
             leftovers: None,
             tests: None,
+            pages: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let started = wait_for(&events, |e| {

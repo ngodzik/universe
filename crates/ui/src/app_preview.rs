@@ -136,17 +136,79 @@ pub struct Shot {
     pub png: Vec<u8>,
 }
 
+/// What kind of thing a line of the pilot's log tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Something under way: a page loading, the front end starting.
+    Step,
+    /// A call the back end answered.
+    Call,
+    /// Something done: a page loaded, a screen the same as kept.
+    Done,
+    /// The front end's server at work: building a page.
+    Built,
+    /// Something that went wrong.
+    Failed,
+}
+
+/// A line of the pilot's log: what happened, said in a few words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// When, from when the preview started.
+    pub at: std::time::Duration,
+    /// What.
+    pub text: String,
+    /// Of what kind.
+    pub kind: ActivityKind,
+}
+
+/// The frame the page is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown<'a> {
+    /// What it shows now.
+    Live(&'a Frame),
+    /// What it showed last, there or before, while it loads and shows
+    /// nothing yet: no blank frame flashes between two pages.
+    Stale(&'a Frame),
+    /// Nothing yet: the first page is being built.
+    Waiting,
+}
+
+/// How many lines the log keeps, the latest.
+const KEPT_ACTIVITY: usize = 300;
+
+/// How many pages' last frames are held, to show again as they load.
+const KEPT_PAGES: usize = 12;
+
 /// The App view's state.
 #[derive(Debug, Default)]
 pub struct AppPreview {
     status: Option<Status>,
     frame: Option<Frame>,
+    /// The last frame that showed something, and the last of each page.
+    good: Option<Frame>,
+    by_page: VecDeque<(String, Frame)>,
+    /// The pages' frames to keep between sessions, not yet given away.
+    to_keep: Vec<(String, Frame)>,
+    /// Whether the page shown may have changed since it was last kept,
+    /// without loading again: an app that routes itself, a server that
+    /// built it again.
+    unsettled: bool,
+    /// Since when a page loads, and which, as far as known.
+    loading: Option<std::time::Instant>,
+    target: Option<String>,
+    /// What happened, for the log, and since when.
+    activity: VecDeque<Activity>,
+    started: Option<std::time::Instant>,
+    /// The page's errors are those from this count of errors on.
+    errors_seen: u64,
+    page_errors_from: u64,
     address: String,
     operations: Vec<Operation>,
     calls: VecDeque<Call>,
     /// The first call of the page shown: those before are another's.
     page_from: u64,
-    errors: VecDeque<String>,
+    errors: VecDeque<(u64, String)>,
     said: VecDeque<String>,
     state: State,
     focused: bool,
@@ -226,7 +288,135 @@ impl AppPreview {
 
     /// The errors the page met, the latest last.
     pub fn errors(&self) -> impl Iterator<Item = &String> {
-        self.errors.iter()
+        self.errors.iter().map(|(_, e)| e)
+    }
+
+    /// The errors of the page shown, since it started loading.
+    pub fn page_errors(&self) -> impl Iterator<Item = &String> {
+        self.errors
+            .iter()
+            .filter(|(n, _)| *n >= self.page_errors_from)
+            .map(|(_, e)| e)
+    }
+
+    /// The pilot's log, the latest last.
+    pub fn activity(&self) -> impl Iterator<Item = &Activity> {
+        self.activity.iter()
+    }
+
+    /// The frame to draw the page with: what it shows, else, while it
+    /// loads, what it last showed there or before, else nothing yet.
+    #[must_use]
+    pub fn shown(&self) -> Shown<'_> {
+        match &self.frame {
+            Some(frame) if !blank(frame) => Shown::Live(frame),
+            _ => {
+                // The page in this state, else in another, else the last.
+                let page = page_of(self.target.as_deref().unwrap_or(&self.address));
+                let key = self.page_key(page);
+                let same_page = |k: &str| k.split_once('|').is_some_and(|(p, _)| p == page);
+                let kept = self
+                    .by_page
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| *k == key)
+                    .or_else(|| self.by_page.iter().rev().find(|(k, _)| same_page(k)))
+                    .map(|(_, f)| f)
+                    .or(self.good.as_ref());
+                kept.map_or(Shown::Waiting, Shown::Stale)
+            }
+        }
+    }
+
+    /// How long the page has been loading, while it does.
+    #[must_use]
+    pub fn loading_for(&self) -> Option<std::time::Duration> {
+        self.loading.map(|since| since.elapsed())
+    }
+
+    /// The page being loaded, as far as known.
+    #[must_use]
+    pub fn loading_page(&self) -> &str {
+        page_of(self.target.as_deref().unwrap_or(&self.address))
+    }
+
+    /// A page's key among those kept: its path, and the state the back end
+    /// answers in, for a page empty to differ from the same page full.
+    fn page_key(&self, page: &str) -> String {
+        let state = &self.state;
+        let mut answers: Vec<String> = state
+            .answers
+            .iter()
+            .map(|(i, a)| format!("{i}:{a:?}"))
+            .collect();
+        answers.sort();
+        let on = |on: bool| if on { '1' } else { '0' };
+        format!(
+            "{page}|{}{}{}{}{}|{}",
+            on(state.tone.empty),
+            on(state.slow),
+            on(state.failing),
+            on(state.tone.no_rights),
+            on(state.tone.flags_on),
+            answers.join(",")
+        )
+    }
+
+    /// Keeps the frame shown as the last of the page at `address`, here
+    /// and between sessions, when it shows that page: not blank, and not
+    /// what another showed before it.
+    fn remember(&mut self) {
+        let Some(frame) = self
+            .good
+            .as_ref()
+            .filter(|g| self.frame.as_ref().is_some_and(|f| f.seq == g.seq))
+        else {
+            return;
+        };
+        if self.address.is_empty() {
+            return;
+        }
+        let key = self.page_key(page_of(&self.address));
+        if self
+            .by_page
+            .iter()
+            .any(|(k, f)| *k == key && f.seq == frame.seq)
+        {
+            return;
+        }
+        let frame = frame.clone();
+        self.by_page.retain(|(k, _)| *k != key);
+        push(&mut self.by_page, (key.clone(), frame.clone()), KEPT_PAGES);
+        self.to_keep.retain(|(k, _)| *k != key);
+        self.to_keep.push((key, frame));
+    }
+
+    /// The pages' frames to keep between sessions, given away once.
+    pub(crate) fn take_pages_to_keep(&mut self) -> Vec<(String, Frame)> {
+        std::mem::take(&mut self.to_keep)
+    }
+
+    fn log(&mut self, kind: ActivityKind, text: String) {
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
+        push(
+            &mut self.activity,
+            Activity {
+                at: started.elapsed(),
+                text,
+                kind,
+            },
+            KEPT_ACTIVITY,
+        );
+    }
+
+    /// Notes that `path` is asked for: its last frame shows as it loads.
+    pub(crate) fn going(&mut self, path: &str) {
+        if self.loading.is_none() {
+            self.remember();
+        }
+        self.target = Some(path.to_owned());
+        self.loading = Some(std::time::Instant::now());
+        self.log(ActivityKind::Step, format!("Asked for {}", page_of(path)));
     }
 
     /// The lines the front end's server printed, the latest last.
@@ -446,6 +636,10 @@ impl AppPreview {
             status: Some(Status::Reading),
             size: Some(config.size),
             tests: std::mem::take(&mut self.tests),
+            by_page: std::mem::take(&mut self.by_page),
+            // Its first page, as it last showed, while it is built.
+            target: Some(config.start.clone()),
+            loading: Some(std::time::Instant::now()),
             ..Self::default()
         };
         AppOrder::Start(Box::new(config))
@@ -473,6 +667,27 @@ impl AppPreview {
 
     pub(crate) fn change(&mut self, change: Change) -> AppOrder {
         change.apply(&mut self.state);
+        let said = match &change {
+            Change::Empty(on) => format!("Lists empty: {}", on_off(*on)),
+            Change::Slow(on) => format!("Every call slow: {}", on_off(*on)),
+            Change::Failing(on) => format!("Every call failing: {}", on_off(*on)),
+            Change::NoRights(on) => format!("No rights: {}", on_off(*on)),
+            Change::FlagsOn(on) => format!("Every flag on: {}", on_off(*on)),
+            Change::Answer(index, answer) => {
+                let operation = self
+                    .operations
+                    .get(*index)
+                    .map_or_else(String::new, |o| format!("{} {}", o.method, o.path));
+                match answer {
+                    Some(Answer::Status(status)) => format!("{operation} answers {status}"),
+                    Some(Answer::Empty) => format!("{operation} answers empty"),
+                    Some(Answer::Slow) => format!("{operation} answers slowly"),
+                    None => format!("{operation} answers as the state says"),
+                }
+            }
+            Change::Reset => "The back end answers as the spec says".to_owned(),
+        };
+        self.log(ActivityKind::Step, said);
         AppOrder::Change(change)
     }
 
@@ -506,10 +721,40 @@ impl AppPreview {
                 if !matches!(status, Status::Running { .. }) {
                     self.focused = false;
                 }
+                let (kind, said) = match &status {
+                    Status::Reading => (ActivityKind::Step, "Reading the spec".to_owned()),
+                    Status::Starting { api, .. } => (
+                        ActivityKind::Step,
+                        format!("API simulated on port {api}; starting the front end"),
+                    ),
+                    Status::Opening => (
+                        ActivityKind::Step,
+                        "The front end answers: opening it in the browser".to_owned(),
+                    ),
+                    Status::Running { .. } => (ActivityKind::Done, "Running".to_owned()),
+                    Status::Failed(why) => (
+                        ActivityKind::Failed,
+                        format!("Stopped: {}", why.lines().next().unwrap_or_default()),
+                    ),
+                    Status::Stopped => (ActivityKind::Step, "Stopped".to_owned()),
+                };
+                self.log(kind, said);
                 self.status = Some(status);
             }
-            Event::Operations(operations) => self.operations = operations,
-            Event::Said(line) => push(&mut self.said, line, KEPT_LINES),
+            Event::Operations(operations) => {
+                self.log(
+                    ActivityKind::Step,
+                    format!("The spec holds {} operations", operations.len()),
+                );
+                self.operations = operations;
+            }
+            Event::Said(line) => {
+                if let Some((kind, said)) = server_said(&line) {
+                    self.log(kind, said);
+                }
+                self.unsettled = true;
+                push(&mut self.said, line, KEPT_LINES);
+            }
             Event::Call(call) => {
                 if let Some(playing) = &mut self.playing
                     && let Some(operation) = call.operation.and_then(|i| self.operations.get(i))
@@ -518,12 +763,53 @@ impl AppPreview {
                 {
                     playing.acted = true;
                 }
+                let path = call.path.split('?').next().unwrap_or(&call.path);
+                let source = match call.source {
+                    universe_preview::Source::Schema => "made",
+                    universe_preview::Source::Fixture => "fixture",
+                    universe_preview::Source::Changed => "changed",
+                    universe_preview::Source::Missing => "not in the spec",
+                };
+                let kind = if call.status >= 400 {
+                    ActivityKind::Failed
+                } else {
+                    ActivityKind::Call
+                };
+                self.log(
+                    kind,
+                    format!(
+                        "{} {path} → {} · {source} · {} ms",
+                        call.method,
+                        call.status,
+                        call.took.as_millis()
+                    ),
+                );
                 push(&mut self.calls, call, KEPT_CALLS);
             }
-            Event::Frame(frame) => self.frame = Some(frame),
+            Event::Frame(frame) => {
+                if !blank(&frame) {
+                    // It shows the page: what it loaded is drawn.
+                    if self.target.is_some() && self.loading.is_none() {
+                        self.target = None;
+                    }
+                    self.good = Some(frame.clone());
+                }
+                self.frame = Some(frame);
+            }
             // A page that loads: its server's calls come before it says
             // where it is, however long it takes to build.
-            Event::Loading => self.page_from = self.calls.back().map_or(0, |c| c.seq + 1),
+            Event::Loading => {
+                // What the page before last showed, kept as it goes.
+                if self.loading.is_none() {
+                    self.remember();
+                }
+                self.page_from = self.calls.back().map_or(0, |c| c.seq + 1);
+                self.page_errors_from = self.errors_seen + 1;
+                if self.loading.is_none() {
+                    self.loading = Some(std::time::Instant::now());
+                }
+                self.log(ActivityKind::Step, "A page loads".to_owned());
+            }
             Event::Address { url, within } => {
                 if within && url != self.address {
                     // An app that routes itself: the new page's calls are
@@ -533,10 +819,45 @@ impl AppPreview {
                         .back()
                         .map_or(0, |c| c.seq.saturating_sub(recent(&self.calls)));
                 }
+                if page_of(&url) != page_of(&self.address) {
+                    self.log(ActivityKind::Step, format!("Showing {}", page_of(&url)));
+                    self.unsettled |= within;
+                }
+                // Routed within, there is nothing more to load: the browser
+                // said it started, never that it ended.
+                if within {
+                    self.loading = None;
+                    self.target = None;
+                }
                 self.address = url;
             }
-            Event::Quiet => {}
-            Event::Console(error) => push(&mut self.errors, error, KEPT_ERRORS),
+            Event::Quiet => {
+                if let Some(since) = self.loading.take() {
+                    let page = page_of(&self.address).to_owned();
+                    self.log(
+                        ActivityKind::Done,
+                        format!("{page} loaded in {:.1} s", since.elapsed().as_secs_f32()),
+                    );
+                }
+                self.target = None;
+                // Its frame, to show again while it loads next time, in
+                // this session and the next.
+                self.remember();
+                self.unsettled = false;
+            }
+            // Shown a moment unchanged since it changed without loading.
+            Event::Still => {
+                if self.unsettled && self.loading.is_none() {
+                    self.remember();
+                    self.unsettled = false;
+                }
+            }
+            Event::Console(error) => {
+                let first = error.lines().next().unwrap_or_default().to_owned();
+                self.log(ActivityKind::Failed, first);
+                self.errors_seen += 1;
+                push(&mut self.errors, (self.errors_seen, error), KEPT_ERRORS);
+            }
             Event::Shot { label, png } => {
                 let stepped = self
                     .playing
@@ -552,10 +873,48 @@ impl AppPreview {
                     self.replaying = false;
                 }
             }
-            Event::Compared { label, changed } => self.compared.push((label, changed)),
+            Event::Compared { label, changed } => {
+                let (kind, said) = match changed {
+                    Some(c) if c < 0.01 => {
+                        (ActivityKind::Done, format!("{label}: the same as kept"))
+                    }
+                    Some(c) => (
+                        ActivityKind::Failed,
+                        format!("{label}: {:.0}% changed from what was kept", c * 100.0),
+                    ),
+                    None => (
+                        ActivityKind::Step,
+                        format!("{label}: no picture to compare"),
+                    ),
+                };
+                self.log(kind, said);
+                self.compared.push((label, changed));
+            }
             Event::Kept(path) => {
+                self.log(
+                    ActivityKind::Done,
+                    "Its answer kept as a fixture".to_owned(),
+                );
                 self.kept = Some(path.clone());
                 return Some(path);
+            }
+            Event::Pages(pages) => {
+                let said = match pages.len() {
+                    0 => None,
+                    1 => Some("A page kept from before, shown as it loads".to_owned()),
+                    n => Some(format!("{n} pages kept from before, shown as they load")),
+                };
+                if let Some(said) = said {
+                    self.log(ActivityKind::Step, said);
+                }
+                // Those seen meanwhile are newer.
+                for (key, frame) in pages.into_iter().rev() {
+                    if self.by_page.len() < KEPT_PAGES
+                        && !self.by_page.iter().any(|(k, _)| *k == key)
+                    {
+                        self.by_page.push_front((key, frame));
+                    }
+                }
             }
             Event::Gone => {
                 self.status = Some(Status::Failed("The browser went away".to_owned()));
@@ -564,6 +923,77 @@ impl AppPreview {
         }
         None
     }
+}
+
+/// Whether a frame shows nothing: every point of a grid over it the same
+/// colour, as the browser sends between two pages and while one is
+/// built.
+fn blank(frame: &Frame) -> bool {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    if width < 16 || height < 16 {
+        return true;
+    }
+    let at = |x: usize, y: usize| {
+        let i = (y * width + x) * 4;
+        frame.rgba.get(i..i + 3)
+    };
+    let Some(first) = at(width / 2, height / 2) else {
+        return true;
+    };
+    (0..10).all(|row| {
+        (0..10).all(|column| {
+            at(column * (width - 1) / 9, row * (height - 1) / 9)
+                .is_some_and(|p| p.iter().zip(first).all(|(a, b)| a.abs_diff(*b) < 8))
+        })
+    })
+}
+
+/// The path of an address, its query aside: `/dashboard/demo`.
+fn page_of(address: &str) -> &str {
+    let path = address.split_once("://").map_or(address, |(_, rest)| {
+        rest.find('/').map_or("/", |i| &rest[i..])
+    });
+    path.split(['?', '#']).next().unwrap_or(path)
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// What a line of the front end's server says of its work, when it says
+/// something worth a line of the log: a page built, a page served, an
+/// error.
+fn server_said(line: &str) -> Option<(ActivityKind, String)> {
+    let line = line.trim();
+    let short = |text: &str| text.chars().take(120).collect::<String>();
+    if line.contains("Compiling") {
+        let what = line
+            .split("Compiling")
+            .nth(1)
+            .unwrap_or_default()
+            .trim_matches(|c: char| c == '.' || c.is_whitespace());
+        return Some((
+            ActivityKind::Built,
+            short(&format!("The server builds {what}")),
+        ));
+    }
+    if line.starts_with('⨯') || line.contains("Error:") || line.starts_with("error") {
+        return Some((
+            ActivityKind::Failed,
+            short(line.trim_start_matches('⨯').trim()),
+        ));
+    }
+    let served = ["GET /", "POST /", "HEAD /"]
+        .iter()
+        .any(|m| line.starts_with(m))
+        && line.contains(" in ");
+    if served {
+        return Some((
+            ActivityKind::Built,
+            short(&format!("The server answered {line}")),
+        ));
+    }
+    None
 }
 
 /// How many of the latest calls came in the last moment: those a page
@@ -781,5 +1211,111 @@ mod tests {
         // A size asked again is not sent again.
         assert!(preview.size(800, 600, 1.0).is_some());
         assert!(preview.size(800, 600, 1.0).is_none());
+    }
+
+    /// A frame of 32 by 32 pixels: one colour, or a page that shows
+    /// something.
+    fn frame(seq: u64, plain: bool) -> Frame {
+        let rgba = (0..32 * 32)
+            .flat_map(|i: u32| {
+                let shade = if plain { 0 } else { (i * 7 % 251) as u8 };
+                [shade, shade, shade, 255]
+            })
+            .collect();
+        Frame {
+            width: 32,
+            height: 32,
+            rgba,
+            seq,
+        }
+    }
+
+    #[test]
+    fn a_page_shows_as_it_last_showed_while_it_loads_again() {
+        let address = |path: &str, within| Event::Address {
+            url: format!("http://127.0.0.1:3000{path}"),
+            within,
+        };
+        let shown = |preview: &AppPreview| match preview.shown() {
+            Shown::Live(f) => format!("live {}", f.seq),
+            Shown::Stale(f) => format!("stale {}", f.seq),
+            Shown::Waiting => "waiting".to_owned(),
+        };
+        let mut preview = AppPreview::default();
+        preview.told(Event::Loading);
+        preview.told(Event::Frame(frame(1, true)));
+        assert_eq!(shown(&preview), "waiting");
+        preview.told(address("/products", false));
+        preview.told(Event::Frame(frame(2, false)));
+        assert_eq!(shown(&preview), "live 2");
+        preview.told(Event::Quiet);
+        let kept = preview.take_pages_to_keep();
+        let keys: Vec<&str> = kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["/products|00000|"]);
+        assert!(preview.take_pages_to_keep().is_empty());
+        assert!(
+            preview
+                .activity()
+                .any(|a| a.text.starts_with("/products loaded in"))
+        );
+
+        // Another page, never shown: the last frame, between two pages.
+        preview.going("/orders");
+        preview.told(Event::Loading);
+        preview.told(Event::Frame(frame(3, true)));
+        assert_eq!(shown(&preview), "stale 2");
+        preview.told(address("/orders", false));
+        preview.told(Event::Frame(frame(4, false)));
+        preview.told(Event::Quiet);
+        // Back to the first: its own frame, not the last.
+        preview.going("/products?tab=all");
+        preview.told(Event::Loading);
+        preview.told(Event::Frame(frame(5, true)));
+        assert_eq!(shown(&preview), "stale 2");
+        preview.told(address("/products", false));
+        preview.told(Event::Frame(frame(6, false)));
+        preview.told(Event::Quiet);
+
+        // Routed within, it is kept once it shows still, and loads no more
+        // although the browser said it started.
+        preview.told(Event::Loading);
+        preview.told(address("/customers", true));
+        assert!(preview.loading_for().is_none());
+        preview.told(Event::Frame(frame(7, false)));
+        preview.told(Event::Still);
+        let kept = preview.take_pages_to_keep();
+        let keys: Vec<&str> = kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["/orders|00000|", "/products|00000|", "/customers|00000|"]
+        );
+        assert_eq!(kept[2].1.seq, 7);
+        // Still again, unchanged: nothing more to keep.
+        preview.told(Event::Still);
+        assert!(preview.take_pages_to_keep().is_empty());
+
+        // In another state, its own key; the page in the first meanwhile.
+        preview.change(Change::Empty(true));
+        preview.going("/orders");
+        preview.told(Event::Loading);
+        preview.told(Event::Frame(frame(9, true)));
+        assert_eq!(shown(&preview), "stale 4");
+        preview.told(address("/orders", false));
+        preview.told(Event::Frame(frame(8, false)));
+        preview.told(Event::Quiet);
+        let kept = preview.take_pages_to_keep();
+        assert_eq!(kept.last().map(|(k, _)| k.as_str()), Some("/orders|10000|"));
+    }
+
+    #[test]
+    fn pages_kept_before_show_while_they_load() {
+        let mut preview = AppPreview::default();
+        let mut before = frame(u64::MAX, false);
+        before.rgba[0] = 1;
+        preview.told(Event::Pages(vec![("/products|00000|".to_owned(), before)]));
+        preview.going("/products");
+        assert!(matches!(preview.shown(), Shown::Stale(f) if f.seq == u64::MAX));
+        // Kept already: not given to keep again.
+        assert!(preview.take_pages_to_keep().is_empty());
     }
 }

@@ -24,6 +24,10 @@ use crate::{Event, Frame, Sink};
 /// How long the browser may take to say where its DevTools listen.
 const STARTS_WITHIN: Duration = Duration::from_secs(30);
 
+/// How the name of a browser's profile begins, in the system's folder of
+/// temporary files.
+pub(crate) const PROFILE_PREFIX: &str = "universe-browser-";
+
 /// How long a step of a workflow may load before it is photographed as it
 /// is.
 const STEP_WITHIN: Duration = Duration::from_secs(15);
@@ -31,6 +35,9 @@ const STEP_WITHIN: Duration = Duration::from_secs(15);
 /// How long after a step is asked for its page may be said quiet: what the
 /// page before said is not its.
 const STEP_SETTLES: Duration = Duration::from_millis(400);
+
+/// How long the page must show the same frame to be said still.
+const STILL_AFTER: Duration = Duration::from_millis(700);
 
 /// A button of the pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -280,7 +287,7 @@ impl Browser {
         let program = find().ok_or(PreviewError::NoBrowser)?;
         static PROFILES: AtomicU64 = AtomicU64::new(0);
         let profile = std::env::temp_dir().join(format!(
-            "universe-browser-{}-{}",
+            "{PROFILE_PREFIX}{}-{}",
             std::process::id(),
             PROFILES.fetch_add(1, Ordering::Relaxed)
         ));
@@ -354,6 +361,7 @@ impl Browser {
             after: None,
             after_kept: None,
             size: (width, height, scale),
+            last_frame: None,
         };
         driver.open(address, cookies)?;
         let thread = std::thread::spawn(move || driver.drive(&asked));
@@ -374,6 +382,11 @@ impl Browser {
     /// What it was started as.
     pub(crate) fn program(&self) -> String {
         self.program.display().to_string()
+    }
+
+    /// The folder of its profile.
+    pub(crate) fn profile(&self) -> &std::path::Path {
+        &self.profile
     }
 
     /// Asks the browser something; nothing when it is gone.
@@ -517,6 +530,8 @@ struct Driver {
     /// shown.
     after_kept: Option<PathBuf>,
     size: (u32, u32, f32),
+    /// When the last frame came, until the page is said still.
+    last_frame: Option<Instant>,
 }
 
 impl Driver {
@@ -668,6 +683,10 @@ impl Driver {
                 && self.input_again().is_err()
             {
                 return;
+            }
+            if self.last_frame.is_some_and(|at| at.elapsed() > STILL_AFTER) {
+                self.last_frame = None;
+                (self.sink)(Event::Still);
             }
             if let Some((due, _)) = &self.after
                 && Instant::now() >= *due
@@ -930,6 +949,7 @@ impl Driver {
                 if let Some(picture) = decoded {
                     let rgba = picture.to_rgba8();
                     self.frames += 1;
+                    self.last_frame = Some(Instant::now());
                     (self.sink)(Event::Frame(Frame {
                         width: rgba.width(),
                         height: rgba.height(),
@@ -1005,11 +1025,35 @@ impl Driver {
             "Log.entryAdded" if params["entry"]["level"] == "error" => {
                 let entry = &params["entry"];
                 let text = entry["text"].as_str().unwrap_or_default();
-                (self.sink)(Event::Console(first_lines(text)));
+                let url = entry["url"].as_str().unwrap_or_default();
+                // A page with no icon of its own has not failed.
+                if url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(url)
+                    .ends_with("/favicon.ico")
+                {
+                    return Ok(());
+                }
+                // What failed to load, said with it.
+                let said = if url.is_empty() || text.contains(url) {
+                    text.to_owned()
+                } else {
+                    format!("{text}: {}", path_of(url))
+                };
+                (self.sink)(Event::Console(first_lines(&said)));
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// An address of this machine as its path: `/v1/products/?page=2`.
+fn path_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((_, rest)) if stays_here(url) => rest.find('/').map_or("/", |i| &rest[i..]),
+        _ => url,
     }
 }
 
@@ -1052,6 +1096,16 @@ mod tests {
         assert!(!stays_here("https://shop.example.com/dashboard"));
         assert!(!stays_here("https://127.0.0.1.example.com/"));
         assert!(!stays_here("http://user@example.com/"));
+        // Said by its path, when of this machine.
+        assert_eq!(
+            path_of("http://127.0.0.1:4100/v1/items?page=2"),
+            "/v1/items?page=2"
+        );
+        assert_eq!(path_of("http://localhost:3000"), "/");
+        assert_eq!(
+            path_of("https://cdn.example.com/a.js"),
+            "https://cdn.example.com/a.js"
+        );
     }
 
     #[test]

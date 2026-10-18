@@ -479,6 +479,11 @@ where
                     audit(self.workspace.root(), line);
                 }
                 app.app_told(event);
+                if let Some(preview) = &self.preview {
+                    for (key, frame) in app.take_app_pages() {
+                        preview.keep_page(&key, frame);
+                    }
+                }
                 None
             }
             Incoming::SubscriptionCalls(calls) => {

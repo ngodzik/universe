@@ -5259,8 +5259,12 @@ impl App {
         self.preview.tests_kept(tests);
     }
 
-    /// Shows the front end's page at `path`.
+    /// Shows the front end's page at `path`: its last frame, if it was
+    /// shown before, as it loads.
     pub fn app_go(&mut self, path: &str) -> Option<Effect> {
+        if self.preview.is_running() {
+            self.preview.going(path);
+        }
         self.app_order(crate::app_preview::AppOrder::Go(path.to_owned()))
     }
 
@@ -5348,6 +5352,12 @@ impl App {
                 path.display()
             ));
         }
+    }
+
+    /// The App view's pages as they last showed, to keep between sessions:
+    /// given away once.
+    pub fn take_app_pages(&mut self) -> Vec<(String, universe_preview::Frame)> {
+        self.preview.take_pages_to_keep()
     }
 
     /// Opens a file from the App view, at `line`, the view left for it:

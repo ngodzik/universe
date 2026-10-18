@@ -2,7 +2,9 @@
 //! without leaving it (killed, crashed) would leave its front end and its
 //! browser running, and the next start stops them. A process is stopped
 //! only while it still runs the very command written down, so that a
-//! number the system gave since to another program is never touched.
+//! number the system gave since to another program is never touched; a
+//! folder is removed only when it is a browser's profile in the system's
+//! folder of temporary files.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,14 +33,18 @@ impl Record {
     /// Writes down a process, or a group of them led by `pid`, started with
     /// `command`. A failure to write is not the preview's.
     pub(crate) fn add(&self, group: bool, pid: u32, command: &str) {
-        let Some(file) = &self.file else {
-            return;
-        };
         let line = format!(
             "{} {pid} {}\n",
             if group { "group" } else { "process" },
             command.replace('\n', " ")
         );
+        self.add_line(&line);
+    }
+
+    fn add_line(&self, line: &str) {
+        let Some(file) = &self.file else {
+            return;
+        };
         let write = || -> std::io::Result<()> {
             use std::io::Write as _;
             if let Some(dir) = file.parent() {
@@ -51,6 +57,12 @@ impl Record {
                 .write_all(line.as_bytes())
         };
         let _ = write();
+    }
+
+    /// Writes down a browser's profile, removed once the browser is
+    /// stopped.
+    pub(crate) fn add_profile(&self, folder: &Path) {
+        self.add_line(&format!("profile 0 {}\n", folder.display()));
     }
 
     /// Forgets what was written down, all of it stopped.
@@ -73,6 +85,10 @@ pub fn stop_leftovers(file: &Path) {
         else {
             continue;
         };
+        if kind == "profile" {
+            remove_profile(Path::new(command));
+            continue;
+        }
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
@@ -94,6 +110,18 @@ pub fn stop_leftovers(file: &Path) {
         }
     }
     let _ = std::fs::remove_file(file);
+}
+
+/// Removes a browser's profile left behind, if that is what `folder` is.
+fn remove_profile(folder: &Path) {
+    let is_profile = folder.parent() == Some(std::env::temp_dir().as_path())
+        && folder.file_name().is_some_and(|n| {
+            n.to_string_lossy()
+                .starts_with(crate::browser::PROFILE_PREFIX)
+        });
+    if is_profile {
+        let _ = std::fs::remove_dir_all(folder);
+    }
 }
 
 /// Whether process `pid` runs `command` still.
@@ -125,10 +153,23 @@ mod tests {
         record.add(false, left.id(), "sleep 97");
         // A number written down for a command it no longer runs.
         record.add(false, other.id(), "something else");
+        // A browser's profile, and a folder that is none.
+        let profile = std::env::temp_dir().join(format!(
+            "{}test-{}",
+            crate::browser::PROFILE_PREFIX,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(profile.join("Default")).unwrap();
+        record.add_profile(&profile);
+        let kept = dir.path().join("not-a-profile");
+        std::fs::create_dir_all(&kept).unwrap();
+        record.add_profile(&kept);
         stop_leftovers(&file);
         assert!(left.wait().is_ok_and(|s| !s.success()));
         assert!(other.try_wait().unwrap().is_none());
         assert!(!file.exists());
+        assert!(!profile.exists());
+        assert!(kept.exists());
         let _ = other.kill();
         let _ = other.wait();
     }
