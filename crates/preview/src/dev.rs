@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 
 use crate::error::PreviewError;
 
-/// How long the front end may take to answer on its port.
+/// How long the front end may take to answer on its port: a Flutter app
+/// is built for the web before it answers, which takes longer.
 const READY_WITHIN: Duration = Duration::from_secs(180);
+const FLUTTER_READY_WITHIN: Duration = Duration::from_secs(600);
 
 /// How many of its last lines are kept, to say why it stopped.
 const KEPT_LINES: usize = 60;
@@ -26,6 +28,9 @@ pub enum Framework {
     Next,
     /// `vite`: `--port`, `--host`, `--strictPort`.
     Vite,
+    /// `flutter run -d web-server`: `--web-port`, `--web-hostname`, and
+    /// what it reads given as `--dart-define`.
+    Flutter,
     /// Anything else: told its port in `PORT`.
     #[default]
     Other,
@@ -80,10 +85,13 @@ fn line(run: &Run, port: &str) -> String {
     if let Some(command) = &run.command {
         return command.replace("{port}", port);
     }
+    if run.framework == Framework::Flutter {
+        return format!("flutter run -d web-server --web-port {port} --web-hostname 127.0.0.1");
+    }
     let flags = match run.framework {
         Framework::Next => format!("--port {port} --hostname 127.0.0.1"),
         Framework::Vite => format!("--port {port} --host 127.0.0.1 --strictPort"),
-        Framework::Other => String::new(),
+        Framework::Other | Framework::Flutter => String::new(),
     };
     let runner = if run.runner.is_empty() {
         "npm"
@@ -134,6 +142,7 @@ fn expanded(value: &str) -> String {
 pub struct DevServer {
     child: Child,
     port: u16,
+    within: Duration,
     line: String,
     said: Arc<Mutex<VecDeque<String>>>,
 }
@@ -151,7 +160,19 @@ impl DevServer {
         api: Option<(&str, &str)>,
         lines: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Self, PreviewError> {
-        let line = command_line(run, port);
+        let mut line = command_line(run, port);
+        // A Flutter app built for the web reads no environment: what it
+        // reads is given at its build.
+        if run.framework == Framework::Flutter {
+            let own = format!("http://127.0.0.1:{port}");
+            let defines = api
+                .map(|(name, address)| (name.to_owned(), address.to_owned()))
+                .into_iter()
+                .chain(run.own_env.iter().map(|name| (name.clone(), own.clone())));
+            for (name, value) in defines {
+                line.push_str(&format!(" --dart-define={name}={value}"));
+            }
+        }
         let mut command = shell(&line);
         command
             .current_dir(&run.folder)
@@ -189,6 +210,11 @@ impl DevServer {
         Ok(Self {
             child,
             port,
+            within: if run.framework == Framework::Flutter {
+                FLUTTER_READY_WITHIN
+            } else {
+                READY_WITHIN
+            },
             line,
             said,
         })
@@ -219,10 +245,10 @@ impl DevServer {
                     said: self.said(),
                 });
             }
-            if began.elapsed() > READY_WITHIN {
+            if began.elapsed() > self.within {
                 return Err(PreviewError::Timeout {
                     port: self.port,
-                    seconds: READY_WITHIN.as_secs(),
+                    seconds: self.within.as_secs(),
                 });
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -379,6 +405,10 @@ mod tests {
         assert_eq!(
             command_line(&run("yarn", Framework::Other), 3100),
             "yarn run dev"
+        );
+        assert_eq!(
+            command_line(&run("flutter", Framework::Flutter), 3100),
+            "flutter run -d web-server --web-port 3100 --web-hostname 127.0.0.1"
         );
         let own = Run {
             command: Some("make serve PORT={port}".to_owned()),

@@ -154,7 +154,7 @@ pub(crate) fn show(
         let text = if plan.is_reading() {
             "Reading the project…"
         } else {
-            "No front end found: a package whose router serves screens (Next.js, React Router, TanStack Router)"
+            "No front end found: a package whose router serves screens (Next.js, React Router, TanStack Router, a Flutter app)"
         };
         ui.painter().text(
             body.center(),
@@ -651,9 +651,11 @@ fn config(
     let framework = match front.framework {
         universe_codemap::Framework::Next => universe_preview::Framework::Next,
         universe_codemap::Framework::Vite => universe_preview::Framework::Vite,
+        universe_codemap::Framework::Flutter => universe_preview::Framework::Flutter,
         universe_codemap::Framework::Other => universe_preview::Framework::Other,
     };
-    if settings.command.is_none() && front.dev.is_none() {
+    let flutter = front.framework == universe_codemap::Framework::Flutter;
+    if settings.command.is_none() && front.dev.is_none() && !flutter {
         return Err(format!(
             "{} has no `dev` script: name the command that runs it as `command` in the [app] table of the project's settings",
             front.name

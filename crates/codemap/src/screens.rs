@@ -62,6 +62,8 @@ pub enum Router {
     ReactRouter,
     /// TanStack Router's file routes.
     TanStack,
+    /// go_router's routes, or a Flutter app's named ones.
+    Flutter,
 }
 
 /// What builds and serves a front end while it is worked on.
@@ -71,6 +73,8 @@ pub enum Framework {
     Next,
     /// `vite`.
     Vite,
+    /// `flutter run`, for the web.
+    Flutter,
     /// Anything else, run as its script says.
     #[default]
     Other,
@@ -167,11 +171,16 @@ const LONGEST_WAY: usize = 6;
 /// texts.
 pub(crate) fn read(map: &CodeMap, sources: &[(usize, String)]) -> Vec<FrontEnd> {
     let text_of: HashMap<usize, &str> = sources.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let manifest_name = |path: &str| {
+        ["package.json", "pubspec.yaml"]
+            .into_iter()
+            .find(|name| path == *name || path.ends_with(&format!("/{name}")))
+    };
     let mut manifests: Vec<(usize, &str)> = sources
         .iter()
         .filter(|(n, _)| {
             let path = &map.nodes[*n].path;
-            (path == "package.json" || path.ends_with("/package.json"))
+            manifest_name(path).is_some()
                 && !crate::map::is_test(Path::new(path))
                 && worth(Path::new(path)) == 0
                 && !in_aside(path)
@@ -182,12 +191,20 @@ pub(crate) fn read(map: &CodeMap, sources: &[(usize, String)]) -> Vec<FrontEnd> 
     let calls = calls_in(map, &text_of);
     let mut fronts = Vec::new();
     for (node, text) in manifests {
-        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(text) else {
+        let path = &map.nodes[node].path;
+        let Some(name) = manifest_name(path) else {
             continue;
         };
-        let path = &map.nodes[node].path;
+        let manifest = if name == "pubspec.yaml" {
+            pubspec(text)
+        } else {
+            serde_json::from_str::<serde_json::Value>(text).ok()
+        };
+        let Some(manifest) = manifest else {
+            continue;
+        };
         let folder = path
-            .strip_suffix("package.json")
+            .strip_suffix(name)
             .unwrap_or_default()
             .trim_end_matches('/');
         if let Some(front) = front_end(map, &text_of, &calls, folder, &manifest) {
@@ -217,13 +234,23 @@ fn front_end(
             .iter()
             .any(|key| manifest[key].get(name).is_some())
     };
+    let flutter = manifest["flutter"] == true;
+    let manifest_file = if flutter {
+        "pubspec.yaml"
+    } else {
+        "package.json"
+    };
     let within = |path: &str| folder.is_empty() || path.starts_with(&format!("{folder}/"));
     // The package's files, but those of a package inside it.
     let nested: Vec<String> = map
         .nodes
         .iter()
-        .filter(|n| n.path.ends_with("/package.json") && within(&n.path))
-        .filter_map(|n| n.path.strip_suffix("/package.json").map(str::to_owned))
+        .filter(|n| n.path.ends_with(&format!("/{manifest_file}")) && within(&n.path))
+        .filter_map(|n| {
+            n.path
+                .strip_suffix(&format!("/{manifest_file}"))
+                .map(str::to_owned)
+        })
         .filter(|f| f != folder)
         .collect();
     let files: Vec<usize> = map
@@ -231,14 +258,16 @@ fn front_end(
         .iter()
         .enumerate()
         .filter(|(_, n)| {
-            matches!(
-                n.kind,
-                NodeKind::File {
-                    language: Language::TypeScript | Language::JavaScript,
-                    ..
-                }
-            ) && within(&n.path)
-                && !nested.iter().any(|f| n.path.starts_with(&format!("{f}/")))
+            let language = match n.kind {
+                NodeKind::File { language, .. } => Some(language),
+                NodeKind::Folder => None,
+            };
+            let ours = if flutter {
+                language == Some(Language::Dart)
+            } else {
+                matches!(language, Some(Language::TypeScript | Language::JavaScript))
+            };
+            ours && within(&n.path) && !nested.iter().any(|f| n.path.starts_with(&format!("{f}/")))
         })
         .map(|(i, _)| i)
         .collect();
@@ -249,7 +278,9 @@ fn front_end(
         .map(|(i, n)| (n.path.as_str(), i))
         .collect();
 
-    let (router, mut screens) = if depends("next") {
+    let (router, mut screens) = if flutter {
+        (Router::Flutter, flutter_routes(map, text_of, &files))
+    } else if depends("next") {
         let app = next_app(map, &index, folder, &files);
         if app.is_empty() {
             (Router::NextPages, next_pages(map, folder, &files))
@@ -277,6 +308,7 @@ fn front_end(
         .or_else(|| manifest["scripts"]["start"].as_str())
         .map(str::to_owned);
     let framework = match dev.as_deref() {
+        _ if flutter => Framework::Flutter,
         Some(script) if script.contains("next") => Framework::Next,
         Some(script) if script.contains("vite") => Framework::Vite,
         _ if depends("next") => Framework::Next,
@@ -302,7 +334,11 @@ fn front_end(
         name,
         router,
         framework,
-        runner: runner(&index, folder),
+        runner: if flutter {
+            "flutter".to_owned()
+        } else {
+            runner(&index, folder)
+        },
         dev,
         api_env: api_env(&read),
         own_env: own_env(&read),
@@ -313,6 +349,199 @@ fn front_end(
     connect(map, text_of, calls, &index, &files, &mut front);
     front.workflows = workflows(map, &front);
     Some(front)
+}
+
+/// A Flutter app's `pubspec.yaml` read as a package's manifest: its name,
+/// its dependencies, and whether it is Flutter's.
+fn pubspec(text: &str) -> Option<serde_json::Value> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(text).ok()?;
+    let doc = docs.first()?;
+    let dependencies: serde_json::Map<String, serde_json::Value> = doc["dependencies"]
+        .as_hash()
+        .into_iter()
+        .flat_map(|h| h.keys())
+        .filter_map(|k| k.as_str())
+        .map(|k| (k.to_owned(), serde_json::Value::Bool(true)))
+        .collect();
+    let flutter = dependencies.contains_key("flutter");
+    Some(serde_json::json!({
+        "name": doc["name"].as_str().unwrap_or_default(),
+        "dependencies": dependencies,
+        "flutter": flutter,
+    }))
+}
+
+/// The screens of a Flutter app: go_router's `GoRoute(path: …)`, a child's
+/// path under its parent's and a `ShellRoute`'s widget the layout of those
+/// it holds, and the named routes of a `MaterialApp`; each rendered by the
+/// file that defines its widget.
+fn flutter_routes(map: &CodeMap, text_of: &HashMap<usize, &str>, files: &[usize]) -> Vec<Screen> {
+    static CLASS: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*(?:abstract\s+)?class\s+([A-Z]\w*)").ok());
+    static ROUTE: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"\b(GoRoute|ShellRoute)\s*\(").ok());
+    static PATH: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r#"\bpath\s*:\s*['"]([^'"]*)['"]"#).ok());
+    static WIDGET: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"(?:builder|pageBuilder)\s*:\s*\([^)]*\)\s*(?:=>|\{[^}]*?return)\s*(?:const\s+)?(?:\w+\s*\(\s*(?:key:\s*[^,]+,\s*)?child\s*:\s*(?:const\s+)?)?([A-Z]\w*)\s*[(<]")
+            .ok()
+    });
+    static NAMED: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"['"](/[^'"]*)['"]\s*:\s*\([^)]*\)\s*=>\s*(?:const\s+)?([A-Z]\w*)\s*\("#).ok()
+    });
+    let (Some(class), Some(route), Some(path_re), Some(widget), Some(named)) = (
+        CLASS.as_ref(),
+        ROUTE.as_ref(),
+        PATH.as_ref(),
+        WIDGET.as_ref(),
+        NAMED.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    // Each widget's file.
+    let mut defined: HashMap<String, usize> = HashMap::new();
+    for &file in files {
+        if let Some(text) = text_of.get(&file) {
+            for c in class.captures_iter(text) {
+                defined.entry(c[1].to_owned()).or_insert(file);
+            }
+        }
+    }
+    let file_of = |name: &str, or: usize| {
+        map.nodes[defined.get(name).copied().unwrap_or(or)]
+            .path
+            .clone()
+    };
+    let mut screens = Vec::new();
+    for &file in files {
+        let Some(text) = text_of.get(&file) else {
+            continue;
+        };
+        // Each route: whether it is a shell, its span, its own text (what
+        // its children's spans leave), its path and its widget.
+        let mut routes: Vec<FlutterRoute> = Vec::new();
+        for c in route.captures_iter(text) {
+            let Some(m) = c.get(0) else { continue };
+            let (start, end) = enclosing_parens(text, m.end() - 1);
+            routes.push(FlutterRoute {
+                shell: &c[1] == "ShellRoute",
+                start,
+                end,
+                path: None,
+                view: None,
+            });
+        }
+        let spans: Vec<(usize, usize)> = routes.iter().map(|r| (r.start, r.end)).collect();
+        for (i, entry) in routes.iter_mut().enumerate() {
+            let (start, end) = (entry.start, entry.end);
+            // Up to its first child: what it says of itself.
+            let own_end = spans
+                .iter()
+                .enumerate()
+                .filter(|(j, (s, e))| *j != i && *s > start && *e <= end)
+                .map(|(_, (s, _))| *s)
+                .min()
+                .unwrap_or(end);
+            let own = &text[start..own_end];
+            entry.path = path_re.captures(own).map(|c| c[1].to_owned());
+            entry.view = widget.captures(own).map(|c| c[1].to_owned());
+        }
+        for (
+            i,
+            FlutterRoute {
+                shell,
+                start,
+                end,
+                path,
+                view,
+            },
+        ) in routes.iter().enumerate()
+        {
+            if *shell {
+                continue;
+            }
+            let Some(path) = path else { continue };
+            // Its whole path, through the routes that hold it; their shells
+            // its layouts.
+            let mut full = path.clone();
+            let mut layouts = Vec::new();
+            let mut inner = (*start, *end);
+            loop {
+                let parent = routes
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, r)| *j != i && r.start < inner.0 && r.end >= inner.1)
+                    .max_by_key(|(_, r)| r.start);
+                let Some((_, parent)) = parent else {
+                    break;
+                };
+                if parent.shell {
+                    if let Some(view) = &parent.view {
+                        layouts.insert(0, file_of(view, file));
+                    }
+                } else if let Some(p_path) = &parent.path
+                    && !full.starts_with('/')
+                {
+                    full = format!("{}/{full}", p_path.trim_end_matches('/'));
+                }
+                inner = (parent.start, parent.end);
+            }
+            let parts: Vec<String> = full
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| match s.strip_prefix(':') {
+                    Some(name) => format!("[{name}]"),
+                    None => s.to_owned(),
+                })
+                .collect();
+            screens.push(Screen {
+                route: format!("/{}", parts.join("/")),
+                file: view
+                    .as_deref()
+                    .map_or_else(|| map.nodes[file].path.clone(), |v| file_of(v, file)),
+                layouts,
+                ..Screen::default()
+            });
+        }
+        if routes.is_empty() && text.contains("routes") {
+            for c in named.captures_iter(text) {
+                screens.push(Screen {
+                    route: c[1].to_owned(),
+                    file: file_of(&c[2], file),
+                    ..Screen::default()
+                });
+            }
+        }
+    }
+    screens
+}
+
+/// A route of go_router as read: whether it is a shell, the span of its
+/// call, its path and its widget.
+struct FlutterRoute {
+    shell: bool,
+    start: usize,
+    end: usize,
+    path: Option<String>,
+    view: Option<String>,
+}
+
+/// The span of the call whose `(` is at `open`: to its matching `)`.
+fn enclosing_parens(text: &str, open: usize) -> (usize, usize) {
+    let mut depth = 0i32;
+    for (i, &b) in text.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (open, i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    (open, text.len())
 }
 
 /// The tool that runs a package's scripts, by the lock file beside it or
@@ -353,8 +582,9 @@ fn env_read(
     text_of: &HashMap<usize, &str>,
     files: &[usize],
 ) -> BTreeMap<String, usize> {
-    static READ: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r"(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]*)").ok());
+    static READ: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]*)|fromEnvironment\(\s*['"]([A-Z][A-Z0-9_]*)['"]"#).ok()
+    });
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let Some(read) = READ.as_ref() else {
         return counts;
@@ -367,7 +597,9 @@ fn env_read(
             continue;
         };
         for c in read.captures_iter(text) {
-            *counts.entry(c[1].to_owned()).or_default() += 1;
+            if let Some(name) = c.get(1).or_else(|| c.get(2)) {
+                *counts.entry(name.as_str().to_owned()).or_default() += 1;
+            }
         }
     }
     counts
@@ -1114,7 +1346,8 @@ fn written_links(text: &str, routes: &[Vec<&str>]) -> Vec<usize> {
             .split('/')
             .filter(|s| !s.is_empty())
             .map(|s| {
-                if s.contains('\u{1}') {
+                // Put in by `${...}`, or by Dart's `$id`.
+                if s.contains('\u{1}') || s.contains('$') {
                     "*".to_owned()
                 } else {
                     s.to_owned()
@@ -1573,6 +1806,80 @@ mod tests {
             ]
         );
         assert_eq!(map.front_ends[1].framework, Framework::Vite);
+    }
+
+    #[test]
+    fn a_flutter_app_s_go_router_its_shell_and_its_screens() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shop_spec(root);
+        write(
+            root,
+            "app/pubspec.yaml",
+            "name: shop_app\ndependencies:\n  flutter:\n    sdk: flutter\n  go_router: ^14.0.0\n",
+        );
+        write(
+            root,
+            "app/lib/router.dart",
+            "import 'shell.dart';\nimport 'screens/products.dart';\nimport 'screens/product.dart';\nimport 'screens/login.dart';\n\nfinal router = GoRouter(routes: [\n  ShellRoute(\n    builder: (context, state, child) => AppShell(child: child),\n    routes: [\n      GoRoute(\n        path: '/products',\n        builder: (context, state) => const ProductsScreen(),\n        routes: [\n          GoRoute(path: ':id', builder: (context, state) => ProductScreen(id: state.pathParameters['id']!)),\n        ],\n      ),\n    ],\n  ),\n  GoRoute(path: '/login', builder: (context, state) => const LoginScreen()),\n]);\n",
+        );
+        write(
+            root,
+            "app/lib/shell.dart",
+            "class AppShell extends StatelessWidget {\n  Widget build(BuildContext context) => TextButton(onPressed: () => context.go('/login'));\n}\n",
+        );
+        write(
+            root,
+            "app/lib/screens/products.dart",
+            "import '../api.dart';\nclass ProductsScreen extends StatelessWidget {\n  void open(BuildContext context, String id) => context.go('/products/$id');\n  Future<void> create() => http.post(Uri.parse('$base/v1/products/'));\n}\n",
+        );
+        write(
+            root,
+            "app/lib/screens/product.dart",
+            "class ProductScreen extends StatelessWidget {}\n",
+        );
+        write(
+            root,
+            "app/lib/screens/login.dart",
+            "class LoginScreen extends StatelessWidget {}\n",
+        );
+        write(
+            root,
+            "app/lib/api.dart",
+            "const base = String.fromEnvironment('API_URL', defaultValue: 'http://localhost:8000');\n",
+        );
+        let map = map(root, 100);
+        let app = &map.front_ends[0];
+        assert_eq!(
+            (
+                app.name.as_str(),
+                app.router,
+                app.framework,
+                app.runner.as_str()
+            ),
+            ("shop_app", Router::Flutter, Framework::Flutter, "flutter")
+        );
+        assert_eq!(app.api_env.as_deref(), Some("API_URL"));
+        let screens: Vec<String> = app
+            .screens
+            .iter()
+            .map(|s| format!("{} {} {:?}", s.route, s.file, s.layouts))
+            .collect();
+        assert_eq!(
+            screens,
+            [
+                "/login app/lib/screens/login.dart []",
+                "/products app/lib/screens/products.dart [\"app/lib/shell.dart\"]",
+                "/products/[id] app/lib/screens/product.dart [\"app/lib/shell.dart\"]",
+            ]
+        );
+        // The shell's link from every screen it holds; a path put in by
+        // `$id`.
+        assert_eq!(app.screens[1].links, [0, 2]);
+        assert_eq!(app.screens[2].links, [0]);
+        let create = app.workflows.iter().find(|w| w.method == "POST").unwrap();
+        assert_eq!(create.name, "Create Product");
+        assert_eq!(create.steps, [1]);
     }
 
     #[test]
