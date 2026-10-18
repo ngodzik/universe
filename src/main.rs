@@ -26,7 +26,7 @@ use universe_ui::Defaults;
 const FILE_LIST_LIMIT: usize = 300;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version)]
 struct Cli {
     /// Base URL of an OpenAI compatible endpoint.
     #[arg(
