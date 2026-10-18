@@ -32,10 +32,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config;
-      # CEF's wrapper is built with Ninja.
-      - name: Wayland headers and Ninja
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev ninja-build
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
       - name: CEF, kept between runs
         uses: actions/cache@v4
         with:
@@ -69,11 +70,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config;
-      # CEF's wrapper is built with Ninja.
-      - name: Wayland headers and Ninja
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev ninja-build
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
       - name: Ninja
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -102,10 +104,11 @@ jobs:
       # is told to leave it alone in dependabot.yml.
       - uses: dtolnay/rust-toolchain@1.99
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config;
-      # CEF's wrapper is built with Ninja.
-      - name: Wayland headers and Ninja
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev ninja-build
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
       - name: CEF, kept between runs
         uses: actions/cache@v4
         with:
