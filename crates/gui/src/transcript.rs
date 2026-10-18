@@ -682,6 +682,10 @@ fn table_grid(
     aligns: &[md::Align],
     rows: &[Vec<Vec<md::Span>>],
 ) {
+    // A label wraps at the room the grid gives a column, which a column
+    // measured once on narrow cells keeps: a cell keeps to one line, and
+    // the card scrolls instead.
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     egui::Grid::new(ui.next_auto_id())
         .striped(true)
         .spacing(egui::vec2(18.0, 4.0))
