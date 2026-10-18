@@ -19,9 +19,9 @@ const MAX_MATCHES: usize = 100;
 const MAX_LINE: usize = 200;
 
 /// The lines matching `pattern` under `dir`, as `path:line: text`, in files
-/// whose name matches `glob` when given. Files that git ignores and binary
-/// files are skipped. The pattern is a regular expression, case sensitive
-/// unless it has no capital letter.
+/// whose name matches `glob` when given. Files that git ignores, binary
+/// files and files of secrets are skipped. The pattern is a regular
+/// expression, case sensitive unless it has no capital letter.
 pub(crate) fn search(
     root: &Path,
     dir: &Path,
@@ -55,6 +55,10 @@ pub(crate) fn search(
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .map(ignore::DirEntry::into_path)
+        // A match in a file of secrets would show it, or tell a guess of it.
+        .filter(|path| {
+            !crate::secrets::secret_file(&path.strip_prefix(root).unwrap_or(path).to_string_lossy())
+        })
         .collect();
     paths.sort();
 

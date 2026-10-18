@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+use crate::secrets::secret_file;
+
 /// How long a command may run.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -930,35 +932,6 @@ pub fn known_hosts(root: &Path) -> Vec<String> {
         }
     }
     hosts
-}
-
-/// Files that hold secrets: reading them shows them.
-const SECRET_FILES: [&str; 16] = [
-    ".aws/credentials",
-    ".aws/sso/cache",
-    ".aws/cli/cache",
-    ".ssh/",
-    ".kube/config",
-    ".docker/config.json",
-    ".netrc",
-    ".git-credentials",
-    ".config/gh/hosts.yml",
-    ".pgpass",
-    ".npmrc",
-    ".pypirc",
-    ".claude/.credentials.json",
-    ".codex/auth.json",
-    ".config/gcloud/",
-    ".azure/",
-];
-
-/// Whether `word` names a file of secrets: one above, or a `.env` file.
-fn secret_file(word: &str) -> bool {
-    let name = word.rsplit('/').next().unwrap_or(word);
-    SECRET_FILES.iter().any(|f| word.contains(f))
-        || name == ".env"
-        || name.starts_with(".env.")
-        || name.ends_with(".env")
 }
 
 /// Why `command` would show a secret's value, if it would.

@@ -97,6 +97,14 @@ struct SearchArgs {
 /// Past this many lines, reading a whole file says how to read less.
 const LONG_FILE: usize = 300;
 
+/// What a model may see of a file of secrets.
+enum Secrets {
+    /// The names of the variables it sets.
+    Names,
+    /// Nothing.
+    Nothing,
+}
+
 #[derive(Deserialize)]
 struct WriteArgs {
     path: String,
@@ -181,7 +189,8 @@ impl Toolbox {
                 name: "read_file".into(),
                 description: "Read a text file, or only lines `start` to `end` of it, numbered \
                     from 1. Read only the lines you need when you know where they are, from \
-                    `search` or `outline`: every line read is paid for again on each later turn."
+                    `search` or `outline`: every line read is paid for again on each later turn. \
+                    Of a `.env` file, only the names of the variables it sets."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -276,6 +285,11 @@ impl Toolbox {
             }
             "read_file" => {
                 let args: ReadArgs = parse(call)?;
+                match self.secrets(&args.path) {
+                    Some(Secrets::Names) => return self.names(args.path),
+                    Some(Secrets::Nothing) => return Err(ToolError::Secret(args.path.into())),
+                    None => {}
+                }
                 let text = self.workspace.read(&args.path)?;
                 let total = text.lines().count();
                 if args.start.is_none() && args.end.is_none() {
@@ -316,6 +330,9 @@ impl Toolbox {
             "search" => {
                 let args: SearchArgs = parse(call)?;
                 let where_ = args.path.as_deref().unwrap_or(".");
+                if self.secrets(where_).is_some() {
+                    return Err(ToolError::Secret(where_.into()));
+                }
                 let dir = self.workspace.resolve(where_)?;
                 let (text, matches) = crate::search::search(
                     self.workspace.root(),
@@ -367,6 +384,11 @@ impl Toolbox {
             }
             "replace" => {
                 let args: ReplaceArgs = parse(call)?;
+                // Whether the text to replace is found would tell what the
+                // file holds.
+                if self.secrets(&args.path).is_some() {
+                    return Err(ToolError::Secret(args.path.into()));
+                }
                 let before = self.workspace.read(&args.path)?;
                 self.workspace.replace(&args.path, &args.old, &args.new)?;
                 let after = self.workspace.read(&args.path)?;
@@ -374,6 +396,13 @@ impl Toolbox {
             }
             "write_file" => {
                 let args: WriteArgs = parse(call)?;
+                // A new one may be written, not one whose values the model
+                // cannot see.
+                if self.secrets(&args.path).is_some()
+                    && self.workspace.resolve(&args.path)?.exists()
+                {
+                    return Err(ToolError::Secret(args.path.into()));
+                }
                 let before = self.workspace.read(&args.path).ok();
                 self.workspace.write(&args.path, &args.content)?;
                 let created = before.is_none();
@@ -387,6 +416,59 @@ impl Toolbox {
             }
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
+    }
+
+    /// What a model may see of the file `relative` names if it holds
+    /// secrets, by its name or by the one a link of it leads to.
+    fn secrets(&self, relative: &str) -> Option<Secrets> {
+        let real = self
+            .workspace
+            .resolve(relative)
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .map(|path| self.workspace.display(&path).to_string_lossy().into_owned());
+        let names: Vec<&str> = std::iter::once(relative).chain(real.as_deref()).collect();
+        if names
+            .iter()
+            .any(|name| crate::secrets::variables_file(name))
+        {
+            Some(Secrets::Names)
+        } else if names.iter().any(|name| crate::secrets::secret_file(name)) {
+            Some(Secrets::Nothing)
+        } else {
+            None
+        }
+    }
+
+    /// The names of the variables the file `path` sets, never their values.
+    fn names(&self, path: String) -> Result<ToolOutput, ToolError> {
+        let names = crate::secrets::names_set(&self.workspace.read(&path)?);
+        let for_model = if names.is_empty() {
+            format!("{path} sets no variable.")
+        } else {
+            let listed: Vec<String> = names
+                .iter()
+                .map(|(name, empty)| {
+                    if *empty {
+                        format!("{name} (empty)")
+                    } else {
+                        name.clone()
+                    }
+                })
+                .collect();
+            format!(
+                "{path} sets these variables; their values are secrets, not shown:\n{}",
+                listed.join("\n")
+            )
+        };
+        Ok(ToolOutput {
+            picture: None,
+            summary: ToolSummary::Ran {
+                label: format!("Names({path})"),
+                lines: names.len(),
+            },
+            for_model,
+        })
     }
 
     fn changed_output(
@@ -630,6 +712,88 @@ mod tests {
                 .call(&call("outline", json!({"path": "/etc"})))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_file_of_secrets_shows_only_the_names_it_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut tools = Toolbox::new(Workspace::new(root).unwrap());
+        let env = "API_KEY=sk-live-0123456789\nPORT=8080\nTOKEN=\n";
+        fs::write(root.join(".env"), env).unwrap();
+        fs::create_dir_all(root.join("deploy")).unwrap();
+        fs::write(root.join("deploy/prod.env"), env).unwrap();
+        fs::write(
+            root.join(".netrc"),
+            "machine h login me password sk-live-0123\n",
+        )
+        .unwrap();
+        let secret = |tools: &mut Toolbox, name: &str, args: serde_json::Value| {
+            matches!(tools.call(&call(name, args)), Err(ToolError::Secret(_)))
+        };
+
+        let read = tools
+            .call(&call("read_file", json!({"path": ".env"})))
+            .unwrap();
+        assert_eq!(
+            read.for_model,
+            ".env sets these variables; their values are secrets, not shown:\n\
+             API_KEY\nPORT\nTOKEN (empty)"
+        );
+        // A range of lines is no way round it.
+        let range = tools
+            .call(&call(
+                "read_file",
+                json!({"path": "deploy/prod.env", "start": 1, "end": 1}),
+            ))
+            .unwrap();
+        assert!(!range.for_model.contains("sk-live"), "{}", range.for_model);
+        assert!(secret(&mut tools, "read_file", json!({"path": ".netrc"})));
+
+        // A search neither finds a value nor tells whether a guess matches.
+        let found = tools
+            .call(&call("search", json!({"pattern": "sk-live"})))
+            .unwrap();
+        assert_eq!(found.for_model, "no match");
+        assert!(secret(
+            &mut tools,
+            "search",
+            json!({"pattern": "sk", "path": ".env"})
+        ));
+
+        // Nor does an edit, and a file of secrets is not written over.
+        assert!(secret(
+            &mut tools,
+            "replace",
+            json!({"path": ".env", "old": "sk-live", "new": "sk-live"})
+        ));
+        assert!(secret(
+            &mut tools,
+            "write_file",
+            json!({"path": ".env", "content": "API_KEY=\n"})
+        ));
+        assert_eq!(fs::read_to_string(root.join(".env")).unwrap(), env);
+        // A new one may be written.
+        tools
+            .call(&call(
+                "write_file",
+                json!({"path": "api/.env", "content": "PORT=1\n"}),
+            ))
+            .unwrap();
+
+        // Nor is a link to one read through.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+            let linked = tools
+                .call(&call("read_file", json!({"path": "notes.txt"})))
+                .unwrap();
+            assert!(
+                !linked.for_model.contains("sk-live"),
+                "{}",
+                linked.for_model
+            );
+        }
     }
 
     #[test]

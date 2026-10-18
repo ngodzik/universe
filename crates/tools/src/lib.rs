@@ -23,6 +23,7 @@ mod outline;
 mod picture;
 mod rules;
 mod search;
+mod secrets;
 mod snapshot;
 mod toolbox;
 mod workspace;

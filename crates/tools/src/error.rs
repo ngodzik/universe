@@ -68,6 +68,14 @@ pub enum ToolError {
         bytes: usize,
     },
 
+    /// The file holds secrets, which a model neither reads nor changes:
+    /// what it holds, or whether a guess matches it, would be told. Of a
+    /// file of variables, `read_file` gives the names it sets.
+    #[error(
+        "{0} holds secrets, which models neither read nor change: read_file gives the names a .env file sets, and the person sets their values"
+    )]
+    Secret(PathBuf),
+
     /// A directory listing was asked for a file.
     #[error("{0} is a file, not a directory: read it with read_file")]
     NotADirectory(PathBuf),
