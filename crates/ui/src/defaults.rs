@@ -253,8 +253,7 @@ fn keep_private(dir: &Path, person: Option<&Path>) -> io::Result<()> {
             .mode(0o700)
             .create(dir)?;
         let dir = dir.canonicalize()?;
-        let person = person.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_owned()));
-        if person.is_some_and(|person| person.starts_with(&dir)) {
+        if person.is_some_and(|person| resolved(person).starts_with(&dir)) {
             return Ok(());
         }
         let mut pending = vec![dir];
@@ -278,6 +277,28 @@ fn keep_private(dir: &Path, person: Option<&Path>) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = (dir, person);
     Ok(())
+}
+
+/// `path` with its links resolved as far as it exists, the rest as written:
+/// compared with a folder resolved, it is compared on the same ground.
+#[cfg(unix)]
+fn resolved(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+    let mut out = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_owned());
+    out.extend(rest.into_iter().rev());
+    out
 }
 
 #[cfg(test)]
@@ -325,10 +346,16 @@ mod tests {
         keep_private(&new, None).unwrap();
         assert_eq!(mode(&new), 0o700);
 
-        // Never the person's own folder, nor one above it.
-        set(dir.path(), 0o755);
-        keep_private(dir.path(), Some(&dir.path().join("me"))).unwrap();
-        assert_eq!(mode(dir.path()), 0o755);
+        // Never the person's own folder, nor one above it, even reached
+        // through a link, as macOS's temporary folders are.
+        let above = dir.path().join("above");
+        fs::create_dir(&above).unwrap();
+        set(&above, 0o755);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&above, &link).unwrap();
+        keep_private(&above, Some(&above.join("me"))).unwrap();
+        keep_private(&link, Some(&link.join("me"))).unwrap();
+        assert_eq!(mode(&above), 0o755);
     }
 
     #[test]
