@@ -329,7 +329,6 @@ where
                     AppOrder::Go(path) => preview.go(&path),
                     AppOrder::Reload => preview.reload(),
                     AppOrder::History(back) => preview.history(back),
-                    AppOrder::Place(place) => preview.place(place),
                     AppOrder::Play(steps) => preview.play(steps),
                     AppOrder::Change(change) => preview.change(move |state| change.apply(state)),
                     AppOrder::Keep(index) => preview.keep(index),

@@ -1,13 +1,12 @@
-//! The App view's state: the project's front end running in the system's
-//! Chrome against a simulated back end, as the preview last told it, and
-//! what the person asks of it. The window says where the page goes on the
-//! screen; the browser's own window shows it there, and the host carries
-//! out the rest.
+//! The App view's state: the project's front end running in the Chrome
+//! universe holds in its window, against a simulated back end, as the
+//! preview last told it, and what the person asks of it. The window shows
+//! the page; the host carries out the rest.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use universe_preview::{Answer, Call, Config, Event, Operation, Place, State, Status};
+use universe_preview::{Answer, Call, Config, Event, Operation, State, Status};
 
 /// How many calls are kept, the latest.
 const KEPT_CALLS: usize = 400;
@@ -34,8 +33,6 @@ pub enum AppOrder {
     Reload,
     /// Back in the page's history, or forward.
     History(bool),
-    /// Show the browser's window with its page there, or hide it.
-    Place(Option<Place>),
     /// Show a workflow: its steps' pages in turn.
     Play(Vec<String>),
     /// Change the state the back end answers in.
@@ -131,10 +128,8 @@ pub struct Activity {
 pub struct AppPreview {
     status: Option<Status>,
     /// Whether its first page has loaded: until then, the wait is drawn
-    /// rather than the browser's window shown.
+    /// rather than the page.
     page_shown: bool,
-    /// Where the browser's window was last asked to be.
-    place: Option<Place>,
     /// Since when a page loads, and which, as far as known.
     loading: Option<std::time::Instant>,
     target: Option<String>,
@@ -184,8 +179,7 @@ impl AppPreview {
         matches!(self.status, Some(Status::Running { .. }))
     }
 
-    /// Whether the browser's window shows the page: running, its first
-    /// page loaded.
+    /// Whether the page shows: running, its first page loaded.
     #[must_use]
     pub fn page_shown(&self) -> bool {
         self.is_running() && self.page_shown
@@ -311,19 +305,7 @@ impl AppPreview {
     pub(crate) fn stop(&mut self) -> AppOrder {
         self.status = Some(Status::Stopped);
         self.playing = None;
-        self.place = None;
         AppOrder::Stop
-    }
-
-    /// The order to show the browser's window at `place`, or to hide it,
-    /// when that changed: shown only while the page is.
-    pub(crate) fn place(&mut self, place: Option<Place>) -> Option<AppOrder> {
-        let place = place.filter(|_| self.page_shown());
-        if self.place == place || !self.is_running() {
-            return None;
-        }
-        self.place = place;
-        Some(AppOrder::Place(place))
     }
 
     pub(crate) fn change(&mut self, change: Change) -> AppOrder {
@@ -387,9 +369,6 @@ impl AppPreview {
                     Status::Stopped => (ActivityKind::Step, "Stopped".to_owned()),
                 };
                 self.log(kind, said);
-                if !matches!(status, Status::Running { .. }) {
-                    self.place = None;
-                }
                 self.status = Some(status);
             }
             Event::Operations(operations) => {
@@ -501,7 +480,6 @@ impl AppPreview {
                 self.status = Some(Status::Failed(
                     "Chrome was closed: start it again to see the page".to_owned(),
                 ));
-                self.place = None;
             }
         }
         None
@@ -654,34 +632,20 @@ mod tests {
     }
 
     #[test]
-    fn the_browser_s_window_shows_once_the_first_page_has_loaded() {
-        let place = Place {
-            left: 10,
-            top: 20,
-            width: 800,
-            height: 600,
-        };
+    fn the_page_shows_once_its_first_page_has_loaded() {
         let mut preview = AppPreview::default();
         preview.told(Event::Status(Status::Running {
             address: "http://127.0.0.1:3000".to_owned(),
         }));
-        // Built still: the wait shows, not the window.
+        // Built still: the wait shows, not the page.
         assert!(!preview.page_shown());
-        assert_eq!(preview.place(Some(place)), None);
         preview.told(address("http://127.0.0.1:3000/products", false));
         preview.told(Event::Quiet);
         assert!(preview.page_shown());
-        assert_eq!(
-            preview.place(Some(place)),
-            Some(AppOrder::Place(Some(place)))
-        );
-        // Asked again where it is: nothing to send.
-        assert_eq!(preview.place(Some(place)), None);
-        assert_eq!(preview.place(None), Some(AppOrder::Place(None)));
-        // Closed: a stop that says so, and nothing more to place.
+        // Closed: a stop that says so, and no page.
         preview.told(Event::Gone);
         assert!(!preview.is_on());
-        assert_eq!(preview.place(Some(place)), None);
+        assert!(!preview.page_shown());
     }
 
     #[test]

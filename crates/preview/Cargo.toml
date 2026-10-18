@@ -14,8 +14,5 @@ thiserror.workspace  = true
 tungstenite.workspace = true
 yaml-rust2.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13.2", default-features = false }
-
 [dev-dependencies]
 tempfile.workspace = true

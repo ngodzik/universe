@@ -5218,13 +5218,6 @@ impl App {
         self.app_order(crate::app_preview::AppOrder::History(back))
     }
 
-    /// Where the browser's window is to show the page, on the screen, as
-    /// the window has room for it: `None` while the view is not shown.
-    /// Sent when it changes, and only once the page has loaded.
-    pub fn app_place(&mut self, place: Option<universe_preview::Place>) -> Option<Effect> {
-        self.preview.place(place).map(Effect::App)
-    }
-
     /// Changes the state the simulated back end answers in.
     pub fn app_change(&mut self, change: crate::app_preview::Change) -> Option<Effect> {
         let order = self.preview.change(change);
@@ -5332,8 +5325,8 @@ impl App {
             }
             Some(MapView::App) => {
                 "The app: its front end against a back end simulated from its spec, in Chrome \
-                 over this view. Start it and use the page as in any browser; Ctrl-J hides the \
-                 pilot, Ctrl-N again for the universe"
+                 within this view. Start it and use the page as in any browser; Ctrl-J hides \
+                 the pilot, Ctrl-N again for the universe"
             }
             None => return,
         };
@@ -6128,7 +6121,7 @@ mod tests {
     }
 
     #[test]
-    fn the_app_view_its_pilot_and_its_page_s_window() {
+    fn the_app_view_and_its_pilot() {
         use crate::app_preview::AppOrder;
         let mut app = ready();
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
@@ -6157,20 +6150,6 @@ mod tests {
             app.app_reload(),
             Some(Effect::App(AppOrder::Reload))
         ));
-        // Its window shows once its first page has loaded.
-        let place = universe_preview::Place {
-            left: 0,
-            top: 0,
-            width: 640,
-            height: 480,
-        };
-        assert!(app.app_place(Some(place)).is_none());
-        app.app_told(universe_preview::Event::Quiet);
-        assert!(matches!(
-            app.app_place(Some(place)),
-            Some(Effect::App(AppOrder::Place(Some(_))))
-        ));
-
         // Left for a file, Ctrl-N comes back to it.
         app.open_from_app(PathBuf::from("/p/fixture.json"), 1);
         assert_eq!(app.map_view(), None);

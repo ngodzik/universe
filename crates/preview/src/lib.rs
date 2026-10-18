@@ -1,9 +1,9 @@
 //! A project's front end run as its developers run it, against a back end
-//! simulated from the API's spec, in the system's Chrome: a window of its
-//! own that universe places over the App view, driven over the DevTools
-//! protocol. The person uses the page there as in any browser; its
-//! address, its loads and its errors are told, and every call it makes
-//! with the operation it reached and where its answer came from.
+//! simulated from the API's spec, in the Chrome universe holds in its own
+//! window, driven over the DevTools protocol. The person uses the page
+//! there as in any browser; its address, its loads and its errors are
+//! told, and every call it makes with the operation it reached and where
+//! its answer came from.
 //!
 //! Nothing here asks a model. The answers are made from the spec's
 //! schemas, the same for the same place, bent to a state on demand (lists
@@ -20,14 +20,13 @@ mod leftovers;
 mod made;
 mod mock;
 mod spec;
-mod window;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-pub use browser::{Place, browser_found};
+pub use browser::browser_found;
 pub use dev::{Framework, Run, command_line, command_shown, free_port};
 pub use error::PreviewError;
 pub use leftovers::{leftovers_file, stop_leftovers};
@@ -70,11 +69,10 @@ pub struct Config {
     /// Where what it starts is written down, to be stopped at the next
     /// start if it is left running.
     pub leftovers: Option<PathBuf>,
-    /// Whether the browser shows a window, to be placed over universe's;
-    /// else it runs headless, as a test's does.
-    pub shown: bool,
-    /// Universe's own window, on X11, which the browser's is held over.
-    pub parent: Option<u64>,
+    /// The port the DevTools of the browser universe holds listen on, its
+    /// page the front end's; without one, the system's browser is started
+    /// headless, as a test's is.
+    pub devtools: Option<u16>,
 }
 
 /// Where a preview is.
@@ -183,11 +181,6 @@ impl Preview {
     /// Goes back in the page's history, or forward.
     pub fn history(&self, back: bool) {
         self.order(Order::Browser(Request::History(back)));
-    }
-
-    /// Shows the browser's window with its page at `place`, or hides it.
-    pub fn place(&self, place: Option<Place>) {
-        self.order(Order::Browser(Request::Place(place)));
     }
 
     /// Shows a workflow: its steps' pages in turn, each once it has
@@ -304,14 +297,15 @@ fn start(
     server.ready()?;
     sink(Event::Status(Status::Opening));
     let address = format!("http://127.0.0.1:{port}");
-    let browser = Browser::start(
-        &format!("{address}{}", config.start),
-        &config.cookies,
-        config.shown.then_some(config.parent),
-        Arc::clone(sink),
-    )?;
-    record.add(false, browser.pid(), &browser.program());
-    record.add_profile(browser.profile());
+    let first = format!("{address}{}", config.start);
+    let browser = match config.devtools {
+        Some(port) => Browser::attach(port, &first, &config.cookies, Arc::clone(sink))?,
+        None => Browser::start(&first, &config.cookies, Arc::clone(sink))?,
+    };
+    if let Some((pid, program, profile)) = browser.started() {
+        record.add(false, pid, &program);
+        record.add_profile(profile);
+    }
     sink(Event::Status(Status::Running { address }));
     Ok((mock, server, browser))
 }
@@ -390,8 +384,7 @@ mod tests {
             cookies: Vec::new(),
             start: "/".to_owned(),
             leftovers: None,
-            shown: false,
-            parent: None,
+            devtools: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let failed = wait_for(&events, |e| matches!(e, Event::Status(Status::Failed(_))));
@@ -440,8 +433,7 @@ mod tests {
             cookies: vec![("session".to_owned(), "simulated".to_owned())],
             start: "/index.html".to_owned(),
             leftovers: None,
-            shown: false,
-            parent: None,
+            devtools: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let started = wait_for(&events, |e| {

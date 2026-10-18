@@ -1,7 +1,8 @@
-//! The App view: the project's front end running in the system's Chrome
-//! against a back end simulated from its spec. Its page on the left, in
-//! Chrome's own window held over this one's, used there as in any
-//! browser; the wait drawn until its first page has loaded. On the right
+//! The App view: the project's front end running in the Chrome universe
+//! holds, against a back end simulated from its spec. Its page on the
+//! left, drawn by Chrome under this view, which leaves room for it, and
+//! used there as in any browser; the wait drawn until its first page has
+//! loaded. On the right
 //! the pilot, sized by its edge and hidden or shown again with Ctrl-J or
 //! its tab: how the front end runs, the states the back end answers in,
 //! the workflows to show step by step, the screens, the calls of the page
@@ -54,23 +55,13 @@ pub(crate) struct AppView {
     dragged: Option<f32>,
     /// How the chosen front end runs: its folder, its command, its spec.
     how: Option<(String, String, String)>,
-    /// Where universe's window is on the screen, as the window last said.
-    pub(crate) screen: Option<Screen>,
-}
-
-/// Where universe's window is on the screen, for Chrome's to be placed
-/// over its page area.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Screen {
-    /// The top left of what it draws, in the screen's pixels.
-    pub(crate) left: f64,
-    pub(crate) top: f64,
-    /// The screen's pixels to a device-independent one.
-    pub(crate) scale: f64,
-    /// Whether it is minimized: Chrome's window then hides too.
-    pub(crate) minimized: bool,
-    /// Its window on X11, which Chrome's is held over.
-    pub(crate) parent: Option<u64>,
+    /// The port the DevTools of the Chrome universe holds listen on.
+    pub(crate) devtools: Option<u16>,
+    /// Whether that Chrome could be loaded.
+    pub(crate) chrome: bool,
+    /// Where the page shows, in points, and the points to a window's
+    /// pixel: none while it does not.
+    pub(crate) page_area: Option<(Rect, f32)>,
 }
 
 impl AppView {
@@ -89,7 +80,9 @@ impl AppView {
             open_call: None,
             dragged: None,
             how: None,
-            screen: None,
+            devtools: None,
+            chrome: false,
+            page_area: None,
         }
     }
 
@@ -123,6 +116,44 @@ impl AppView {
 
 /// Draws the App view.
 pub(crate) fn show(
+    ui: &mut Ui,
+    view: &mut AppView,
+    plan: &Plan,
+    app: &mut App,
+    effects: &mut Vec<Effect>,
+    background: Color32,
+) {
+    let rect = ui.max_rect();
+    // The background, painted once the page's room is known: around it.
+    let backdrop = ui.painter().add(egui::Shape::Noop);
+    view.page_area = None;
+    show_view(ui, view, plan, app, effects);
+    let shapes = match view.page_area {
+        Some((hole, _)) => around(rect, hole)
+            .into_iter()
+            .map(|r| egui::Shape::rect_filled(r, CornerRadius::ZERO, background))
+            .collect(),
+        None => vec![egui::Shape::rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            background,
+        )],
+    };
+    ui.painter().set(backdrop, egui::Shape::Vec(shapes));
+}
+
+/// What of `outer` lies around `hole`: above, below, left and right.
+fn around(outer: Rect, hole: Rect) -> [Rect; 4] {
+    let hole = hole.intersect(outer);
+    [
+        Rect::from_min_max(outer.min, pos2(outer.max.x, hole.min.y)),
+        Rect::from_min_max(pos2(outer.min.x, hole.max.y), outer.max),
+        Rect::from_min_max(pos2(outer.min.x, hole.min.y), pos2(hole.min.x, hole.max.y)),
+        Rect::from_min_max(pos2(hole.max.x, hole.min.y), pos2(outer.max.x, hole.max.y)),
+    ]
+}
+
+fn show_view(
     ui: &mut Ui,
     view: &mut AppView,
     plan: &Plan,
@@ -196,7 +227,7 @@ pub(crate) fn show(
         )
     };
 
-    page(ui, view, page_area.shrink2(vec2(12.0, 8.0)), app, effects);
+    page(ui, view, page_area.shrink2(vec2(12.0, 8.0)), app);
 
     match pilot_area {
         Some(area) => {
@@ -294,18 +325,22 @@ fn status_line(app: &App) -> String {
     }
 }
 
-/// The page: Chrome's window over this area once its first page has
-/// loaded, the wait drawn until then.
-fn page(ui: &mut Ui, view: &AppView, area: Rect, app: &mut App, effects: &mut Vec<Effect>) {
+/// The page: Chrome's own, drawn under this view once its first page has
+/// loaded, nothing here covering it; the wait drawn until then.
+fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &App) {
     let preview = app.app_preview();
     let painter = ui.painter_at(area);
+    if preview.page_shown() {
+        view.page_area = Some((area, ui.ctx().zoom_factor()));
+        return;
+    }
     painter.rect_filled(area, CornerRadius::same(8), Color32::from_rgb(8, 9, 12));
     if !preview.is_on() {
         let (title, said) = match preview.status() {
             Some(Status::Failed(why)) => ("It stopped", why.clone()),
             _ => (
                 "Not running",
-                "Start it in the pilot, on the right: the page opens here, in Chrome".to_owned(),
+                "Start it in the pilot, on the right: the page shows here, in Chrome".to_owned(),
             ),
         };
         painter.text(
@@ -328,48 +363,9 @@ fn page(ui: &mut Ui, view: &AppView, area: Rect, app: &mut App, effects: &mut Ve
         );
         return;
     }
-    if !preview.page_shown() {
-        let deep = app.bullets() != universe_ui::markdown::Bullets::Plain;
-        waiting(ui, &painter, area, app, deep);
-        ui.ctx().request_repaint();
-        return;
-    }
-    // Under Chrome's window, seen only while it catches up with a move.
-    painter.text(
-        area.center(),
-        Align2::CENTER_CENTER,
-        "The page shows here, in Chrome",
-        FontId::proportional(14.0),
-        DIM,
-    );
-    let place = view
-        .screen
-        .filter(|screen| !screen.minimized)
-        .map(|screen| place(area, ui.pixels_per_point(), screen));
-    if let Some(effect) = app.app_place(place) {
-        effects.push(effect);
-    }
-}
-
-/// Where Chrome's page goes for this area to show it: from the window's
-/// points to the screen's pixels, then to its device-independent ones.
-fn place(area: Rect, pixels_per_point: f32, screen: Screen) -> universe_preview::Place {
-    let pixels = |points: f32| f64::from(points) * f64::from(pixels_per_point);
-    let scale = screen.scale.max(0.1);
-    let dip = |pixels: f64| (pixels / scale).round();
-    universe_preview::Place {
-        left: dip(screen.left + pixels(area.min.x)) as i32,
-        top: dip(screen.top + pixels(area.min.y)) as i32,
-        width: dip(pixels(area.width())).max(1.0) as u32,
-        height: dip(pixels(area.height())).max(1.0) as u32,
-    }
-}
-
-/// The App view is not shown: Chrome's window hides with it.
-pub(crate) fn hidden(app: &mut App, effects: &mut Vec<Effect>) {
-    if let Some(effect) = app.app_place(None) {
-        effects.push(effect);
-    }
+    let deep = app.bullets() != universe_ui::markdown::Bullets::Plain;
+    waiting(ui, &painter, area, app, deep);
+    ui.ctx().request_repaint();
 }
 
 /// The wait while a page is built and nothing shows yet: stars that come
@@ -777,6 +773,11 @@ fn config(
     settings: &universe_codemap::AppSettings,
     map: Option<&CodeMap>,
 ) -> Result<universe_preview::Config, String> {
+    let Some(devtools) = view.devtools.filter(|_| view.chrome) else {
+        return Err(
+            "Chrome, which shows the page here, is not installed for universe: run scripts/setup-chrome.sh once, then start universe again".to_owned(),
+        );
+    };
     let root = &view.root;
     let spec = if let Some(spec) = &settings.spec {
         let path = PathBuf::from(spec);
@@ -862,8 +863,7 @@ fn config(
             .base
             .as_ref()
             .map(|b| universe_preview::leftovers_file(b, root)),
-        shown: true,
-        parent: view.screen.and_then(|screen| screen.parent),
+        devtools: Some(devtools),
     })
 }
 
@@ -1293,42 +1293,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chrome_s_page_goes_over_the_area_whatever_the_scales() {
-        let area = Rect::from_min_size(pos2(12.0, 92.0), vec2(1000.0, 700.0));
-        let screen = Screen {
-            left: 50.0,
-            top: 40.0,
-            scale: 1.0,
-            minimized: false,
-            parent: None,
-        };
+    fn the_background_leaves_room_for_the_page() {
+        let outer = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 80.0));
+        let hole = Rect::from_min_max(pos2(10.0, 20.0), pos2(60.0, 70.0));
+        let [above, below, left, right] = around(outer, hole);
+        assert_eq!(above, Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 20.0)));
         assert_eq!(
-            place(area, 1.0, screen),
-            universe_preview::Place {
-                left: 62,
-                top: 132,
-                width: 1000,
-                height: 700
-            }
+            below,
+            Rect::from_min_max(pos2(0.0, 70.0), pos2(100.0, 80.0))
         );
-        // Text drawn larger: more of the screen's pixels for each point.
-        let larger = place(area, 1.25, screen);
-        assert_eq!((larger.left, larger.width), (65, 1250));
-        // A screen of two pixels to the point, which Chrome counts as one.
-        let dense = Screen {
-            left: 100.0,
-            top: 80.0,
-            scale: 2.0,
-            ..screen
-        };
+        assert_eq!(left, Rect::from_min_max(pos2(0.0, 20.0), pos2(10.0, 70.0)));
         assert_eq!(
-            place(area, 2.0, dense),
-            universe_preview::Place {
-                left: 62,
-                top: 132,
-                width: 1000,
-                height: 700
-            }
+            right,
+            Rect::from_min_max(pos2(60.0, 20.0), pos2(100.0, 70.0))
         );
+        let covered: f32 = [above, below, left, right].iter().map(|r| r.area()).sum();
+        assert!((covered + hole.area() - outer.area()).abs() < 0.01);
     }
 }

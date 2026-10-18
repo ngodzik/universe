@@ -16,11 +16,16 @@ universe-preview.workspace = true
 thiserror.workspace       = true
 bevy.workspace            = true
 bevy_egui.workspace       = true
+bevy_cef.workspace        = true
 egui_plot.workspace       = true
 serde_json.workspace      = true
 image.workspace           = true
-raw-window-handle = "0.6.2"
 tokio = { workspace = true, features = ["rt", "time"] }
+
+# Unbundled, as a build run from its folder is, CEF is found where it was
+# installed for development.
+[target.'cfg(target_os = "macos")'.dependencies]
+bevy_cef = { workspace = true, features = ["debug"] }
 
 [dev-dependencies]
 tempfile.workspace = true

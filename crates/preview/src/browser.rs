@@ -1,11 +1,11 @@
-//! The system's Chrome, Chromium or Edge, in a window of its own that
-//! universe places over the App view's page and drives over the DevTools
-//! protocol. The person uses the page in it as in any browser, at the
-//! browser's own speed; what it does (its address, its loads, its
-//! console's errors) is told, and its pages are kept from leaving this
-//! machine.
+//! A browser driven over the DevTools protocol: the Chrome universe holds
+//! in its own window, which the person uses as any browser, reached at
+//! the port its DevTools listen on; else the system's Chrome, Chromium or
+//! Edge started headless, as tests do. What its page does (its address,
+//! its loads, its console's errors) is told, and its pages are kept from
+//! leaving this machine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -32,27 +32,9 @@ const STEP_WITHIN: Duration = Duration::from_secs(15);
 /// page before said is not its.
 const STEP_SETTLES: Duration = Duration::from_millis(400);
 
-/// How often a window not yet found is looked for, once it is to show.
-const LOOKED_FOR: Duration = Duration::from_millis(250);
-
 /// How the name of a browser's profile begins, in the system's folder of
 /// temporary files.
 pub(crate) const PROFILE_PREFIX: &str = "universe-browser-";
-
-/// Where the page's window goes on the screen, in the screen's
-/// device-independent pixels: where the page itself shows, the window's
-/// own frame around it left to the browser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Place {
-    /// From the screen's left.
-    pub left: i32,
-    /// From the screen's top.
-    pub top: i32,
-    /// Its width.
-    pub width: u32,
-    /// Its height.
-    pub height: u32,
-}
 
 /// What the browser is asked.
 pub(crate) enum Request {
@@ -62,25 +44,29 @@ pub(crate) enum Request {
     Reload,
     /// Back in the page's history, or forward.
     History(bool),
-    /// Show the window there, or hide it.
-    Place(Option<Place>),
     /// Show these addresses in turn, each once it has loaded.
     Play(Vec<String>),
 }
 
-/// A browser running, stopped when dropped.
+/// A browser driven, let go when dropped: stopped with it when it was
+/// started for the preview.
 pub(crate) struct Browser {
-    child: Child,
-    program: PathBuf,
-    profile: PathBuf,
-    requests: Sender<Request>,
+    started: Option<Started>,
+    requests: Option<Sender<Request>>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// A browser started for the preview: its process, what it was started
+/// as, and its profile's folder.
+struct Started {
+    child: Child,
+    program: PathBuf,
+    profile: PathBuf,
+}
+
 impl Browser {
-    /// Starts a browser at `address`, `cookies` set for it first. `shown`,
-    /// its window is hidden until it is placed, and held over the window
-    /// it names where the system lets it be; else it runs headless.
+    /// Starts the system's browser, headless, at `address`, `cookies` set
+    /// for it first.
     ///
     /// # Errors
     ///
@@ -89,7 +75,6 @@ impl Browser {
     pub(crate) fn start(
         address: &str,
         cookies: &[(String, String)],
-        shown: Option<Option<u64>>,
         sink: Sink,
     ) -> Result<Self, PreviewError> {
         let program = find().ok_or(PreviewError::NoBrowser)?;
@@ -99,7 +84,6 @@ impl Browser {
             std::process::id(),
             PROFILES.fetch_add(1, Ordering::Relaxed)
         ));
-        prepare(&profile);
         let mut command = Command::new(&program);
         command
             .args([
@@ -116,36 +100,19 @@ impl Browser {
                 "--metrics-recording-only",
                 "--password-store=basic",
                 "--use-mock-keychain",
-                "--class=universe-page",
-                "--window-size=800,600",
+                "--window-size=1280,800",
+                // Headless, it needs no screen at all, and is kept from it.
+                "--headless=new",
+                "about:blank",
             ])
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
             // Kept from the desktop's session: nothing of the person's
             // keyring or settings is its to reach.
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        match shown {
-            // A window of its own, without tabs or an address bar.
-            Some(_) => {
-                // An address the app window takes, which `about:blank` is
-                // not: an empty page the colour of the wait.
-                command.arg("--app=data:text/html,<body style='background:%2308090c'>");
-                if cfg!(target_os = "linux") {
-                    // Placed by universe, which only X11 lets a program do.
-                    command
-                        .arg("--ozone-platform=x11")
-                        .env_remove("WAYLAND_DISPLAY");
-                }
-            }
-            // Headless, it needs no screen at all, and is kept from it.
-            None => {
-                command
-                    .args(["--headless=new", "about:blank"])
-                    .env_remove("DISPLAY")
-                    .env_remove("WAYLAND_DISPLAY");
-            }
-        }
         let mut child = command.spawn().map_err(|source| PreviewError::Start {
             command: program.display().to_string(),
             source,
@@ -169,89 +136,185 @@ impl Browser {
                 }
             }
         });
-        let url = wait_for_devtools(&listening, &mut child)?;
-        let socket = connect(&url)?;
+        let url = match wait_for_devtools(&listening, &mut child) {
+            Ok(url) => url,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&profile);
+                return Err(error);
+            }
+        };
+        let started = Started {
+            child,
+            program,
+            profile,
+        };
+        let port = url
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .and_then(|host| host.rsplit_once(':'))
+            .and_then(|(_, port)| port.parse().ok());
+        let Some(port) = port else {
+            return Err(PreviewError::NoDevTools {
+                said: format!("its DevTools listen at {url}"),
+            });
+        };
+        let page = wait_for_page(port)?;
+        Self::drive_at(&page, address, cookies, sink, Some(started))
+    }
+
+    /// Drives the browser whose DevTools listen on `port`, on this machine:
+    /// the one universe holds in its window, whose page it waits for, then
+    /// sends to `address`, `cookies` set for it first.
+    ///
+    /// # Errors
+    ///
+    /// [`PreviewError::NoDevTools`] when nothing answers there in time,
+    /// others when its socket cannot be opened.
+    pub(crate) fn attach(
+        port: u16,
+        address: &str,
+        cookies: &[(String, String)],
+        sink: Sink,
+    ) -> Result<Self, PreviewError> {
+        let url = wait_for_page(port)?;
+        Self::drive_at(&url, address, cookies, sink, None)
+    }
+
+    fn drive_at(
+        url: &str,
+        address: &str,
+        cookies: &[(String, String)],
+        sink: Sink,
+        started: Option<Started>,
+    ) -> Result<Self, PreviewError> {
+        let socket = connect(url)?;
         let (requests, asked) = mpsc::channel();
         let mut driver = Driver {
             socket,
-            session: String::new(),
-            target: String::new(),
-            window: None,
             next: 0,
-            pending: HashMap::new(),
             main_frame: None,
             sink,
             playing: VecDeque::new(),
             step: None,
-            frame: (0, 0),
-            placed: None,
-            held: match shown {
-                Some(parent) => crate::window::Held::new(child.id(), parent),
-                None => crate::window::Held::none(),
-            },
-            holding: false,
-            looked: Instant::now(),
         };
         driver.open(address, cookies)?;
         let thread = std::thread::spawn(move || driver.drive(&asked));
         Ok(Self {
-            child,
-            program,
-            profile,
-            requests,
+            started,
+            requests: Some(requests),
             thread: Some(thread),
         })
     }
 
-    /// Its process's id.
-    pub(crate) fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    /// What it was started as.
-    pub(crate) fn program(&self) -> String {
-        self.program.display().to_string()
-    }
-
-    /// The folder of its profile.
-    pub(crate) fn profile(&self) -> &Path {
-        &self.profile
+    /// The process it was started as, what it was started as, and its
+    /// profile: none for the browser universe holds.
+    pub(crate) fn started(&self) -> Option<(u32, String, &Path)> {
+        self.started.as_ref().map(|s| {
+            (
+                s.child.id(),
+                s.program.display().to_string(),
+                s.profile.as_path(),
+            )
+        })
     }
 
     /// Asks the browser something; nothing when it is gone.
     pub(crate) fn ask(&self, request: Request) {
-        let _ = self.requests.send(request);
+        if let Some(requests) = &self.requests {
+            let _ = requests.send(request);
+        }
     }
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Its driver stops once no one asks it anything, or once the
+        // browser it drives is gone.
+        self.requests = None;
+        if let Some(started) = &mut self.started {
+            let _ = started.child.kill();
+            let _ = started.child.wait();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // Its helpers may write there a moment longer than it lives.
-        for _ in 0..5 {
-            if std::fs::remove_dir_all(&self.profile).is_ok() || !self.profile.exists() {
-                break;
+        if let Some(started) = &self.started {
+            // Its helpers may write there a moment longer than it lives.
+            for _ in 0..5 {
+                if std::fs::remove_dir_all(&started.profile).is_ok() || !started.profile.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
             }
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
-/// A profile whose app windows take the system's frame, which universe
-/// then takes away: the browser draws no title bar of its own over the
-/// page.
-fn prepare(profile: &Path) {
-    let preferences = json!({
-        "browser": {"custom_chrome_frame": false, "has_seen_welcome_page": true},
-        "profile": {"exit_type": "Normal", "exited_cleanly": true},
-    });
-    let folder = profile.join("Default");
-    let _ = std::fs::create_dir_all(&folder)
-        .and_then(|()| std::fs::write(folder.join("Preferences"), preferences.to_string()));
+/// The socket of the page the DevTools on `port` list first, once they
+/// list one.
+fn wait_for_page(port: u16) -> Result<String, PreviewError> {
+    let began = Instant::now();
+    loop {
+        match page_socket(port) {
+            Some(url) => return Ok(url),
+            None if began.elapsed() < STARTS_WITHIN => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None => {
+                return Err(PreviewError::NoDevTools {
+                    said: format!("no page answered on port {port}"),
+                });
+            }
+        }
+    }
+}
+
+/// The socket of the page the DevTools on `port` list first: `None` while
+/// nothing answers there, or no page is listed. A page's own socket, as
+/// the Chrome held in universe's window has its page driven: its browser
+/// lists no targets of its own.
+fn page_socket(port: u16) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(
+            format!(
+                "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .ok()?;
+    // Read as long as its length says: the DevTools keep the connection
+    // open, however they are asked.
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let body = loop {
+        let read = stream.read(&mut chunk).ok()?;
+        answer.extend_from_slice(&chunk[..read]);
+        let text = String::from_utf8_lossy(&answer);
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if read == 0 || length.is_some_and(|n| body.len() >= n) {
+                break body.to_owned();
+            }
+        } else if read == 0 {
+            return None;
+        }
+    };
+    let listed: Value = serde_json::from_str(body.trim()).ok()?;
+    listed
+        .as_array()?
+        .iter()
+        .find(|target| target["type"] == "page")
+        .and_then(|page| page["webSocketDebuggerUrl"].as_str())
+        .map(str::to_owned)
 }
 
 /// Waits for the line that says where the DevTools listen.
@@ -343,46 +406,23 @@ pub fn browser_found() -> bool {
     find().is_some()
 }
 
-/// What a command's answer is for, once it comes.
-enum Pending {
-    /// How much wider and taller the window is than its page: its frame.
-    Frame,
-}
-
 /// The socket's side: what is asked, sent; what the browser says, told.
 struct Driver {
     socket: WebSocket<TcpStream>,
-    session: String,
-    /// The page's target, and its window.
-    target: String,
-    window: Option<i64>,
     next: u64,
-    pending: HashMap<u64, Pending>,
     main_frame: Option<String>,
     sink: Sink,
     /// The steps of a workflow yet to show, and since when the one
     /// showing was asked for.
     playing: VecDeque<String>,
     step: Option<Instant>,
-    /// How much wider and taller the window is than the page it shows.
-    frame: (i32, i32),
-    /// Where the page was last placed, while it shows.
-    placed: Option<Place>,
-    /// The window held over universe's, where the system lets it be,
-    /// whether it is, and when it was last looked for.
-    held: crate::window::Held,
-    holding: bool,
-    looked: Instant,
 }
 
 impl Driver {
-    /// Sends a command, on the page's session unless `browser`.
-    fn send(&mut self, method: &str, params: Value, browser: bool) -> Result<u64, PreviewError> {
+    /// Sends a command to the page.
+    fn send(&mut self, method: &str, params: Value) -> Result<u64, PreviewError> {
         self.next += 1;
-        let mut message = json!({"id": self.next, "method": method, "params": params});
-        if !browser {
-            message["sessionId"] = Value::String(self.session.clone());
-        }
+        let message = json!({"id": self.next, "method": method, "params": params});
         self.socket
             .send(Message::text(message.to_string()))
             .map_err(PreviewError::Socket)?;
@@ -391,8 +431,8 @@ impl Driver {
 
     /// Sends a command and waits for its answer, what the browser says
     /// meanwhile left unsaid.
-    fn call(&mut self, method: &str, params: Value, browser: bool) -> Result<Value, PreviewError> {
-        let id = self.send(method, params, browser)?;
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, PreviewError> {
+        let id = self.send(method, params)?;
         let began = Instant::now();
         while began.elapsed() < STARTS_WITHIN {
             let Some(message) = self.receive()? else {
@@ -434,75 +474,30 @@ impl Driver {
         }
     }
 
-    /// Takes the page of the app window it opened with, hides the window
-    /// until it is placed, sets the cookies, and goes to `address`.
+    /// Hears what its page says, sets the cookies, and goes to `address`.
     fn open(&mut self, address: &str, cookies: &[(String, String)]) -> Result<(), PreviewError> {
-        let began = Instant::now();
-        let target = loop {
-            let targets = self.call("Target.getTargets", json!({}), true)?;
-            let page = targets["targetInfos"].as_array().and_then(|all| {
-                all.iter()
-                    .find(|t| t["type"] == "page")
-                    .and_then(|t| t["targetId"].as_str())
-                    .map(str::to_owned)
-            });
-            match page {
-                Some(page) => break page,
-                None if began.elapsed() < STARTS_WITHIN => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                None => {
-                    return Err(PreviewError::Refused {
-                        method: "Target.getTargets".to_owned(),
-                        message: "no window opened".to_owned(),
-                    });
-                }
-            }
-        };
-        let attached = self.call(
-            "Target.attachToTarget",
-            json!({"targetId": target, "flatten": true}),
-            true,
-        )?;
-        self.session = attached["sessionId"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        let window = self.call(
-            "Browser.getWindowForTarget",
-            json!({"targetId": target}),
-            true,
-        )?;
-        self.window = window["windowId"].as_i64();
-        self.target = target;
-        self.hide()?;
         for domain in [
             "Page.enable",
             "Runtime.enable",
             "Log.enable",
             "Network.enable",
         ] {
-            self.call(domain, json!({}), false)?;
+            self.call(domain, json!({}))?;
         }
-        self.call(
-            "Page.setLifecycleEventsEnabled",
-            json!({"enabled": true}),
-            false,
-        )?;
+        self.call("Page.setLifecycleEventsEnabled", json!({"enabled": true}))?;
         // Pages are held before they load, to keep them on this machine.
         self.call(
             "Fetch.enable",
             json!({"patterns": [{"resourceType": "Document", "requestStage": "Request"}]}),
-            false,
         )?;
         let cookies: Vec<Value> = cookies
             .iter()
             .map(|(name, value)| json!({"name": name, "value": value, "url": address}))
             .collect();
         if !cookies.is_empty() {
-            self.call("Network.setCookies", json!({"cookies": cookies}), false)?;
+            self.call("Network.setCookies", json!({"cookies": cookies}))?;
         }
-        self.send("Page.navigate", json!({"url": address}), false)?;
+        self.send("Page.navigate", json!({"url": address}))?;
         Ok(())
     }
 
@@ -526,19 +521,6 @@ impl Driver {
             {
                 return;
             }
-            // A window shown is held once the system has it: placed again,
-            // its frame gone.
-            if let Some(place) = self.placed
-                && !self.holding
-                && self.held.can_hold()
-                && self.looked.elapsed() > LOOKED_FOR
-            {
-                self.looked = Instant::now();
-                self.holding = self.held.hold();
-                if self.holding && self.bounds(place).is_err() {
-                    return;
-                }
-            }
             match self.receive() {
                 Ok(Some(message)) => {
                     if self.told(&message).is_err() {
@@ -557,10 +539,10 @@ impl Driver {
     fn ask(&mut self, request: Request) -> Result<(), PreviewError> {
         match request {
             Request::Go(address) => {
-                self.send("Page.navigate", json!({"url": address}), false)?;
+                self.send("Page.navigate", json!({"url": address}))?;
             }
             Request::Reload => {
-                self.send("Page.reload", json!({}), false)?;
+                self.send("Page.reload", json!({}))?;
             }
             Request::History(back) => {
                 let expression = if back {
@@ -568,13 +550,7 @@ impl Driver {
                 } else {
                     "history.forward()"
                 };
-                self.send("Runtime.evaluate", json!({"expression": expression}), false)?;
-            }
-            Request::Place(Some(place)) => self.place(place)?,
-            Request::Place(None) => {
-                if self.placed.take().is_some() {
-                    self.hide()?;
-                }
+                self.send("Runtime.evaluate", json!({"expression": expression}))?;
             }
             Request::Play(steps) => {
                 self.playing = steps.into();
@@ -584,94 +560,18 @@ impl Driver {
         Ok(())
     }
 
-    /// Shows the window with its page at `place`, held over universe's.
-    fn place(&mut self, place: Place) -> Result<(), PreviewError> {
-        let Some(window) = self.window else {
-            return Ok(());
-        };
-        if self.placed.is_none() {
-            self.send(
-                "Browser.setWindowBounds",
-                json!({"windowId": window, "bounds": {"windowState": "normal"}}),
-                true,
-            )?;
-            // How much of the window is its frame, where it keeps one.
-            if !self.held.can_hold() {
-                let id = self.send(
-                    "Runtime.evaluate",
-                    json!({"expression": "[outerWidth - innerWidth, outerHeight - innerHeight]", "returnByValue": true}),
-                    false,
-                )?;
-                self.pending.insert(id, Pending::Frame);
-            }
-        }
-        if self.holding {
-            self.holding = self.held.hold();
-        }
-        self.placed = Some(place);
-        self.bounds(place)
-    }
-
-    /// Sets the window's bounds for its page to be at `place`, its frame
-    /// above and around it.
-    fn bounds(&mut self, place: Place) -> Result<(), PreviewError> {
-        let Some(window) = self.window else {
-            return Ok(());
-        };
-        let (wider, taller) = self.frame;
-        let side = wider / 2;
-        self.send(
-            "Browser.setWindowBounds",
-            json!({"windowId": window, "bounds": {
-                "left": place.left - side,
-                "top": place.top - (taller - side).max(0),
-                "width": i64::from(place.width) + i64::from(wider),
-                "height": i64::from(place.height) + i64::from(taller),
-            }}),
-            true,
-        )?;
-        Ok(())
-    }
-
-    fn hide(&mut self) -> Result<(), PreviewError> {
-        if let Some(window) = self.window {
-            self.send(
-                "Browser.setWindowBounds",
-                json!({"windowId": window, "bounds": {"windowState": "minimized"}}),
-                true,
-            )?;
-        }
-        Ok(())
-    }
-
     /// Shows the next step of the workflow, if one is left.
     fn next_step(&mut self) -> Result<(), PreviewError> {
         self.step = None;
         if let Some(address) = self.playing.pop_front() {
-            self.send("Page.navigate", json!({"url": address}), false)?;
+            self.send("Page.navigate", json!({"url": address}))?;
             self.step = Some(Instant::now());
         }
         Ok(())
     }
 
     fn told(&mut self, message: &Value) -> Result<(), PreviewError> {
-        if let Some(id) = message["id"].as_u64() {
-            if let Some(Pending::Frame) = self.pending.remove(&id) {
-                let value = &message["result"]["result"]["value"];
-                let thickness = |i: usize| {
-                    value[i]
-                        .as_i64()
-                        .and_then(|n| i32::try_from(n).ok())
-                        .unwrap_or(0)
-                        .max(0)
-                };
-                self.frame = (thickness(0), thickness(1));
-                if self.frame != (0, 0)
-                    && let Some(place) = self.placed
-                {
-                    self.bounds(place)?;
-                }
-            }
+        if message.get("id").is_some() {
             return Ok(());
         }
         let params = &message["params"];
@@ -684,12 +584,11 @@ impl Driver {
                 let url = params["request"]["url"].as_str().unwrap_or_default();
                 let id = params["requestId"].clone();
                 if stays_here(url) {
-                    self.send("Fetch.continueRequest", json!({"requestId": id}), false)?;
+                    self.send("Fetch.continueRequest", json!({"requestId": id}))?;
                 } else {
                     self.send(
                         "Fetch.failRequest",
                         json!({"requestId": id, "errorReason": "BlockedByClient"}),
-                        false,
                     )?;
                     (self.sink)(Event::Console(format!(
                         "Kept from leaving this machine: the page went to {url}"
@@ -769,10 +668,6 @@ impl Driver {
                     format!("{text}: {}", path_of(url))
                 };
                 (self.sink)(Event::Console(first_lines(&said)));
-            }
-            // Its window closed: the browser is gone with it.
-            "Target.detachedFromTarget" if params["sessionId"].as_str() == Some(&self.session) => {
-                (self.sink)(Event::Gone);
             }
             _ => {}
         }
