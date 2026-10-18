@@ -25,6 +25,8 @@ pub enum Language {
     JavaScript,
     /// `.dart`
     Dart,
+    /// `.go`
+    Go,
     /// `.md`
     Markdown,
     /// Settings: `.toml`, `.json`, `.yaml`, `.yml`
@@ -43,6 +45,7 @@ impl Language {
             Some("ts" | "tsx") => Self::TypeScript,
             Some("js" | "jsx" | "mjs" | "cjs") => Self::JavaScript,
             Some("dart") => Self::Dart,
+            Some("go") => Self::Go,
             Some("md") => Self::Markdown,
             Some("toml" | "json" | "yaml" | "yml") => Self::Config,
             _ => Self::Other,
@@ -58,6 +61,7 @@ impl Language {
             Self::TypeScript => "TypeScript",
             Self::JavaScript => "JavaScript",
             Self::Dart => "Dart",
+            Self::Go => "Go",
             Self::Markdown => "Markdown",
             Self::Config => "Settings",
             Self::Other => "Other",
@@ -155,7 +159,15 @@ impl CodeMap {
 /// Whether a file is a test, by its folders' names or its own: by name or
 /// by part of it, `kubernetes-tests` as well as `tests`.
 pub(crate) fn is_test(path: &Path) -> bool {
-    const TESTS: [&str; 6] = ["tests", "test", "__tests__", "testing", "spec", "e2e"];
+    const TESTS: [&str; 7] = [
+        "tests",
+        "test",
+        "__tests__",
+        "testing",
+        "spec",
+        "e2e",
+        "testdata",
+    ];
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -167,6 +179,7 @@ pub(crate) fn is_test(path: &Path) -> bool {
         .any(|f| TESTS.contains(&f) || f.ends_with("-tests") || f.ends_with("_tests"))
         || name.starts_with("test_")
         || name.ends_with("_test.py")
+        || name.ends_with("_test.go")
         || name.contains(".test.")
         || name.contains(".spec.")
 }
@@ -271,11 +284,22 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         .filter_map(|e| e.path().strip_prefix(root).ok().map(Path::to_path_buf))
         .collect();
     // What tells most of the design first, when not all fits: the code and
-    // what names its packages, then its tests, then the rest. Sorted, so
-    // that the same project always gives the same map.
+    // what names its packages, then its tests, then the rest; and of each,
+    // a file of every folder in turn, so that what fits spreads over the
+    // whole project rather than its first folders by name. Ordered so, the
+    // same project always gives the same map.
+    let spread: HashMap<PathBuf, usize> = spread(&files)
+        .into_iter()
+        .enumerate()
+        .map(|(at, f)| (f, at))
+        .collect();
     files.sort_by_cached_key(|f| {
         let wanted = first.contains(f.to_string_lossy().as_ref());
-        (!wanted, worth(f), f.clone())
+        (
+            !wanted,
+            worth(f),
+            spread.get(f).copied().unwrap_or(usize::MAX),
+        )
     });
     let left_out = files.len().saturating_sub(limit);
     files.truncate(limit);
@@ -375,6 +399,46 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
     map
 }
 
+/// `files` in an order that takes one from every folder in turn, the
+/// folder's own files counting as one more, and so on down every level:
+/// any start of it holds a part of every folder.
+fn spread(files: &[PathBuf]) -> Vec<PathBuf> {
+    #[derive(Default)]
+    struct Folder {
+        files: Vec<PathBuf>,
+        folders: std::collections::BTreeMap<std::ffi::OsString, Folder>,
+    }
+    fn order(folder: Folder) -> Vec<PathBuf> {
+        let mut own = folder.files;
+        own.sort();
+        let mut streams: Vec<std::vec::IntoIter<PathBuf>> = std::iter::once(own)
+            .chain(folder.folders.into_values().map(order))
+            .map(Vec::into_iter)
+            .collect();
+        let mut out = Vec::new();
+        loop {
+            let before = out.len();
+            for stream in &mut streams {
+                out.extend(stream.next());
+            }
+            if out.len() == before {
+                return out;
+            }
+        }
+    }
+    let mut top = Folder::default();
+    for file in files {
+        let mut at = &mut top;
+        if let Some(parent) = file.parent() {
+            for part in parent.components() {
+                at = at.folders.entry(part.as_os_str().to_owned()).or_default();
+            }
+        }
+        at.files.push(file.clone());
+    }
+    order(top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +479,16 @@ mod tests {
     }
 
     #[test]
+    fn go_files_are_code_and_their_tests_and_test_data_are_tests() {
+        assert_eq!(Language::of(Path::new("pkg/api/pod.go")), Language::Go);
+        assert!(!is_test(Path::new("pkg/api/pod.go")));
+        assert!(is_test(Path::new("pkg/api/pod_test.go")));
+        assert!(is_test(Path::new("pkg/api/testdata/pod.yaml")));
+        assert_eq!(worth(Path::new("pkg/api/pod.go")), 0);
+        assert_eq!(worth(Path::new("vendor/github.com/acme/y/y.go")), 1);
+    }
+
+    #[test]
     fn short_of_room_the_code_comes_before_its_tests_and_documents() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a_docs/guide.md", "");
@@ -433,6 +507,26 @@ mod tests {
         assert!(map.find("kubernetes-tests/k8s.py").is_some());
         assert!(map.find("docs/conf.py").is_some());
         assert!(map.find("a_docs/guide.md").is_none());
+    }
+
+    #[test]
+    fn short_of_room_every_folder_has_its_share() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..10 {
+            write(dir.path(), &format!("a/a{n}.go"), "");
+            write(dir.path(), &format!("b/x/b{n}.go"), "");
+            write(dir.path(), &format!("b/y/c{n}.go"), "");
+        }
+        let map = map(dir.path(), 8);
+        let count = |prefix: &str| {
+            map.nodes
+                .iter()
+                .filter(|n| matches!(n.kind, NodeKind::File { .. }) && n.path.starts_with(prefix))
+                .count()
+        };
+        // Half to each folder of the root, and of b's half, half to each of
+        // its own: not the first eight files by name.
+        assert_eq!((count("a/"), count("b/x/"), count("b/y/")), (4, 2, 2));
     }
 
     #[test]

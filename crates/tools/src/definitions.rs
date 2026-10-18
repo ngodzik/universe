@@ -1,6 +1,6 @@
 //! Where a name is defined, found by `git grep` rather than by a model: the
 //! lines that define a function, a class, a type or a constant of that name,
-//! in Python, TypeScript, JavaScript and Rust; then ranked by what the file
+//! in Python, TypeScript, JavaScript, Rust and Go; then ranked by what the file
 //! it is looked for from imports, so that the one it means comes first.
 
 use std::path::{Component, Path, PathBuf};
@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 const MOST: usize = 60;
 
 /// The code searched: what the language servers read.
-const SOURCES: [&str; 8] = [
-    "*.py", "*.pyi", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.rs",
+const SOURCES: [&str; 9] = [
+    "*.py", "*.pyi", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.rs", "*.go",
 ];
 
 /// The most files searched for definitions, of those that hold the name: a
@@ -57,10 +57,11 @@ pub fn definitions(root: &Path, name: &str, from: &Path, lines: &[String]) -> Ve
         return Vec::new();
     }
     let name_re = regex_escape(name);
-    // Keywords that define, then the name, in every language read; or, in
-    // Python, the name assigned at the top of a module.
+    // Keywords that define, then the name, in every language read; a Go
+    // method, its receiver between; or, in Python, the name assigned at the
+    // top of a module.
     let pattern = format!(
-        r"(^|[^A-Za-z0-9_])(def|class|function|interface|type|enum|const|let|var|fn|struct|trait|mod|static|macro_rules!)[[:space:]]+{name_re}([^A-Za-z0-9_]|$)|^{name_re}[[:space:]]*(:[^=]*)?=([^=]|$)"
+        r"(^|[^A-Za-z0-9_])(def|class|function|interface|type|enum|const|let|var|fn|func|struct|trait|mod|static|macro_rules!)[[:space:]]+{name_re}([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])func[[:space:]]*\([^)]*\)[[:space:]]*{name_re}([^A-Za-z0-9_]|$)|^{name_re}[[:space:]]*(:[^=]*)?=([^=]|$)"
     );
     // First the files that hold the name at all, a plain search that is
     // quick even in a large project; then the pattern, in those alone.
@@ -334,6 +335,36 @@ mod tests {
         assert_eq!(found[0].line, 1);
         // A use is not a definition.
         assert!(found.iter().all(|d| !d.text.contains("x = ")));
+    }
+
+    #[test]
+    fn go_functions_methods_and_types() {
+        let dir = repo(&[
+            (
+                "pkg/store/store.go",
+                "package store\n\ntype Store struct{}\n\nfunc (s *Store) Get(k string) int {\n\treturn 0\n}\n",
+            ),
+            (
+                "pkg/cache/cache.go",
+                "package cache\n\nfunc Get(k string) int { return 1 }\n",
+            ),
+            (
+                "cmd/main.go",
+                "package main\n\nfunc main() {\n\tx := store.Get(\"a\")\n\t_ = x\n}\n",
+            ),
+        ]);
+        let from = Path::new("cmd/main.go");
+        let text = lines(&std::fs::read_to_string(dir.path().join(from)).unwrap());
+        let found = definitions(dir.path(), "Get", from, &text);
+        let mut paths: Vec<&str> = found.iter().map(|d| d.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["pkg/cache/cache.go", "pkg/store/store.go"]);
+        let types = definitions(dir.path(), "Store", from, &text);
+        assert_eq!(types.len(), 1);
+        assert_eq!(
+            (types[0].path.as_str(), types[0].line),
+            ("pkg/store/store.go", 3)
+        );
     }
 
     #[test]

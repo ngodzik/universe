@@ -286,7 +286,8 @@ fn is_code(kind: NodeKind) -> bool {
                 | Language::Python
                 | Language::TypeScript
                 | Language::JavaScript
-                | Language::Dart,
+                | Language::Dart
+                | Language::Go,
             ..
         }
     )

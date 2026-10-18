@@ -26,6 +26,7 @@ fn language(path: &Path) -> Option<(Language, &'static Kinds)> {
         ),
         "tsx" => (tree_sitter_typescript::LANGUAGE_TSX.into(), &TYPESCRIPT),
         "js" | "jsx" | "mjs" | "cjs" => (tree_sitter_javascript::LANGUAGE.into(), &TYPESCRIPT),
+        "go" => (tree_sitter_go::LANGUAGE.into(), &GO),
         _ => return None,
     })
 }
@@ -81,6 +82,19 @@ const TYPESCRIPT: Kinds = Kinds {
         "enum_declaration",
     ],
     bindings: &["lexical_declaration", "variable_declaration"],
+};
+
+/// Each type of a `type` declaration, of a group as of a single one, is
+/// shown by its spec: `Pod struct`.
+const GO: Kinds = Kinds {
+    containers: &[],
+    leaves: &[
+        "function_declaration",
+        "method_declaration",
+        "type_spec",
+        "type_alias",
+    ],
+    bindings: &[],
 };
 
 /// The map of one file, `None` when its language is not known.
@@ -179,7 +193,7 @@ pub(crate) fn outline_dir(root: &Path, dir: &Path) -> String {
         ));
     }
     if out.is_empty() {
-        "no Rust, Python, TypeScript or JavaScript definitions here: use search".into()
+        "no Rust, Python, TypeScript, JavaScript or Go definitions here: use search".into()
     } else {
         out.join("\n")
     }
@@ -194,6 +208,15 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, source).unwrap();
         outline_file(&path).unwrap()
+    }
+
+    #[test]
+    fn go_functions_methods_and_every_type_of_a_group() {
+        let source = "package store\n\nimport \"fmt\"\n\n// Store keeps things.\ntype Store struct {\n\titems map[string]int\n}\n\ntype (\n\tKey string\n\tGetter interface {\n\t\tGet(k Key) int\n\t}\n)\n\ntype Alias = Store\n\nfunc New() *Store {\n\treturn &Store{}\n}\n\nfunc (s *Store) Get(k Key) int {\n\treturn s.items[string(k)]\n}\n";
+        assert_eq!(
+            map("store.go", source),
+            "L6    Store struct\nL11   Key string\nL12   Getter interface\nL17   Alias = Store\nL19   func New() *Store\nL23   func (s *Store) Get(k Key) int"
+        );
     }
 
     #[test]

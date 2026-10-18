@@ -1,7 +1,8 @@
 //! Language servers, asked where a name is defined and where it is used:
 //! the programs editors ask (pyright for Python, typescript-language-server
-//! for TypeScript and JavaScript, rust-analyzer for Rust), spoken to over
-//! their standard input and output in the Language Server Protocol.
+//! for TypeScript and JavaScript, rust-analyzer for Rust, gopls for Go),
+//! spoken to over their standard input and output in the Language Server
+//! Protocol.
 //!
 //! A server is started the first time a file of its language is asked
 //! about, and kept: it reads the project once, then answers at once. It
@@ -75,6 +76,7 @@ enum Language {
     Python,
     TypeScript,
     Rust,
+    Go,
 }
 
 impl Language {
@@ -83,6 +85,7 @@ impl Language {
             "py" | "pyi" => Some(Self::Python),
             "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript),
             "rs" => Some(Self::Rust),
+            "go" => Some(Self::Go),
             _ => None,
         }
     }
@@ -93,6 +96,7 @@ impl Language {
             Self::Python => ("pyright-langserver", &["--stdio"]),
             Self::TypeScript => ("typescript-language-server", &["--stdio"]),
             Self::Rust => ("rust-analyzer", &[]),
+            Self::Go => ("gopls", &[]),
         }
     }
 
@@ -104,6 +108,7 @@ impl Language {
             Some("tsx") => "typescriptreact",
             Some("jsx") => "javascriptreact",
             Some("rs") => "rust",
+            Some("go") => "go",
             _ => "javascript",
         }
     }

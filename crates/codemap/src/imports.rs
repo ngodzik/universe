@@ -34,6 +34,19 @@ static PUBSPEC_NAME: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?m)^name:\s*([A-Za-z_]\w*)").ok());
 static CARGO_NAME: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"(?m)^\s*name\s*=\s*"([^"]+)""#).ok());
+static GO_MODULE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?m)^module\s+(\S+)").ok());
+/// Where a Go file's imports end: its first declaration, which they all
+/// come before.
+static GO_DECLARATION: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?m)^(?:func|type|var|const)\b").ok());
+static GO_IMPORT_ONE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"(?m)^import\s+(?:[\w.]+\s+)?"([^"]+)""#).ok());
+static GO_IMPORT_BLOCK: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?ms)^import\s*\((.*?)\)").ok());
+/// One import of a block, its name or `_` or `.` before it if any.
+static GO_IMPORT_LINE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"(?m)^\s*(?:[\w.]+\s+)?"([^"]+)""#).ok());
 
 /// What resolving imports needs to know of the whole project, gathered once:
 /// the files by path, the workspace's Rust crates, the folders Python
@@ -46,6 +59,12 @@ pub(crate) struct Index {
     /// Dart packages by name, with the `lib` folder `package:` imports of
     /// them start from.
     dart_packages: HashMap<String, String>,
+    /// The project's Go modules, by the path their `go.mod` declares, with
+    /// their folder: the longest first, so that a module nested in another
+    /// is found before it.
+    go_modules: Vec<(String, String)>,
+    /// Each Go package, a folder, by the file an import of it leads to.
+    go_packages: HashMap<String, String>,
 }
 
 /// A TypeScript path alias: imports starting with `prefix` (and, for a
@@ -74,11 +93,15 @@ impl Index {
             python_modules: HashMap::new(),
             aliases: HashMap::new(),
             dart_packages: HashMap::new(),
+            go_modules: Vec::new(),
+            go_packages: HashMap::new(),
         };
         index.crates = rust_crates(root, &index);
         index.python_modules = python_modules(&index);
         index.aliases = typescript_aliases(root, &index);
         index.dart_packages = dart_packages(root, &index);
+        index.go_modules = go_modules(root, &index);
+        index.go_packages = go_packages(&index);
         index
     }
 
@@ -318,6 +341,7 @@ pub(crate) fn of(path: &str, language: Language, text: &str, index: &Index) -> V
         Language::Python => python(path, text, index),
         Language::TypeScript | Language::JavaScript => javascript(path, text, index),
         Language::Dart => dart(path, text, index),
+        Language::Go => go(path, text, index),
         _ => Vec::new(),
     };
     let mut nodes: Vec<usize> = found.iter().filter_map(|p| index.file(p)).collect();
@@ -540,6 +564,142 @@ fn dart(path: &str, text: &str, index: &Index) -> Vec<String> {
         .collect()
 }
 
+/// The project's Go modules, by the path each `go.mod` declares, the
+/// longest first.
+fn go_modules(root: &Path, index: &Index) -> Vec<(String, String)> {
+    let Some(module) = GO_MODULE.as_ref() else {
+        return Vec::new();
+    };
+    let mut modules: Vec<(String, String)> = index
+        .paths()
+        .filter(|p| file_name(p) == "go.mod")
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(root.join(path)).ok()?;
+            let found = module.captures(&text)?.get(1)?;
+            Some((found.as_str().to_owned(), parent(path).to_owned()))
+        })
+        .collect();
+    modules.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.cmp(b)));
+    modules
+}
+
+/// Each Go package, a folder, by the file that stands for it: the one named
+/// after the package (`log.go` for `log/v2`), else its `doc.go`, else the
+/// first of its files not generated, else its first. An import names a
+/// package, not a file, and leading to all of them would draw as many edges
+/// as files.
+fn go_packages(index: &Index) -> HashMap<String, String> {
+    let mut files: HashMap<&str, Vec<&str>> = HashMap::new();
+    for path in index
+        .paths()
+        .filter(|p| p.ends_with(".go") && !p.ends_with("_test.go"))
+    {
+        files.entry(parent(path)).or_default().push(path);
+    }
+    files
+        .into_iter()
+        .map(|(dir, mut paths)| {
+            paths.sort_unstable();
+            let named = join(dir, &format!("{}.go", go_package_name(dir)));
+            let doc = join(dir, "doc.go");
+            let file = [named, doc]
+                .into_iter()
+                .find(|f| paths.contains(&f.as_str()))
+                .or_else(|| {
+                    paths
+                        .iter()
+                        .find(|p| !go_generated(file_name(p)))
+                        .map(|p| (*p).to_owned())
+                })
+                .unwrap_or_else(|| paths[0].to_owned());
+            (dir.to_owned(), file)
+        })
+        .collect()
+}
+
+/// The name a Go package in `dir` goes by: its folder's, or for a major
+/// version's folder (`v2`), the one above it.
+fn go_package_name(dir: &str) -> &str {
+    let name = file_name(dir);
+    let version = name
+        .strip_prefix('v')
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if version && !parent(dir).is_empty() {
+        file_name(parent(dir))
+    } else {
+        name
+    }
+}
+
+/// Whether a Go file's name says a tool wrote it: `zz_generated.deepcopy.go`,
+/// `generated.pb.go`, `types_swagger_doc_generated.go`.
+fn go_generated(name: &str) -> bool {
+    name.starts_with("zz_generated") || name.contains(".pb.") || name.contains("generated")
+}
+
+/// What a Go file imports, as the files that stand for those packages: of
+/// the project's own modules, by the longest module path an import starts
+/// with, or vendored beside the module the file is in. The standard
+/// library and modules from elsewhere are no files of the project.
+fn go(path: &str, text: &str, index: &Index) -> Vec<String> {
+    let header = GO_DECLARATION
+        .as_ref()
+        .and_then(|re| re.find(text))
+        .map_or(text, |found| &text[..found.start()]);
+    let mut imports: Vec<&str> = Vec::new();
+    if let Some(re) = GO_IMPORT_ONE.as_ref() {
+        imports.extend(
+            re.captures_iter(header)
+                .filter_map(|c| c.get(1))
+                .map(|m| m.as_str()),
+        );
+    }
+    if let (Some(block), Some(line)) = (GO_IMPORT_BLOCK.as_ref(), GO_IMPORT_LINE.as_ref()) {
+        for found in block.captures_iter(header).filter_map(|c| c.get(1)) {
+            imports.extend(
+                line.captures_iter(found.as_str())
+                    .filter_map(|c| c.get(1))
+                    .map(|m| m.as_str()),
+            );
+        }
+    }
+    imports
+        .into_iter()
+        .filter_map(|import| {
+            index
+                .go_packages
+                .get(&go_package(path, import, index)?)
+                .cloned()
+        })
+        .collect()
+}
+
+/// The folder of the package `import` names, for a file at `path`.
+fn go_package(path: &str, import: &str, index: &Index) -> Option<String> {
+    let own = index.go_modules.iter().find_map(|(module, dir)| {
+        let rest = import.strip_prefix(module.as_str())?;
+        if rest.is_empty() {
+            Some(dir.clone())
+        } else {
+            rest.strip_prefix('/').map(|rest| join(dir, rest))
+        }
+    });
+    if let Some(own) = own.filter(|dir| index.go_packages.contains_key(dir)) {
+        return Some(own);
+    }
+    // The module the file is in, the nearest above it, and its vendor folder.
+    let mut at = parent(path);
+    loop {
+        if index.go_modules.iter().any(|(_, dir)| dir == at) {
+            return Some(join(at, &format!("vendor/{import}")));
+        }
+        if at.is_empty() {
+            return None;
+        }
+        at = parent(at);
+    }
+}
+
 /// The file `target` names, as bundlers and TypeScript look: the path as
 /// written, with each extension, as a folder's index, and `.js` naming a
 /// `.ts` source.
@@ -701,6 +861,50 @@ mod tests {
         assert_eq!(
             imports(root, "src/app.ts"),
             ["lib/index.ts", "src/c/index.js", "src/util.ts"]
+        );
+    }
+
+    #[test]
+    fn go_imports_lead_to_their_packages_in_every_module_and_the_vendor_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "go.mod", "module example.com/app\n\ngo 1.24\n");
+        write(
+            root,
+            "cmd/app/main.go",
+            "package main\n\nimport \"fmt\"\n\nimport (\n\t\"os\"\n\t// \"example.com/app/gone\"\n\t\"example.com/app/pkg/store\"\n\tlib \"example.com/lib/x\"\n\t_ \"github.com/acme/y\"\n\t\"github.com/acme/log/v2\"\n\t\"example.com/app/pkg/schema\"\n)\n\nfunc main() {}\n\nimport \"example.com/app/pkg/late\"\n",
+        );
+        write(root, "pkg/store/util.go", "package store\n");
+        write(root, "pkg/store/store.go", "package store\n");
+        write(root, "pkg/store/store_test.go", "package store\n");
+        write(root, "pkg/late/late.go", "package late\n");
+        write(root, "pkg/gone/gone.go", "package gone\n");
+        write(root, "shared/lib/go.mod", "module example.com/lib\n");
+        write(root, "shared/lib/x/b.go", "package x\n");
+        write(root, "shared/lib/x/a.go", "package x\n");
+        write(root, "vendor/github.com/acme/y/doc.go", "package y\n");
+        write(root, "vendor/github.com/acme/y/y_linux.go", "package y\n");
+        write(root, "vendor/github.com/acme/log/v2/a.go", "package log\n");
+        write(
+            root,
+            "vendor/github.com/acme/log/v2/log.go",
+            "package log\n",
+        );
+        write(root, "pkg/schema/generated.pb.go", "package schema\n");
+        write(root, "pkg/schema/version.go", "package schema\n");
+        assert_eq!(
+            imports(root, "cmd/app/main.go"),
+            [
+                // The file named after its package, the first of a package
+                // without one but not a generated one, and a vendored
+                // package's doc.go, or its file named after the module of
+                // a major version.
+                "pkg/schema/version.go",
+                "pkg/store/store.go",
+                "shared/lib/x/a.go",
+                "vendor/github.com/acme/log/v2/log.go",
+                "vendor/github.com/acme/y/doc.go",
+            ]
         );
     }
 
