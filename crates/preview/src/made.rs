@@ -12,8 +12,9 @@ use serde_json::{Map, Value, json};
 
 use crate::spec::Spec;
 
-/// How deep it goes into nested schemas before it stops.
-const DEEPEST: usize = 8;
+/// How deep it goes into nested objects and lists before it makes them
+/// empty: a list in an object in a list… ten levels down.
+const DEEPEST: usize = 10;
 
 /// How many items a list has.
 const ITEMS: usize = 3;
@@ -54,7 +55,13 @@ const PEOPLE: [(&str, &str); 4] = [
 ];
 
 /// A picture any page may show, its policy of content allowing `data:`.
-const PICTURE: &str = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'><rect width='40' height='40' rx='20' fill='%236366f1'/><text x='20' y='26' font-size='15' text-anchor='middle' fill='white' font-family='sans-serif'>U</text></svg>";
+const PICTURE: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'><rect width='40' height='40' rx='20' fill='#6366f1'/><text x='20' y='26' font-size='15' text-anchor='middle' fill='white' font-family='sans-serif'>U</text></svg>";
+
+/// Strings tried, in turn, for one whose pattern the made one does not
+/// match: a decimal, a number, words.
+const PATTERNED: [&str; 12] = [
+    "12.50", "0.25", "12", "1", "demo", "Demo", "DEMO", "demo-1", "demo_1", "abc123", "A1", "a",
+];
 
 /// A body made from `schema`, `key` naming where it is asked for (the
 /// operation and its status), so that two places differ.
@@ -78,7 +85,9 @@ struct Maker<'a> {
 
 impl Maker<'_> {
     fn make(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
-        if depth > DEEPEST {
+        // Objects and lists are made empty past `DEEPEST`; this stops what
+        // nests otherwise.
+        if depth > DEEPEST * 2 {
             return Value::Null;
         }
         let named = Spec::reference(schema).map(str::to_owned);
@@ -119,19 +128,37 @@ impl Maker<'_> {
                 if nullable && lower.ends_with("_at") && !happened {
                     return Value::Null;
                 }
-                let Some(first) = options
+                // The kind a discriminator names, its property saying so.
+                if let Some((property, named, option)) = self.discriminated(schema, options) {
+                    let mut made = self.make(&option, key, field, depth);
+                    if let (Value::Object(fields), Some(named)) = (&mut made, named) {
+                        fields.insert(property, Value::String(named));
+                    }
+                    return made;
+                }
+                // The first that is not null, and not one this is already
+                // within: a filter of filters ends with a clause.
+                let candidates: Vec<&Value> = options
                     .iter()
-                    .find(|o| self.spec.resolve(o)["type"] != "null")
+                    .filter(|o| self.spec.resolve(o)["type"] != "null")
+                    .collect();
+                let within = |o: &&Value| {
+                    Spec::reference(o).is_some_and(|r| self.stack.iter().any(|n| n == r))
+                };
+                let Some(chosen) = candidates
+                    .iter()
+                    .find(|o| !within(o))
+                    .or_else(|| candidates.first())
                 else {
                     return Value::Null;
                 };
-                return self.make(first, key, field, depth + 1);
+                return self.make(chosen, key, field, depth);
             }
         }
         if let Some(parts) = schema["allOf"].as_array() {
             let mut whole = Map::new();
             for part in parts {
-                if let Value::Object(fields) = self.make(part, key, field, depth + 1) {
+                if let Value::Object(fields) = self.make(part, key, field, depth) {
                     whole.extend(fields);
                 }
             }
@@ -163,6 +190,7 @@ impl Maker<'_> {
             return example.clone();
         }
         match kind.as_str() {
+            "object" if depth > DEEPEST => Value::Object(Map::new()),
             "object" => {
                 let mut fields = Map::new();
                 if let Some(properties) = schema["properties"].as_object() {
@@ -174,36 +202,108 @@ impl Maker<'_> {
                 Value::Object(fields)
             }
             "array" => self.list(schema, key, &lower, depth),
-            "integer" => self.integer(key, &lower),
-            "number" => json!(f64::from(seed(key) % 10_000) / 100.0),
+            "integer" => within_bounds(schema, self.integer(key, &lower)),
+            "number" => within_bounds(schema, json!(f64::from(seed(key) % 10_000) / 100.0)),
             "boolean" => Value::Bool(self.boolean(&lower)),
-            "string" => self.string(schema, key, &lower),
+            "string" => fitted(schema, self.string(schema, key, &lower)),
             _ => Value::Null,
         }
     }
 
-    fn list(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
-        if self.tone.empty && LISTS.contains(&field) {
-            return Value::Array(Vec::new());
+    /// The option a discriminator names first: its property, the name
+    /// its mapping gives it, and the option. OpenAPI's way of saying which
+    /// of several kinds a body is; without a mapping, the option says it
+    /// with a constant of its own.
+    fn discriminated(
+        &self,
+        schema: &Value,
+        options: &[Value],
+    ) -> Option<(String, Option<String>, Value)> {
+        let discriminator = &schema["discriminator"];
+        let property = discriminator["propertyName"].as_str()?.to_owned();
+        let first = options.first()?;
+        let Some(mapping) = discriminator["mapping"].as_object() else {
+            return Some((property, None, first.clone()));
+        };
+        // The first option in the spec's order, by the name it maps from.
+        let named = options.iter().find_map(|option| {
+            let reference = Spec::reference(option)?;
+            mapping
+                .iter()
+                .find(|(_, r)| r.as_str() == Some(reference))
+                .map(|(name, _)| (name.clone(), option.clone()))
+        });
+        match named {
+            Some((name, option)) => Some((property, Some(name), option)),
+            None => {
+                let (name, reference) = mapping.iter().next()?;
+                Some((
+                    property,
+                    Some(name.clone()),
+                    json!({ "$ref": reference.as_str()? }),
+                ))
+            }
         }
-        let rights = ["permission", "scope", "right", "grant", "capabilit"]
-            .iter()
-            .any(|w| field.contains(w));
-        if self.tone.no_rights && rights {
-            return Value::Array(Vec::new());
+    }
+
+    fn list(&mut self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
+        // A tuple, `[number, format]`: each place its own, as the spec's
+        // example has it when it has one.
+        if let Some(places) = schema["prefixItems"]
+            .as_array()
+            .or_else(|| schema["items"].as_array())
+        {
+            if let Some(example) = schema["examples"]
+                .as_array()
+                .and_then(|e| e.first())
+                .filter(|e| e.as_array().is_some_and(|e| e.len() == places.len()))
+            {
+                return example.clone();
+            }
+            let made = places
+                .iter()
+                .enumerate()
+                .map(|(i, place)| self.make(place, &format!("{key}[{i}]"), "", depth + 1))
+                .collect();
+            return Value::Array(made);
+        }
+        let fewest = schema["minItems"]
+            .as_u64()
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let most = schema["maxItems"]
+            .as_u64()
+            .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        if fewest == 0 {
+            if self.tone.empty && LISTS.contains(&field) {
+                return Value::Array(Vec::new());
+            }
+            let rights = ["permission", "scope", "right", "grant", "capabilit"]
+                .iter()
+                .any(|w| field.contains(w));
+            if (self.tone.no_rights && rights) || depth > DEEPEST {
+                return Value::Array(Vec::new());
+            }
         }
         let items = &schema["items"];
         let resolved = self.spec.resolve(items);
         // A list of an enumeration's values holds them all: a session's
         // permissions, all granted.
         if let Some(choices) = resolved["enum"].as_array() {
-            return Value::Array(choices.clone());
+            return Value::Array(choices.iter().take(most).cloned().collect());
         }
-        let mut made = Vec::new();
-        for i in 0..ITEMS {
+        let count = ITEMS.min(most).max(fewest);
+        let mut made: Vec<Value> = Vec::new();
+        for i in 0..count {
             let item_key = format!("{key}[{i}]");
-            let value = self.make(items, &item_key, "", depth + 1);
-            made.push(distinct(value, i));
+            let value = distinct(self.make(items, &item_key, "", depth + 1), i);
+            if schema["uniqueItems"] == true && made.contains(&value) && made.len() >= fewest {
+                continue;
+            }
+            made.push(value);
+        }
+        // Items that could not be made, a schema within itself: none.
+        if fewest == 0 && made.iter().all(Value::is_null) {
+            made.clear();
         }
         Value::Array(made)
     }
@@ -277,11 +377,27 @@ impl Maker<'_> {
         if format == "email" || field.contains("email") {
             return Value::String(PEOPLE[0].1.to_owned());
         }
+        if format == "duration" {
+            return Value::String("P7D".to_owned());
+        }
+        if format == "time" {
+            return Value::String("09:00:00Z".to_owned());
+        }
+        if format == "ipv4" {
+            return Value::String("127.0.0.1".to_owned());
+        }
+        if format == "hostname" {
+            return Value::String("example.com".to_owned());
+        }
+        let longest = schema["maxLength"].as_u64().unwrap_or(u64::MAX);
         if ["avatar", "image", "logo", "picture", "photo", "icon"]
             .iter()
             .any(|w| field.contains(w))
         {
-            return Value::String(PICTURE.to_owned());
+            let picture = data_uri(PICTURE);
+            if (picture.len() as u64) <= longest {
+                return Value::String(picture);
+            }
         }
         if format == "uri" || format == "url" || field.ends_with("url") || field == "website" {
             return Value::String(format!("https://example.com/{}", field.replace('_', "-")));
@@ -312,6 +428,109 @@ impl Maker<'_> {
             None => "Text".to_owned(),
         })
     }
+}
+
+/// A string made to fit its schema: its pattern, matched by a string tried
+/// in turn when it does not, and its lengths.
+fn fitted(schema: &Value, made: Value) -> Value {
+    let Value::String(mut text) = made else {
+        return made;
+    };
+    if let Some(pattern) = schema["pattern"].as_str()
+        && let Ok(pattern) = regex::Regex::new(&without_lookaround(pattern))
+        && !pattern.is_match(&text)
+        && let Some(tried) = PATTERNED.iter().find(|t| pattern.is_match(t))
+    {
+        (*tried).clone_into(&mut text);
+    }
+    if let Some(longest) = schema["maxLength"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+    {
+        text = text.chars().take(longest).collect();
+    }
+    if let Some(shortest) = schema["minLength"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+    {
+        while text.chars().count() < shortest {
+            text.push('x');
+        }
+    }
+    Value::String(text)
+}
+
+/// A pattern without what Rust's regular expressions do not read, its
+/// look-arounds: `(?!^[-+.]*$)` around a decimal's.
+fn without_lookaround(pattern: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = pattern;
+    while let Some(start) = ["(?=", "(?!", "(?<=", "(?<!"]
+        .iter()
+        .filter_map(|open| rest.find(open))
+        .min()
+    {
+        kept.push_str(&rest[..start]);
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        let mut escaped = false;
+        for (i, c) in rest[start..].char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &rest[end..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// A number held within its schema's bounds.
+fn within_bounds(schema: &Value, made: Value) -> Value {
+    let Some(number) = made.as_f64() else {
+        return made;
+    };
+    let low = schema["minimum"]
+        .as_f64()
+        .or_else(|| schema["exclusiveMinimum"].as_f64().map(|m| m + 1.0));
+    let high = schema["maximum"]
+        .as_f64()
+        .or_else(|| schema["exclusiveMaximum"].as_f64().map(|m| m - 1.0));
+    let held = match (low, high) {
+        (Some(low), Some(high)) if low <= high => number.clamp(low, high),
+        (Some(low), _) => number.max(low),
+        (_, Some(high)) => number.min(high),
+        _ => return made,
+    };
+    if made.is_i64() || made.is_u64() {
+        json!(held.round() as i64)
+    } else {
+        json!(held)
+    }
+}
+
+/// A `data:` address of an SVG picture, each character that is not one an
+/// address may hold as it is escaped: a URI as its schema checks it.
+fn data_uri(svg: &str) -> String {
+    let mut uri = "data:image/svg+xml,".to_owned();
+    for byte in svg.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
 }
 
 /// An item of a list made its own: a person's name and email when it has
@@ -515,6 +734,84 @@ mod tests {
         assert_eq!(days_later("Monday", 1), None);
         let item = json!({"timestamp": "2026-01-01T00:00:00Z", "name": "Row"});
         assert_eq!(distinct(item, 1)["timestamp"], "2026-01-02T00:00:00Z");
+    }
+
+    /// The body made for a lone schema, with these schemas beside it.
+    fn made_for(schema: &str, schemas: &str) -> Value {
+        let spec = Spec::read(&format!(
+            r#"{{"paths": {{"/x": {{"get": {{"responses": {{"200": {{"content": {{"application/json": {{"schema": {schema}}}}}}}}}}}}}}},
+               "components": {{"schemas": {schemas}}}}}"#
+        ))
+        .unwrap();
+        body(
+            &spec,
+            spec.schema(0, "200").unwrap(),
+            "GET /x 200",
+            Tone::default(),
+        )
+    }
+
+    #[test]
+    fn a_body_holds_to_its_schema() {
+        // A tuple: as its example has it, else each place its own.
+        let made = made_for(
+            r##"{"type": "object", "properties": {
+                "tax_id": {"anyOf": [{"type": "array", "prefixItems": [{"type": "string"}, {"$ref": "#/components/schemas/Format"}], "minItems": 2, "maxItems": 2, "examples": [["911144442", "us_ein"]]}, {"type": "null"}]},
+                "pair": {"type": "array", "prefixItems": [{"type": "integer"}, {"$ref": "#/components/schemas/Format"}]},
+                "few": {"type": "array", "items": {"type": "string"}, "maxItems": 1},
+                "many": {"type": "array", "items": {"type": "integer"}, "minItems": 5},
+                "share": {"type": "string", "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"},
+                "delay": {"type": "string", "format": "duration"},
+                "logo_url": {"type": "string", "format": "uri"},
+                "percent": {"type": "integer", "minimum": 0, "maximum": 10},
+                "price": {"oneOf": [{"$ref": "#/components/schemas/Fixed"}, {"$ref": "#/components/schemas/Free"}],
+                          "discriminator": {"propertyName": "kind", "mapping": {"zero": "#/components/schemas/Free", "fixed": "#/components/schemas/Fixed"}}},
+                "filter": {"$ref": "#/components/schemas/Filter"}}}"##,
+            r##"{"Format": {"type": "string", "enum": ["eu_vat", "us_ein"]},
+                "Fixed": {"type": "object", "properties": {"kind": {"type": "string"}, "amount": {"type": "integer"}}},
+                "Free": {"type": "object", "properties": {"kind": {"type": "string"}}},
+                "Filter": {"type": "object", "properties": {"clauses": {"type": "array", "items": {"anyOf": [{"$ref": "#/components/schemas/Filter"}, {"$ref": "#/components/schemas/Clause"}]}}}},
+                "Clause": {"type": "object", "properties": {"value": {"type": "string"}}}}"##,
+        );
+        assert_eq!(made["tax_id"], json!(["911144442", "us_ein"]));
+        assert_eq!(made["pair"][1], "eu_vat");
+        assert_eq!(made["pair"].as_array().unwrap().len(), 2);
+        assert_eq!(made["few"].as_array().unwrap().len(), 1);
+        assert_eq!(made["many"].as_array().unwrap().len(), 5);
+        assert_eq!(made["share"], "12.50");
+        assert_eq!(made["delay"], "P7D");
+        let logo = made["logo_url"].as_str().unwrap();
+        assert!(logo.starts_with("data:image/svg+xml,%3Csvg"));
+        assert!(!logo.contains([' ', '<', '\'', '#']));
+        assert!(made["percent"].as_i64().unwrap() <= 10);
+        // The spec's first kind, its discriminator's property saying so.
+        assert_eq!(made["price"]["kind"], "fixed");
+        assert!(made["price"]["amount"].is_number());
+        // A filter of filters ends with a clause, not with nothing.
+        assert_eq!(made["filter"]["clauses"][0]["value"], "Value");
+    }
+
+    #[test]
+    fn what_nests_too_deep_is_empty_not_null() {
+        let made = made_for(
+            r##"{"$ref": "#/components/schemas/Level"}"##,
+            r##"{"Level": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level2"}}}},
+                "Level2": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level3"}}}},
+                "Level3": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level4"}}}},
+                "Level4": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level5"}}}},
+                "Level5": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level6"}}}},
+                "Level6": {"type": "object", "properties": {"name": {"type": "string"}, "below": {"type": "array", "items": {"$ref": "#/components/schemas/Level7"}}}},
+                "Level7": {"type": "object", "properties": {"name": {"type": "string"}}}}"##,
+        );
+        let mut level = &made;
+        let mut depth = 0;
+        while let Some(first) = level["below"].get(0) {
+            assert!(first["name"].is_string());
+            level = first;
+            depth += 1;
+        }
+        assert!(depth >= 4);
+        assert!(level["below"].is_null() || level["below"] == json!([]));
     }
 
     #[test]
