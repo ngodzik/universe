@@ -3,9 +3,11 @@
 //! front end's files that call it, by the names a generated client gives it.
 //!
 //! All by reading the files, no model: the spec is read as YAML (JSON being
-//! YAML too), and an operation is named by its `operationId`; the function that serves it is the one of that name under
-//! a route decorator (`@router.get(...)`), the nearest to the spec when
-//! several are; a call is an identifier that ends with the operation's name
+//! YAML too), the latest of the versions of one API, and an operation is
+//! named by its `operationId`; the function that serves it is the one of
+//! that name under a route decorator (`@router.get(...)`), else the route
+//! of its method and path, the nearest to the spec when several are; a
+//! call is an identifier that ends with the operation's name
 //! in the forms clients are generated with (`getDag`, `useDagServiceGetDag`,
 //! `UseDagServiceGetDagKeyFn`). Files of the generated client itself are
 //! not callers: they name every operation.
@@ -144,12 +146,15 @@ pub(crate) fn read(
         NodeKind::Folder => None,
     };
 
-    let mut operations: Vec<Operation> = Vec::new();
-    for (node, text) in texts {
-        if language(*node) == Some(Language::Config) && is_spec(text) {
-            operations.extend(operations_of(*node, text));
-        }
-    }
+    let specs: Vec<(usize, Yaml)> = texts
+        .iter()
+        .filter(|(node, text)| language(*node) == Some(Language::Config) && is_spec(text))
+        .filter_map(|(node, text)| Some((*node, load(text)?)))
+        .collect();
+    let mut operations: Vec<Operation> = latest(map, &specs)
+        .into_iter()
+        .flat_map(|(node, doc)| operations_of(node, doc))
+        .collect();
     // Without a spec, the routes the code declares, as FastAPI and Flask
     // write them.
     if operations.is_empty() {
@@ -226,6 +231,38 @@ pub(crate) fn read(
         }
     }
 
+    // An id the code does not write, as when FastAPI makes them with a
+    // `generate_unique_id_function` (`organizations:get`): the operation is
+    // served by the route of its method and path, the nearest to the spec
+    // when several are.
+    if operations
+        .iter()
+        .any(|o| !o.from_code && o.handler.is_none())
+    {
+        let mut routes: HashMap<(String, String), Vec<(usize, usize)>> = HashMap::new();
+        for route in routes_in_code(map, texts) {
+            if let Some(handler) = route.handler {
+                routes
+                    .entry((route.method, route_key(&route.path)))
+                    .or_default()
+                    .push(handler);
+            }
+        }
+        for operation in operations
+            .iter_mut()
+            .filter(|o| !o.from_code && o.handler.is_none())
+        {
+            let spec_path = &map.nodes[operation.spec].path;
+            operation.handler = routes
+                .get(&(operation.method.clone(), route_key(&operation.path)))
+                .and_then(|candidates| {
+                    candidates.iter().copied().max_by_key(|&(c, _)| {
+                        (shared_prefix(spec_path, &map.nodes[c].path), usize::MAX - c)
+                    })
+                });
+        }
+    }
+
     // The front end's files that call them.
     for (node, text) in texts {
         let is_script = matches!(
@@ -274,6 +311,13 @@ pub(crate) fn read(
     calls.sort_unstable();
     (operations, calls)
 }
+
+/// A router: the file that declares it, and its name there.
+type RouterKey = (usize, String);
+
+/// Where each router is included: the router that includes it, by its file
+/// and name, and the prefix it is given there.
+type Includers = HashMap<RouterKey, Vec<(usize, String, String)>>;
 
 /// The routes Python code declares with decorators, there being no spec:
 /// `@router.get("/me")` under `router = APIRouter(prefix="/users")`, that
@@ -332,7 +376,7 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
             .map(|m| m.as_str().to_owned())
     };
     // Each router: its file and name, with its own prefix and its tag.
-    let mut routers: HashMap<(usize, String), (String, Option<String>)> = HashMap::new();
+    let mut routers: HashMap<RouterKey, (String, Option<String>)> = HashMap::new();
     for (node, text) in &python {
         for c in router.captures_iter(text) {
             let args = &c[3];
@@ -345,18 +389,30 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
             );
         }
     }
-    // Where each router is included, and under which prefix.
-    let module_file = |module: &str| -> Option<usize> {
-        let path = module.replace('.', "/");
+    // Where each router is included, and under which prefix. A module
+    // imported from `importer`: `polar.users` wherever the package's root
+    // is, `.users` beside it, `..users` a folder up.
+    let module_file = |importer: usize, module: &str| -> Option<usize> {
+        let dots = module.len() - module.trim_start_matches('.').len();
+        let rest = module[dots..].replace('.', "/");
+        let path = if dots == 0 {
+            rest
+        } else {
+            let mut base = crate::imports::parent(&map.nodes[importer].path);
+            for _ in 1..dots {
+                base = crate::imports::parent(base);
+            }
+            crate::imports::join(base, &rest)
+        };
         let candidates = [format!("{path}.py"), format!("{path}/__init__.py")];
         python.iter().map(|(n, _)| *n).find(|n| {
             let p = &map.nodes[*n].path;
             candidates
                 .iter()
-                .any(|c| p == c || p.ends_with(&format!("/{c}")))
+                .any(|c| p == c || (dots == 0 && p.ends_with(&format!("/{c}"))))
         })
     };
-    let mut included: HashMap<(usize, String), (usize, String, String)> = HashMap::new();
+    let mut included: Includers = HashMap::new();
     for (node, text) in &python {
         // What the file imports, by the name it uses.
         let mut imported: HashMap<String, (String, String)> = HashMap::new();
@@ -384,18 +440,29 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
                 // `users.router`: the module `users`, as imported.
                 Some((module, var)) => imported
                     .get(module)
-                    .map(|(from, name)| format!("{from}.{name}"))
+                    .map(|(from, name)| {
+                        if from.ends_with('.') {
+                            format!("{from}{name}")
+                        } else {
+                            format!("{from}.{name}")
+                        }
+                    })
                     .or_else(|| Some(module.to_owned()))
-                    .and_then(|m| module_file(&m))
+                    .and_then(|m| module_file(*node, &m))
                     .map(|n| (n, var.to_owned())),
                 // `ws_router`: imported under that name, or the file's own.
                 None => match imported.get(target) {
-                    Some((from, name)) => module_file(from).map(|n| (n, name.clone())),
+                    Some((from, name)) => module_file(*node, from).map(|n| (n, name.clone())),
                     None => Some((*node, target.to_owned())),
                 },
             };
+            // A router may be included in several, and serves under each.
             if let Some(key) = resolved {
-                included.insert(key, (*node, c[1].to_owned(), prefix));
+                let includers = included.entry(key).or_default();
+                let includer = (*node, c[1].to_owned(), prefix);
+                if !includers.contains(&includer) {
+                    includers.push(includer);
+                }
             }
         }
     }
@@ -414,12 +481,17 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
                 continue;
             };
             let line = text[..whole.end() + name.start()].matches('\n').count() + 1;
-            let path = format!("{}{}", full_prefix(&key, &routers, &included, 0), &c[3]);
-            let path = if path.is_empty() {
-                "/".to_owned()
-            } else {
-                path.replace("//", "/")
-            };
+            let paths: Vec<String> = full_prefixes(&key, &routers, &included, 0)
+                .into_iter()
+                .map(|prefix| {
+                    let path = format!("{prefix}{}", &c[3]);
+                    if path.is_empty() {
+                        "/".to_owned()
+                    } else {
+                        path.replace("//", "/")
+                    }
+                })
+                .collect();
             let methods: Vec<String> = match &c[2] {
                 "websocket" => vec!["WEBSOCKET".to_owned()],
                 "route" | "api_route" => METHODS_ARG
@@ -435,38 +507,40 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
                 method => vec![method.to_uppercase()],
             };
             let summary = docstring(&after[name.end()..]);
-            let parameters: Vec<Parameter> = path
-                .split('/')
-                .filter_map(|s| s.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
-                .map(|p| Parameter {
-                    name: p.split(':').next().unwrap_or(p).to_owned(),
-                    location: "path".to_owned(),
-                    required: true,
-                    kind: String::new(),
-                    description: String::new(),
-                    example: None,
-                })
-                .collect();
             let tag = routers.get(&key).and_then(|(_, t)| t.clone());
-            for method in methods {
-                operations.push(Operation {
-                    id: name.as_str().to_owned(),
-                    method,
-                    path: path.clone(),
-                    summary: summary.clone(),
-                    description: String::new(),
-                    parameters: parameters.clone(),
-                    body: None,
-                    responses: Vec::new(),
-                    secured: false,
-                    server: None,
-                    tags: tag.iter().cloned().collect(),
-                    deprecated: false,
-                    spec: *node,
-                    from_code: true,
-                    handler: Some((*node, line)),
-                    callers: Vec::new(),
-                });
+            for path in paths {
+                let parameters: Vec<Parameter> = path
+                    .split('/')
+                    .filter_map(|s| s.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+                    .map(|p| Parameter {
+                        name: p.split(':').next().unwrap_or(p).to_owned(),
+                        location: "path".to_owned(),
+                        required: true,
+                        kind: String::new(),
+                        description: String::new(),
+                        example: None,
+                    })
+                    .collect();
+                for method in &methods {
+                    operations.push(Operation {
+                        id: name.as_str().to_owned(),
+                        method: method.clone(),
+                        path: path.clone(),
+                        summary: summary.clone(),
+                        description: String::new(),
+                        parameters: parameters.clone(),
+                        body: None,
+                        responses: Vec::new(),
+                        secured: false,
+                        server: None,
+                        tags: tag.iter().cloned().collect(),
+                        deprecated: false,
+                        spec: *node,
+                        from_code: true,
+                        handler: Some((*node, line)),
+                        callers: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -474,22 +548,41 @@ fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
     operations
 }
 
-/// A router's whole prefix: those of the routers that include it, then
-/// its own.
-fn full_prefix(
-    key: &(usize, String),
-    routers: &HashMap<(usize, String), (String, Option<String>)>,
-    included: &HashMap<(usize, String), (usize, String, String)>,
+/// A route's path as spec and code both write it: its parameters unnamed,
+/// since FastAPI's `{id:uuid}` is the spec's `{id}`, and no slash at its
+/// end, which one may write and the other not.
+fn route_key(path: &str) -> String {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| if s.starts_with('{') { "{}" } else { s })
+        .collect();
+    format!("/{}", parts.join("/"))
+}
+
+/// A router's whole prefixes, one for each place it is included: those of
+/// the routers that include it, then its own.
+fn full_prefixes(
+    key: &RouterKey,
+    routers: &HashMap<RouterKey, (String, Option<String>)>,
+    included: &Includers,
     depth: usize,
-) -> String {
+) -> Vec<String> {
     let own = routers.get(key).map_or("", |(p, _)| p.as_str());
-    match included.get(key) {
-        Some((node, var, prefix)) if depth < 8 => format!(
-            "{}{prefix}{own}",
-            full_prefix(&(*node, var.clone()), routers, included, depth + 1)
-        ),
-        _ => own.to_owned(),
-    }
+    let mut prefixes: Vec<String> = match included.get(key) {
+        Some(includers) if depth < 8 => includers
+            .iter()
+            .flat_map(|(node, var, prefix)| {
+                full_prefixes(&(*node, var.clone()), routers, included, depth + 1)
+                    .into_iter()
+                    .map(move |above| format!("{above}{prefix}{own}"))
+            })
+            .collect(),
+        _ => vec![own.to_owned()],
+    };
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
 }
 
 /// The first line of the docstring that opens a function's body.
@@ -635,17 +728,173 @@ fn path_matches(operation: &[String], written: &[String]) -> bool {
 /// The operations a spec's text declares, in its order, with no handler
 /// nor caller: to compare two versions of a spec.
 pub(crate) fn spec_operations(text: &str) -> Vec<Operation> {
-    operations_of(0, text)
+    load(text).map_or_else(Vec::new, |doc| operations_of(0, &doc))
+}
+
+/// A spec's document, read as YAML, JSON being YAML too; JSON is read as
+/// JSON, many times faster, which a spec of megabytes notices.
+fn load(text: &str) -> Option<Yaml> {
+    if text.trim_start().starts_with('{')
+        && let Ok(Json(doc)) = serde_json::from_str(text)
+    {
+        return Some(doc);
+    }
+    YamlLoader::load_from_str(text).ok()?.into_iter().next()
+}
+
+/// A JSON document read straight into YAML's types, its keys in their
+/// order, which serde's own `Value` would sort.
+struct Json(Yaml);
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonVisitor).map(Json)
+    }
+}
+
+struct JsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonVisitor {
+    type Value = Yaml;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Yaml, E> {
+        Ok(Yaml::Boolean(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Yaml, E> {
+        Ok(Yaml::Integer(v))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Yaml, E> {
+        Ok(i64::try_from(v).map_or_else(|_| Yaml::Real(v.to_string()), Yaml::Integer))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Yaml, E> {
+        Ok(Yaml::Real(v.to_string()))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Yaml, E> {
+        Ok(Yaml::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Yaml, E> {
+        Ok(Yaml::String(v))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Yaml, E> {
+        Ok(Yaml::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Yaml, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Json(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Yaml::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Yaml, A::Error> {
+        let mut hash = yaml_rust2::yaml::Hash::new();
+        while let Some((key, Json(value))) = map.next_entry::<String, Json>()? {
+            hash.insert(Yaml::String(key), value);
+        }
+        Ok(Yaml::Hash(hash))
+    }
+}
+
+/// The specs to read operations from: of the versions of one API, the
+/// latest. Versions share a title and most of their paths, as an API that
+/// keeps a spec per version does (`2026-04`, `2026-10`), or a copy of one
+/// for its tests.
+fn latest<'a>(map: &CodeMap, specs: &'a [(usize, Yaml)]) -> Vec<(usize, &'a Yaml)> {
+    let title = |doc: &'a Yaml| doc["info"]["title"].as_str().unwrap_or_default().trim();
+    let paths = |doc: &'a Yaml| -> HashSet<&'a str> {
+        doc["paths"]
+            .as_hash()
+            .into_iter()
+            .flat_map(|h| h.keys())
+            .filter_map(Yaml::as_str)
+            .collect()
+    };
+    let versions_of_one = |a: &'a Yaml, b: &'a Yaml| {
+        let (ours, theirs) = (paths(a), paths(b));
+        let shared = ours.intersection(&theirs).count();
+        !title(a).is_empty()
+            && title(a) == title(b)
+            && shared * 2 >= ours.len().min(theirs.len()).max(1)
+    };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, (_, doc)) in specs.iter().enumerate() {
+        match groups
+            .iter_mut()
+            .find(|g| g.iter().any(|&j| versions_of_one(doc, &specs[j].1)))
+        {
+            Some(group) => group.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    // The highest version, then one that is not a test's nor a document's,
+    // then the first.
+    let version = |i: usize| specs[i].1["info"]["version"].as_str().unwrap_or_default();
+    let aside = |i: usize| worth(Path::new(&map.nodes[specs[i].0].path));
+    groups
+        .iter()
+        .filter_map(|group| {
+            group.iter().copied().max_by(|&a, &b| {
+                version_order(version(a), version(b))
+                    .then(aside(b).cmp(&aside(a)))
+                    .then(b.cmp(&a))
+            })
+        })
+        .map(|i| (specs[i].0, &specs[i].1))
+        .collect()
+}
+
+/// Two versions in their natural order: their numbers as numbers, so that
+/// `1.10` comes after `1.9` and `2027-01` after `2026-10`.
+fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(v: &str) -> Vec<(bool, &str)> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for (i, c) in v.char_indices().skip(1) {
+            let previous = v[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|p| p.is_ascii_digit());
+            if c.is_ascii_digit() != previous {
+                parts.push(&v[start..i]);
+                start = i;
+            }
+        }
+        if !v.is_empty() {
+            parts.push(&v[start..]);
+        }
+        parts
+            .into_iter()
+            .map(|p| (p.starts_with(|c: char| c.is_ascii_digit()), p))
+            .collect()
+    }
+    for (x, y) in parts(a).into_iter().zip(parts(b)) {
+        let order = match (x, y) {
+            ((true, x), (true, y)) => {
+                let (x, y) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                x.len().cmp(&y.len()).then(x.cmp(y))
+            }
+            ((_, x), (_, y)) => x.cmp(y),
+        };
+        if order.is_ne() {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// The operations a spec declares, in its order.
-fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
-    let Ok(documents) = YamlLoader::load_from_str(text) else {
-        return Vec::new();
-    };
-    let Some(doc) = documents.first() else {
-        return Vec::new();
-    };
+fn operations_of(spec: usize, doc: &Yaml) -> Vec<Operation> {
     let Yaml::Hash(paths) = &doc["paths"] else {
         return Vec::new();
     };
@@ -1248,6 +1497,133 @@ mod tests {
             .collect();
         assert_eq!(handlers, ["api/routes/ui.py"]);
         assert_eq!(get_dags.callers, get_dag.callers);
+    }
+
+    #[test]
+    fn versions_of_one_api_count_once_the_latest_and_not_a_tests_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let shop = |version: &str, paths: &str| {
+            format!(
+                r#"{{"openapi": "3.1.0", "info": {{"title": "Shop API", "version": "{version}"}}, "paths": {{{paths}}}}}"#
+            )
+        };
+        let items = r#""/v1/items/": {"get": {"operationId": "items:list"}}"#;
+        let item = r#""/v1/items/{id}": {"get": {"operationId": "items:get"}}"#;
+        write(
+            root,
+            "api/openapi.json",
+            &shop("2026-10", &format!("{items}, {item}")),
+        );
+        write(
+            root,
+            "server/tests/openapi.json",
+            &shop("2026-10", &format!("{items}, {item}")),
+        );
+        write(
+            root,
+            "docs/2026-04.yaml",
+            "openapi: 3.1.0\ninfo:\n  title: Shop API\n  version: 2026-04\npaths:\n  /v1/items/:\n    get:\n      operationId: items:list\n  /v1/old:\n    get:\n      operationId: old\n",
+        );
+        // Another API, though it shares a path.
+        write(
+            root,
+            "admin/openapi.yaml",
+            "openapi: 3.1.0\ninfo:\n  title: Admin API\n  version: '1'\npaths:\n  /v1/items/:\n    get:\n      operationId: admin_items\n",
+        );
+        let map = map(root, 100);
+        let read: Vec<(&str, &str)> = map
+            .operations
+            .iter()
+            .map(|o| (map.nodes[o.spec].path.as_str(), o.id.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("admin/openapi.yaml", "admin_items"),
+                ("api/openapi.json", "items:list"),
+                ("api/openapi.json", "items:get"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_json_spec_is_read_in_its_order() {
+        let doc = load(r#"{"paths": {"/b": {"get": {}}, "/a": {"get": {}}}}"#).unwrap();
+        let paths: Vec<String> = operations_of(0, &doc).into_iter().map(|o| o.path).collect();
+        assert_eq!(paths, ["/b", "/a"]);
+    }
+
+    #[test]
+    fn versions_in_their_natural_order() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(version_order("1.9", "1.10"), Less);
+        assert_eq!(version_order("2026-10", "2027-01"), Less);
+        assert_eq!(version_order("v2", "v1"), Greater);
+        assert_eq!(version_order("1.0", "1.0"), Equal);
+        assert_eq!(version_order("1.0", "1.0.1"), Less);
+        assert_eq!(version_order("", "1"), Less);
+    }
+
+    #[test]
+    fn an_operation_the_code_does_not_name_is_served_by_its_method_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Ids made by FastAPI from tags and names, which no code writes.
+        write(
+            root,
+            "docs/openapi.json",
+            r#"{"openapi": "3.1.0", "info": {"title": "Shop API"}, "paths": {"/v1/items/{id}": {"get": {"operationId": "items:get"}}, "/v1/portal/items/": {"get": {"operationId": "portal:items:list"}}, "/v1/users/items/": {"get": {"operationId": "users:items:list"}}}}"#,
+        );
+        write(
+            root,
+            "server/shop/api.py",
+            "from fastapi import APIRouter\nfrom shop.items import router as items_router\nfrom shop.portal import router as portal_router\nfrom shop.users import router as users_router\n\nrouter = APIRouter(prefix=\"/v1\")\nrouter.include_router(items_router)\nrouter.include_router(portal_router)\nrouter.include_router(users_router)\n",
+        );
+        write(
+            root,
+            "server/shop/items.py",
+            "router = APIRouter(prefix=\"/items\")\n\n\n@router.get(\n    \"/{id:uuid}\",\n    summary=\"Get\",\n)\nasync def get(id):\n    pass\n",
+        );
+        // Included by a relative import, and in two routers.
+        write(
+            root,
+            "server/shop/portal/__init__.py",
+            "from .items import router as items_router\n\nrouter = APIRouter(prefix=\"/portal\")\nrouter.include_router(items_router)\n",
+        );
+        write(
+            root,
+            "server/shop/portal/items.py",
+            "router = APIRouter(prefix=\"/items\")\n\n@router.get(\"/\")\nasync def list():\n    pass\n",
+        );
+        write(
+            root,
+            "server/shop/users.py",
+            "from shop.portal.items import router as portal_items\n\nrouter = APIRouter(prefix=\"/users\")\nrouter.include_router(portal_items)\n",
+        );
+        let map = map(root, 100);
+        let served: Vec<(&str, Option<(&str, usize)>)> = map
+            .operations
+            .iter()
+            .map(|o| {
+                (
+                    o.id.as_str(),
+                    o.handler
+                        .map(|(n, line)| (map.nodes[n].path.as_str(), line)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            served,
+            [
+                ("items:get", Some(("server/shop/items.py", 8))),
+                (
+                    "portal:items:list",
+                    Some(("server/shop/portal/items.py", 4))
+                ),
+                ("users:items:list", Some(("server/shop/portal/items.py", 4))),
+            ]
+        );
     }
 
     #[test]

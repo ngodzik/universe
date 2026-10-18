@@ -188,6 +188,9 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
         ..Services::default()
     };
     let path_of = |node: usize| map.nodes[node].path.as_str();
+    // Where an operation is served: its handler's file, else its spec's,
+    // since a spec may be kept apart from the code (`docs/openapi.json`).
+    let home = |o: &crate::api::Operation| o.handler.map_or(o.spec, |(file, _)| file);
     let tools = mcp_tools(map, sources);
 
     // A top folder that serves an API or MCP tools, and that Compose does
@@ -195,7 +198,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     let mut serving: Vec<String> = map
         .operations
         .iter()
-        .map(|o| path_of(o.spec).to_owned())
+        .map(|o| path_of(home(o)).to_owned())
         .chain(tools.iter().map(|t| t.path.clone()))
         .collect();
     serving.sort();
@@ -218,13 +221,43 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
 
     // What each serves.
     for (i, operation) in map.operations.iter().enumerate() {
-        if let Some(owner) = services.owner(path_of(operation.spec)) {
+        if let Some(owner) = services.owner(path_of(home(operation))) {
             services.services[owner].operations.push(i);
         }
     }
     for tool in tools {
         if let Some(owner) = services.owner(&tool.path) {
             services.services[owner].tools.push(tool);
+        }
+    }
+
+    // A front end that calls an API through its spec, and that nothing
+    // above covers, is a service too: the package that holds it, by the
+    // name it gives itself.
+    let text_of: HashMap<usize, &str> = sources.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    for operation in &map.operations {
+        for &caller in &operation.callers {
+            let path = path_of(caller);
+            if services.owner(path).is_some() {
+                continue;
+            }
+            let Some((folder, name)) = package_of(map, &text_of, path) else {
+                continue;
+            };
+            let name = if services.services.iter().any(|s| s.name == name) {
+                folder.clone()
+            } else {
+                name
+            };
+            services.services.push(Service {
+                name,
+                folder: Some(folder),
+                external: false,
+                operations: Vec::new(),
+                tools: Vec::new(),
+                cloud: None,
+                platforms: Vec::new(),
+            });
         }
     }
 
@@ -260,7 +293,6 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     // Through OpenAPI: each caller of an operation reaches the service of
     // its spec. A name several specs share is put down to the service the
     // caller reaches most through names that are not shared.
-    let text_of: HashMap<usize, &str> = sources.iter().map(|(n, t)| (*n, t.as_str())).collect();
     let mut specs_of_name: HashMap<&str, HashSet<usize>> = HashMap::new();
     for operation in &map.operations {
         specs_of_name
@@ -283,7 +315,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     {
         let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
         for &(caller, _, i, shared) in &calls {
-            if !shared && let Some(to) = services.owner(path_of(map.operations[i].spec)) {
+            if !shared && let Some(to) = services.owner(path_of(home(&map.operations[i]))) {
                 *counts.entry((caller, to)).or_default() += 1;
             }
         }
@@ -298,15 +330,26 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     }
     for (caller, from, i, shared) in calls {
         let operation = &map.operations[i];
-        let Some(to) = services.owner(path_of(operation.spec)) else {
+        let Some(to) = services.owner(path_of(home(operation))) else {
             continue;
         };
         if shared && favourite.get(&caller) != Some(&to) {
             continue;
         }
-        let evidence = text_of
-            .get(&caller)
-            .and_then(|text| where_named(path_of(caller), text, &operation.id));
+        // Where it names the operation, else where it writes its path, as
+        // a client that calls `GET('/v1/users/{id}')` does: whole, else up
+        // to its first parameter.
+        let evidence = text_of.get(&caller).and_then(|text| {
+            let path = path_of(caller);
+            let written = operation.path.split('{').next().unwrap_or_default();
+            where_named(path, text, &operation.id)
+                .or_else(|| where_written(path, text, &operation.path))
+                .or_else(|| {
+                    (written.matches('/').count() > 2)
+                        .then(|| where_written(path, text, written))
+                        .flatten()
+                })
+        });
         add(&mut links, from, to, Via::OpenApi, Some(i), evidence);
     }
 
@@ -428,6 +471,35 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     apps(root, map, sources, &mut services);
     services.centre = centre(&services);
     services
+}
+
+/// The package a file belongs to, as its nearest `package.json` says, the
+/// project's own aside: its folder, and its name without its scope
+/// (`@acme/web` is `web`), else the folder's.
+fn package_of(
+    map: &CodeMap,
+    text_of: &HashMap<usize, &str>,
+    path: &str,
+) -> Option<(String, String)> {
+    let mut folder = path;
+    while let Some((up, _)) = folder.rsplit_once('/') {
+        folder = up;
+        let Some(node) = map.find(&format!("{folder}/package.json")) else {
+            continue;
+        };
+        let named = text_of
+            .get(&node)
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|v| v.get("name")?.as_str().map(str::to_owned));
+        let last = |name: &str| name.rsplit('/').next().unwrap_or(name).to_owned();
+        let name = named
+            .as_deref()
+            .map(last)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| last(folder));
+        return Some((folder.to_owned(), name));
+    }
+    None
 }
 
 /// The Flutter apps of the project and the platforms each is built for:
@@ -972,6 +1044,58 @@ mod tests {
         // The agent reaches the most.
         assert_eq!(services.centre, Some(index("agent")));
         assert_eq!(services.owner("agent/app.py"), Some(index("agent")));
+    }
+
+    #[test]
+    fn a_front_end_that_calls_the_api_is_a_service_and_the_api_is_where_its_handlers_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The spec kept with the documents, the code that serves it apart.
+        write(
+            root,
+            "docs/openapi.json",
+            r#"{"openapi": "3.1.0", "paths": {"/v1/items/{id}": {"get": {"operationId": "items:get"}}}}"#,
+        );
+        write(
+            root,
+            "server/app.py",
+            "router = APIRouter(prefix=\"/v1/items\")\n\n@router.get(\"/{id}\")\ndef get(id):\n    pass\n",
+        );
+        write(root, "clients/web/package.json", r#"{"name": "@shop/web"}"#);
+        write(
+            root,
+            "clients/web/src/item.ts",
+            "import { client } from './client'\n\nexport const item = (id) =>\n  client.GET('/v1/items/{id}', { params: { path: { id } } })\n",
+        );
+        let map = crate::map(root, 100);
+        let services = &map.services;
+        let found: Vec<(&str, Option<&str>, usize)> = services
+            .services
+            .iter()
+            .map(|s| (s.name.as_str(), s.folder.as_deref(), s.operations.len()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("server", Some("server"), 1),
+                ("web", Some("clients/web"), 0)
+            ]
+        );
+        let links: Vec<String> = services
+            .links
+            .iter()
+            .map(|l| {
+                let evidence = l.evidence.first().map(|e| format!("{}:{}", e.path, e.line));
+                format!(
+                    "{} -> {} {:?} {}",
+                    services.services[l.from].name,
+                    services.services[l.to].name,
+                    l.via,
+                    evidence.unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(links, ["web -> server OpenApi clients/web/src/item.ts:4"]);
     }
 
     #[test]

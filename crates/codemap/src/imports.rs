@@ -749,13 +749,13 @@ fn file_name(path: &str) -> &str {
 }
 
 /// The folder part of a path, empty at the root.
-fn parent(path: &str) -> &str {
+pub(crate) fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// `rel` from `dir`, with `.` and `..` resolved; `..` past the root stays
 /// at the root.
-fn join(dir: &str, rel: &str) -> String {
+pub(crate) fn join(dir: &str, rel: &str) -> String {
     let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
     for part in rel.split('/') {
         match part {
