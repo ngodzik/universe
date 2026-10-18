@@ -143,6 +143,10 @@ async fn main() -> Result<()> {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    // Conversations, the commands run and grants are the person's alone.
+    if let Err(e) = Defaults::keep_home_private() {
+        eprintln!("universe could not make its folder private: {e}");
+    }
     // A choice typed on the command line wins over the one kept for new
     // sessions; one from the environment does not, so that a variable set
     // long ago does not undo what was picked since.
@@ -184,6 +188,8 @@ async fn main() -> Result<()> {
         };
         let ask = !cli.here && matches!(start, universe_ui::Start::New);
         let relaunch = interface(provider, keyed, choices, start, ask).await?;
+        // What was written since loses the others' rights too.
+        let _ = Defaults::keep_home_private();
         return match relaunch {
             Some(relaunch) => Err(relaunch_in(&relaunch)),
             None => Ok(()),

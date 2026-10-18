@@ -77,6 +77,7 @@ A new crate (workflows, context) is added when its first real code lands, not be
 ### Secrets
 - API keys come from the environment, never from a flag value in shell history, never from a committed file
 - A type that holds a key implements `Debug` by hand and redacts it
+- universe's own folder, `~/.universe`, and all it holds are readable by their owner only: `Defaults::keep_home_private` shuts it when universe starts and when its window closes, so what writes there needs nothing more
 
 ### Unsafe
 - `#![deny(unsafe_code)]` in every crate, the binary included

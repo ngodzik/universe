@@ -145,13 +145,34 @@ impl Defaults {
     /// The budget of a request when nothing sets one, in dollars.
     pub const BUDGET: f64 = 0.10;
 
-    /// Where the defaults live, or `None` without a home directory.
-    pub fn path() -> Option<PathBuf> {
-        let base = match std::env::var_os("UNIVERSE_HOME") {
+    /// universe's own folder: `UNIVERSE_HOME`, else `~/.universe`; `None`
+    /// without a home directory.
+    pub fn home() -> Option<PathBuf> {
+        Some(match std::env::var_os("UNIVERSE_HOME") {
             Some(home) => PathBuf::from(home),
             None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
-        };
-        Some(base.join("config.toml"))
+        })
+    }
+
+    /// Where the defaults live, or `None` without a home directory.
+    pub fn path() -> Option<PathBuf> {
+        Self::home().map(|home| home.join("config.toml"))
+    }
+
+    /// Makes universe's own folder, created if missing, and all it holds
+    /// readable by their owner only: conversations, commands run, grants and
+    /// caches are nobody else's. The folder shut, what is written in it later
+    /// is out of reach too, and loses the others' rights at the next call.
+    ///
+    /// # Errors
+    ///
+    /// Any error creating the folder or reading it.
+    pub fn keep_home_private() -> io::Result<()> {
+        let person = std::env::var_os("HOME").map(PathBuf::from);
+        match Self::home() {
+            Some(home) => keep_private(&home, person.as_deref()),
+            None => Ok(()),
+        }
     }
 
     /// Where every command a model runs is written down:
@@ -215,9 +236,96 @@ impl Defaults {
     }
 }
 
+/// Makes `dir`, created if missing, and all it holds readable by their
+/// owner only: group and others lose every right, the owner keeps theirs,
+/// an executable stays one. Links are not followed. Never the person's own
+/// folder, `person`, nor one above it, should `UNIVERSE_HOME` name one.
+fn keep_private(dir: &Path, person: Option<&Path>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let dir = dir.canonicalize()?;
+        let person = person.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_owned()));
+        if person.is_some_and(|person| person.starts_with(&dir)) {
+            return Ok(());
+        }
+        let mut pending = vec![dir];
+        while let Some(path) = pending.pop() {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                // Another's file, which only they may change, is left.
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o7700));
+            }
+            if meta.is_dir() {
+                pending.extend(fs::read_dir(&path)?.flatten().map(|entry| entry.path()));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, person);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn universes_folder_and_all_it_holds_are_its_owners_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".universe");
+        let sessions = home.join("sessions/project");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("a.json"), "{}").unwrap();
+        fs::write(home.join("hook.sh"), "true").unwrap();
+        fs::write(dir.path().join("outside"), "").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside"), home.join("link")).unwrap();
+        for (path, wide) in [
+            (&home, 0o755),
+            (&sessions, 0o775),
+            (&sessions.join("a.json"), 0o644),
+            (&home.join("hook.sh"), 0o755),
+            (&dir.path().join("outside"), 0o644),
+        ] {
+            set(path, wide);
+        }
+
+        keep_private(&home, Some(dir.path())).unwrap();
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&sessions), 0o700);
+        assert_eq!(mode(&home.join("sessions")), 0o700);
+        assert_eq!(mode(&sessions.join("a.json")), 0o600);
+        // An executable stays one, for its owner.
+        assert_eq!(mode(&home.join("hook.sh")), 0o700);
+        // What a link leads to is not universe's.
+        assert_eq!(mode(&dir.path().join("outside")), 0o644);
+
+        // Missing, it is made shut.
+        let new = dir.path().join("new");
+        keep_private(&new, None).unwrap();
+        assert_eq!(mode(&new), 0o700);
+
+        // Never the person's own folder, nor one above it.
+        set(dir.path(), 0o755);
+        keep_private(dir.path(), Some(&dir.path().join("me"))).unwrap();
+        assert_eq!(mode(dir.path()), 0o755);
+    }
 
     #[test]
     fn defaults_survive_a_save_and_a_load() {
