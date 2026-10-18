@@ -17,7 +17,7 @@ version     = "0.1.0"
 edition     = "2024"
 # The oldest toolchain the code is known to build on. CI holds it to this, so
 # the promise is checked rather than asserted.
-rust-version = "1.97.1"
+rust-version = "1.99.1"
 authors     = ["Nicolas Godzik"]
 license     = "MIT"
 
