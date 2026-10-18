@@ -4958,7 +4958,9 @@ mod tests {
         assert_eq!(requests[0].resume, None);
         assert_eq!(requests[1].resume.as_deref(), Some("claude-session-1"));
         assert_eq!(requests[2].resume, None);
-        assert_eq!(requests[2].directory, copy.path());
+        // The workspace's root has its links resolved, as macOS's temporary
+        // folders need.
+        assert_eq!(requests[2].directory, copy.path().canonicalize().unwrap());
     }
 
     #[tokio::test]
