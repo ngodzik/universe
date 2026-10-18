@@ -2207,12 +2207,6 @@ impl App {
                 return None;
             }
         }
-        if self.map == Some(MapView::App)
-            && self.preview.is_focused()
-            && let Some(effect) = self.page_key(key)
-        {
-            return effect;
-        }
         if self.definition_key(key) {
             return None;
         }
@@ -5166,34 +5160,6 @@ impl App {
         self.map
     }
 
-    /// A key while the App view's page has the keys: given to the page,
-    /// but Esc, which gives them back, and universe's own, left to the
-    /// rest (`None`).
-    fn page_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
-        use crate::app_preview::AppOrder;
-        use crate::keymap::PageKey;
-        let held = universe_preview::Modifiers {
-            alt: key.modifiers.contains(KeyModifiers::ALT),
-            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-            meta: false,
-            shift: key.modifiers.contains(KeyModifiers::SHIFT),
-        };
-        let order = match crate::keymap::page_key(key) {
-            PageKey::Universe => return None,
-            PageKey::Leave => {
-                self.preview.focus(false);
-                self.notice = Some(
-                    "The keys are universe's again; click the page to give them back".to_owned(),
-                );
-                return Some(None);
-            }
-            PageKey::Text(c) => AppOrder::Text(c.to_string()),
-            PageKey::Named(name) => AppOrder::Key(universe_preview::Key::named(name, held)?),
-            PageKey::Shortcut(c) => AppOrder::Key(universe_preview::Key::shortcut(c, held)),
-        };
-        Some(self.app_order(order))
-    }
-
     /// Whether the project has a front end the App view can run.
     pub fn has_front_end(&self) -> bool {
         self.front_end
@@ -5226,41 +5192,15 @@ impl App {
         Effect::App(self.preview.stop())
     }
 
-    /// Asks the running front end something, when it runs; what the
-    /// person does on the last screen of a workflow is kept with it.
+    /// Asks the running front end something, when it runs.
     fn app_order(&mut self, order: crate::app_preview::AppOrder) -> Option<Effect> {
         if !self.preview.is_running() {
             return None;
         }
-        self.preview.record(&order);
         Some(Effect::App(order))
     }
 
-    /// Keeps the workflow shown as a test: its screens, the state, what the
-    /// person did on the last and whether its action was called.
-    pub fn app_keep_test(&mut self) -> Option<Effect> {
-        let order = self.preview.keep_test()?;
-        self.notice =
-            Some("Kept as a test: shown again, it compares each screen with these".to_owned());
-        self.app_order(order)
-    }
-
-    /// Shows kept test `index` again, and compares.
-    pub fn app_replay(&mut self, index: usize) -> Option<Effect> {
-        if !self.preview.is_running() {
-            return None;
-        }
-        let order = self.preview.replay(index)?;
-        Some(Effect::App(order))
-    }
-
-    /// The tests kept, as the host read them.
-    pub fn app_tests_kept(&mut self, tests: Vec<universe_preview::Kept>) {
-        self.preview.tests_kept(tests);
-    }
-
-    /// Shows the front end's page at `path`: its last frame, if it was
-    /// shown before, as it loads.
+    /// Shows the front end's page at `path`.
     pub fn app_go(&mut self, path: &str) -> Option<Effect> {
         if self.preview.is_running() {
             self.preview.going(path);
@@ -5278,24 +5218,11 @@ impl App {
         self.app_order(crate::app_preview::AppOrder::History(back))
     }
 
-    /// The person's pointer on the page; pressing on it gives it the keys.
-    pub fn app_pointer(&mut self, pointer: universe_preview::Pointer) -> Option<Effect> {
-        if matches!(pointer, universe_preview::Pointer::Press { .. }) {
-            self.preview.focus(true);
-        }
-        self.app_order(crate::app_preview::AppOrder::Pointer(pointer))
-    }
-
-    /// Gives the keys back to universe, or to the page.
-    pub fn app_focus(&mut self, on: bool) {
-        self.preview.focus(on);
-    }
-
-    /// The page's size in its pixels, and the scale it is drawn at, as the
-    /// window has room for: sent when it changes.
-    pub fn app_size(&mut self, width: u32, height: u32, scale: f32) -> Option<Effect> {
-        let order = self.preview.size(width, height, scale)?;
-        self.app_order(order)
+    /// Where the browser's window is to show the page, on the screen, as
+    /// the window has room for it: `None` while the view is not shown.
+    /// Sent when it changes, and only once the page has loaded.
+    pub fn app_place(&mut self, place: Option<universe_preview::Place>) -> Option<Effect> {
+        self.preview.place(place).map(Effect::App)
     }
 
     /// Changes the state the simulated back end answers in.
@@ -5308,11 +5235,6 @@ impl App {
     /// opens it to be changed.
     pub fn app_keep(&mut self, index: usize) -> Option<Effect> {
         self.app_order(crate::app_preview::AppOrder::Keep(index))
-    }
-
-    /// Photographs the page.
-    pub fn app_shoot(&mut self, label: &str) -> Option<Effect> {
-        self.app_order(crate::app_preview::AppOrder::Shoot(label.to_owned()))
     }
 
     /// Shows a workflow step by step: each of `steps` a label and a path,
@@ -5333,7 +5255,7 @@ impl App {
             method: method.to_owned(),
             path: path.to_owned(),
             acted: false,
-            replay: None,
+            shown: 0,
         };
         self.notice = Some(format!(
             "{name}: its screens one after the other; on the last, do it on the page \
@@ -5354,16 +5276,9 @@ impl App {
         }
     }
 
-    /// The App view's pages as they last showed, to keep between sessions:
-    /// given away once.
-    pub fn take_app_pages(&mut self) -> Vec<(String, universe_preview::Frame)> {
-        self.preview.take_pages_to_keep()
-    }
-
     /// Opens a file from the App view, at `line`, the view left for it:
     /// Ctrl-N comes back to the page.
     pub fn open_from_app(&mut self, path: std::path::PathBuf, line: usize) {
-        self.preview.focus(false);
         self.show_map(None);
         self.open_path_at(path, line);
         self.back_to_app = true;
@@ -5416,9 +5331,9 @@ impl App {
                  one to open it; Ctrl-N again for the plan"
             }
             Some(MapView::App) => {
-                "The app: its front end against a back end simulated from its spec. Start it, \
-                 click the page to use it (Esc gives the keys back), Ctrl-J hides the pilot; \
-                 Ctrl-N again for the universe"
+                "The app: its front end against a back end simulated from its spec, in Chrome \
+                 over this view. Start it and use the page as in any browser; Ctrl-J hides the \
+                 pilot, Ctrl-N again for the universe"
             }
             None => return,
         };
@@ -6213,7 +6128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_app_view_its_pilot_and_its_page_s_keys() {
+    fn the_app_view_its_pilot_and_its_page_s_window() {
         use crate::app_preview::AppOrder;
         let mut app = ready();
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
@@ -6232,36 +6147,29 @@ mod tests {
         assert!(app.app_preview().pilot_shown());
 
         // Nothing goes to a page that is not running.
-        let press = universe_preview::Pointer::Press {
-            x: 1.0,
-            y: 2.0,
-            button: universe_preview::Button::Left,
-            clicks: 1,
-        };
-        assert!(app.app_pointer(press).is_none());
+        assert!(app.app_reload().is_none());
         app.app_told(universe_preview::Event::Status(
             universe_preview::Status::Running {
                 address: "http://127.0.0.1:3000".to_owned(),
             },
         ));
         assert!(matches!(
-            app.app_pointer(press),
-            Some(Effect::App(AppOrder::Pointer(_)))
+            app.app_reload(),
+            Some(Effect::App(AppOrder::Reload))
         ));
-        assert!(app.app_preview().is_focused());
-        // The page has the keys, but universe's own.
-        let typed = app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(matches!(typed, Some(Effect::App(AppOrder::Text(t))) if t == "a"));
-        let enter = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(enter, Some(Effect::App(AppOrder::Key(k))) if k.key == "Enter"));
-        app.on_key(ctrl('j'));
-        assert!(!app.app_preview().pilot_shown());
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.app_preview().is_focused());
-        assert!(
-            app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
-                .is_none()
-        );
+        // Its window shows once its first page has loaded.
+        let place = universe_preview::Place {
+            left: 0,
+            top: 0,
+            width: 640,
+            height: 480,
+        };
+        assert!(app.app_place(Some(place)).is_none());
+        app.app_told(universe_preview::Event::Quiet);
+        assert!(matches!(
+            app.app_place(Some(place)),
+            Some(Effect::App(AppOrder::Place(Some(_))))
+        ));
 
         // Left for a file, Ctrl-N comes back to it.
         app.open_from_app(PathBuf::from("/p/fixture.json"), 1);

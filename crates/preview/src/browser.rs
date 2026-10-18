@@ -1,8 +1,9 @@
-//! A browser driven over the DevTools protocol: Chrome, Chromium or Edge,
-//! headless, in a profile of its own. Its page is seen as the frames it
-//! sends, each sent on only once the one before is taken, so that a slow
-//! reader slows it rather than piles frames up; it is given the person's
-//! pointer and keys, sent where it is asked, photographed.
+//! The system's Chrome, Chromium or Edge, in a window of its own that
+//! universe places over the App view's page and drives over the DevTools
+//! protocol. The person uses the page in it as in any browser, at the
+//! browser's own speed; what it does (its address, its loads, its
+//! console's errors) is told, and its pages are kept from leaving this
+//! machine.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
@@ -14,255 +15,61 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket};
 
 use crate::error::PreviewError;
-use crate::{Event, Frame, Sink};
+use crate::{Event, Sink};
 
-/// How long the browser may take to say where its DevTools listen.
+/// How long the browser may take to say where its DevTools listen, and
+/// to open its window.
 const STARTS_WITHIN: Duration = Duration::from_secs(30);
 
-/// How the name of a browser's profile begins, in the system's folder of
-/// temporary files.
-pub(crate) const PROFILE_PREFIX: &str = "universe-browser-";
-
-/// How long a step of a workflow may load before it is photographed as it
-/// is.
+/// How long a step of a workflow may load before the next is shown.
 const STEP_WITHIN: Duration = Duration::from_secs(15);
 
 /// How long after a step is asked for its page may be said quiet: what the
 /// page before said is not its.
 const STEP_SETTLES: Duration = Duration::from_millis(400);
 
-/// How long the page must show the same frame to be said still.
-const STILL_AFTER: Duration = Duration::from_millis(700);
+/// How often a window not yet found is looked for, once it is to show.
+const LOOKED_FOR: Duration = Duration::from_millis(250);
 
-/// A button of the pointer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Button {
-    /// None held.
-    None,
-    /// The main one.
-    Left,
-    /// The wheel's.
-    Middle,
-    /// The one for a menu.
-    Right,
+/// How the name of a browser's profile begins, in the system's folder of
+/// temporary files.
+pub(crate) const PROFILE_PREFIX: &str = "universe-browser-";
+
+/// Where the page's window goes on the screen, in the screen's
+/// device-independent pixels: where the page itself shows, the window's
+/// own frame around it left to the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    /// From the screen's left.
+    pub left: i32,
+    /// From the screen's top.
+    pub top: i32,
+    /// Its width.
+    pub width: u32,
+    /// Its height.
+    pub height: u32,
 }
-
-/// What the person's pointer does on the page, in its pixels from its top
-/// left.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Pointer {
-    /// Moves there.
-    Move {
-        /// Across.
-        x: f32,
-        /// Down.
-        y: f32,
-    },
-    /// Presses a button there.
-    Press {
-        /// Across.
-        x: f32,
-        /// Down.
-        y: f32,
-        /// Which.
-        button: Button,
-        /// How many times in a row: 2 for a double click.
-        clicks: u32,
-    },
-    /// Lets a button go there.
-    Release {
-        /// Across.
-        x: f32,
-        /// Down.
-        y: f32,
-        /// Which.
-        button: Button,
-        /// How many times in a row.
-        clicks: u32,
-    },
-    /// Turns the wheel there, down and right when positive.
-    Wheel {
-        /// Across.
-        x: f32,
-        /// Down.
-        y: f32,
-        /// Across, in pixels.
-        dx: f32,
-        /// Down, in pixels.
-        dy: f32,
-    },
-}
-
-/// The keys held with another.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Modifiers {
-    /// Alt, Option.
-    pub alt: bool,
-    /// Control.
-    pub ctrl: bool,
-    /// Command, Windows.
-    pub meta: bool,
-    /// Shift.
-    pub shift: bool,
-}
-
-impl Modifiers {
-    /// As the protocol counts them.
-    fn bits(self) -> u8 {
-        u8::from(self.alt)
-            | u8::from(self.ctrl) << 1
-            | u8::from(self.meta) << 2
-            | u8::from(self.shift) << 3
-    }
-}
-
-/// A key pressed on the page.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Key {
-    /// What it means: `Enter`, `a`.
-    pub key: String,
-    /// Where it is: `Enter`, `KeyA`.
-    pub code: String,
-    /// What it types, if anything.
-    pub text: Option<String>,
-    /// Windows' number for it, which pages still read.
-    pub number: u32,
-    /// What is held with it.
-    pub modifiers: Modifiers,
-}
-
-impl Key {
-    /// A key that types nothing, or a line's end, by its name: `Enter`,
-    /// `Backspace`, `Tab`, `Escape`, `ArrowLeft`, `ArrowUp`, `ArrowRight`,
-    /// `ArrowDown`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`.
-    #[must_use]
-    pub fn named(name: &str, modifiers: Modifiers) -> Option<Self> {
-        let (number, text) = match name {
-            "Enter" => (13, Some("\r")),
-            "Backspace" => (8, None),
-            "Tab" => (9, None),
-            "Escape" => (27, None),
-            "ArrowLeft" => (37, None),
-            "ArrowUp" => (38, None),
-            "ArrowRight" => (39, None),
-            "ArrowDown" => (40, None),
-            "Delete" => (46, None),
-            "Home" => (36, None),
-            "End" => (35, None),
-            "PageUp" => (33, None),
-            "PageDown" => (34, None),
-            _ => return None,
-        };
-        Some(Self {
-            key: name.to_owned(),
-            code: name.to_owned(),
-            text: text.map(str::to_owned),
-            number,
-            modifiers,
-        })
-    }
-
-    /// A letter or a digit pressed with what is held, as a shortcut is:
-    /// `Ctrl-A`.
-    #[must_use]
-    pub fn shortcut(c: char, modifiers: Modifiers) -> Self {
-        let upper = c.to_ascii_uppercase();
-        let code = if upper.is_ascii_digit() {
-            format!("Digit{upper}")
-        } else {
-            format!("Key{upper}")
-        };
-        Self {
-            key: c.to_string(),
-            code,
-            text: None,
-            number: u32::from(upper),
-            modifiers,
-        }
-    }
-}
-
-/// Something the person did on the page.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Input {
-    /// With the pointer.
-    Pointer(Pointer),
-    /// A key.
-    Key(Key),
-    /// Text typed.
-    Text(String),
-}
-
-/// What the person did, and how long after what they did before.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Recorded {
-    /// How long after the input before, in milliseconds; the first's, after
-    /// the last step showed.
-    pub after_ms: u64,
-    /// What they did.
-    pub input: Input,
-}
-
-/// A step of a workflow shown.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Step {
-    /// Its label.
-    pub label: String,
-    /// Its address, a path of the front end's.
-    pub path: String,
-    /// A photograph of it to compare it with, as PNG.
-    pub kept: Option<PathBuf>,
-}
-
-/// A workflow to show: its steps in turn, each photographed once quiet,
-/// then what the person did on the last, done again as they did it, and
-/// the page photographed once it is done.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Play {
-    /// The steps.
-    pub steps: Vec<Step>,
-    /// What the person did on the last.
-    pub inputs: Vec<Recorded>,
-    /// A photograph of the page once they did it, to compare with.
-    pub after: Option<PathBuf>,
-    /// The page's size to show it at, its own when it was kept.
-    pub size: Option<(u32, u32, f32)>,
-}
-
-/// How long the page is given to settle once what the person did is done
-/// again, before it is photographed.
-const ACTED_SETTLES: Duration = Duration::from_millis(2500);
 
 /// What the browser is asked.
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Request {
-    /// Go to this address.
+    /// Show this address.
     Go(String),
     /// Load the page again.
     Reload,
-    /// Back in its history, or forward.
+    /// Back in the page's history, or forward.
     History(bool),
-    /// The person's pointer.
-    Pointer(Pointer),
-    /// A key.
-    Key(Key),
-    /// Text typed.
-    Text(String),
-    /// A page of this size, in its pixels, drawn at this scale.
-    Size(u32, u32, f32),
-    /// A photograph, under this label.
-    Shot(String),
-    /// A workflow, its steps' paths whole addresses.
-    Play(Play),
+    /// Show the window there, or hide it.
+    Place(Option<Place>),
+    /// Show these addresses in turn, each once it has loaded.
+    Play(Vec<String>),
 }
 
-/// A browser, running, with a page open.
-pub struct Browser {
+/// A browser running, stopped when dropped.
+pub(crate) struct Browser {
     child: Child,
     program: PathBuf,
     profile: PathBuf,
@@ -271,17 +78,18 @@ pub struct Browser {
 }
 
 impl Browser {
-    /// Starts a browser at `address`, `cookies` set for it first, its page
-    /// `width` by `height` at `scale`.
+    /// Starts a browser at `address`, `cookies` set for it first. `shown`,
+    /// its window is hidden until it is placed, and held over the window
+    /// it names where the system lets it be; else it runs headless.
     ///
     /// # Errors
     ///
     /// [`PreviewError::NoBrowser`] when none is found, others when it does
     /// not start or its DevTools cannot be reached.
-    pub fn start(
+    pub(crate) fn start(
         address: &str,
         cookies: &[(String, String)],
-        (width, height, scale): (u32, u32, f32),
+        shown: Option<Option<u64>>,
         sink: Sink,
     ) -> Result<Self, PreviewError> {
         let program = find().ok_or(PreviewError::NoBrowser)?;
@@ -291,9 +99,10 @@ impl Browser {
             std::process::id(),
             PROFILES.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut child = Command::new(&program)
+        prepare(&profile);
+        let mut command = Command::new(&program);
+        command
             .args([
-                "--headless=new",
                 "--remote-debugging-port=0",
                 &format!("--user-data-dir={}", profile.display()),
                 "--no-first-run",
@@ -302,28 +111,45 @@ impl Browser {
                 "--disable-component-update",
                 "--disable-extensions",
                 "--disable-sync",
+                "--disable-features=Translate",
+                "--hide-crash-restore-bubble",
                 "--metrics-recording-only",
-                "--mute-audio",
-                "--hide-scrollbars",
                 "--password-store=basic",
                 "--use-mock-keychain",
-                &format!("--window-size={width},{height}"),
-                "about:blank",
+                "--class=universe-page",
+                "--window-size=800,600",
             ])
-            // Headless, it needs neither the screen nor the desktop's
-            // session, and is kept from both: nothing of the person's
-            // desktop is its to reach.
-            .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
+            // Kept from the desktop's session: nothing of the person's
+            // keyring or settings is its to reach.
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| PreviewError::Start {
-                command: program.display().to_string(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        match shown {
+            // A window of its own, without tabs or an address bar.
+            Some(_) => {
+                // An address the app window takes, which `about:blank` is
+                // not: an empty page the colour of the wait.
+                command.arg("--app=data:text/html,<body style='background:%2308090c'>");
+                if cfg!(target_os = "linux") {
+                    // Placed by universe, which only X11 lets a program do.
+                    command
+                        .arg("--ozone-platform=x11")
+                        .env_remove("WAYLAND_DISPLAY");
+                }
+            }
+            // Headless, it needs no screen at all, and is kept from it.
+            None => {
+                command
+                    .args(["--headless=new", "about:blank"])
+                    .env_remove("DISPLAY")
+                    .env_remove("WAYLAND_DISPLAY");
+            }
+        }
+        let mut child = command.spawn().map_err(|source| PreviewError::Start {
+            command: program.display().to_string(),
+            source,
+        })?;
         let Some(stderr) = child.stderr.take() else {
             let _ = child.kill();
             return Err(PreviewError::NoDevTools {
@@ -349,19 +175,22 @@ impl Browser {
         let mut driver = Driver {
             socket,
             session: String::new(),
+            target: String::new(),
+            window: None,
             next: 0,
             pending: HashMap::new(),
             main_frame: None,
             sink,
-            frames: 0,
             playing: VecDeque::new(),
             step: None,
-            inputs: VecDeque::new(),
-            next_input: None,
-            after: None,
-            after_kept: None,
-            size: (width, height, scale),
-            last_frame: None,
+            frame: (0, 0),
+            placed: None,
+            held: match shown {
+                Some(parent) => crate::window::Held::new(child.id(), parent),
+                None => crate::window::Held::none(),
+            },
+            holding: false,
+            looked: Instant::now(),
         };
         driver.open(address, cookies)?;
         let thread = std::thread::spawn(move || driver.drive(&asked));
@@ -385,7 +214,7 @@ impl Browser {
     }
 
     /// The folder of its profile.
-    pub(crate) fn profile(&self) -> &std::path::Path {
+    pub(crate) fn profile(&self) -> &Path {
         &self.profile
     }
 
@@ -402,8 +231,27 @@ impl Drop for Browser {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = std::fs::remove_dir_all(&self.profile);
+        // Its helpers may write there a moment longer than it lives.
+        for _ in 0..5 {
+            if std::fs::remove_dir_all(&self.profile).is_ok() || !self.profile.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
+}
+
+/// A profile whose app windows take the system's frame, which universe
+/// then takes away: the browser draws no title bar of its own over the
+/// page.
+fn prepare(profile: &Path) {
+    let preferences = json!({
+        "browser": {"custom_chrome_frame": false, "has_seen_welcome_page": true},
+        "profile": {"exit_type": "Normal", "exited_cleanly": true},
+    });
+    let folder = profile.join("Default");
+    let _ = std::fs::create_dir_all(&folder)
+        .and_then(|()| std::fs::write(folder.join("Preferences"), preferences.to_string()));
 }
 
 /// Waits for the line that says where the DevTools listen.
@@ -497,41 +345,34 @@ pub fn browser_found() -> bool {
 
 /// What a command's answer is for, once it comes.
 enum Pending {
-    /// A photograph, under its label, to compare with one kept; of a
-    /// step of a workflow, which goes on once it is taken.
-    Shot {
-        label: String,
-        kept: Option<PathBuf>,
-        step: bool,
-    },
+    /// How much wider and taller the window is than its page: its frame.
+    Frame,
 }
 
 /// The socket's side: what is asked, sent; what the browser says, told.
 struct Driver {
     socket: WebSocket<TcpStream>,
     session: String,
+    /// The page's target, and its window.
+    target: String,
+    window: Option<i64>,
     next: u64,
     pending: HashMap<u64, Pending>,
     main_frame: Option<String>,
     sink: Sink,
-    frames: u64,
-    /// The steps of a workflow yet to show.
-    playing: VecDeque<Step>,
-    /// The step showing, and since when.
-    step: Option<(Step, Instant)>,
-    /// What the person did, to do again once the steps are shown, and
-    /// when the next is due.
-    inputs: VecDeque<Recorded>,
-    next_input: Option<Instant>,
-    /// Once done, when the page is photographed, and what to compare it
-    /// with.
-    after: Option<(Instant, Option<PathBuf>)>,
-    /// The photograph of the end to compare with, until the steps are
-    /// shown.
-    after_kept: Option<PathBuf>,
-    size: (u32, u32, f32),
-    /// When the last frame came, until the page is said still.
-    last_frame: Option<Instant>,
+    /// The steps of a workflow yet to show, and since when the one
+    /// showing was asked for.
+    playing: VecDeque<String>,
+    step: Option<Instant>,
+    /// How much wider and taller the window is than the page it shows.
+    frame: (i32, i32),
+    /// Where the page was last placed, while it shows.
+    placed: Option<Place>,
+    /// The window held over universe's, where the system lets it be,
+    /// whether it is, and when it was last looked for.
+    held: crate::window::Held,
+    holding: bool,
+    looked: Instant,
 }
 
 impl Driver {
@@ -574,7 +415,6 @@ impl Driver {
         })
     }
 
-    /// The next message, `None` when none came in a moment.
     fn receive(&mut self) -> Result<Option<Value>, PreviewError> {
         match self.socket.read() {
             Ok(Message::Text(text)) => Ok(serde_json::from_str(text.as_str()).ok()),
@@ -594,19 +434,48 @@ impl Driver {
         }
     }
 
-    /// Opens a page of its own, the cookies set, at `address`.
+    /// Takes the page of the app window it opened with, hides the window
+    /// until it is placed, sets the cookies, and goes to `address`.
     fn open(&mut self, address: &str, cookies: &[(String, String)]) -> Result<(), PreviewError> {
-        let target = self.call("Target.createTarget", json!({"url": "about:blank"}), true)?;
-        let id = target["targetId"].as_str().unwrap_or_default().to_owned();
+        let began = Instant::now();
+        let target = loop {
+            let targets = self.call("Target.getTargets", json!({}), true)?;
+            let page = targets["targetInfos"].as_array().and_then(|all| {
+                all.iter()
+                    .find(|t| t["type"] == "page")
+                    .and_then(|t| t["targetId"].as_str())
+                    .map(str::to_owned)
+            });
+            match page {
+                Some(page) => break page,
+                None if began.elapsed() < STARTS_WITHIN => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                None => {
+                    return Err(PreviewError::Refused {
+                        method: "Target.getTargets".to_owned(),
+                        message: "no window opened".to_owned(),
+                    });
+                }
+            }
+        };
         let attached = self.call(
             "Target.attachToTarget",
-            json!({"targetId": id, "flatten": true}),
+            json!({"targetId": target, "flatten": true}),
             true,
         )?;
         self.session = attached["sessionId"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        let window = self.call(
+            "Browser.getWindowForTarget",
+            json!({"targetId": target}),
+            true,
+        )?;
+        self.window = window["windowId"].as_i64();
+        self.target = target;
+        self.hide()?;
         for domain in [
             "Page.enable",
             "Runtime.enable",
@@ -633,26 +502,7 @@ impl Driver {
         if !cookies.is_empty() {
             self.call("Network.setCookies", json!({"cookies": cookies}), false)?;
         }
-        self.resize()?;
         self.send("Page.navigate", json!({"url": address}), false)?;
-        Ok(())
-    }
-
-    /// Sizes the page, and has its frames sent at that size.
-    fn resize(&mut self) -> Result<(), PreviewError> {
-        let (width, height, scale) = self.size;
-        self.send(
-            "Emulation.setDeviceMetricsOverride",
-            json!({"width": width, "height": height, "deviceScaleFactor": scale, "mobile": false}),
-            false,
-        )?;
-        self.send("Page.stopScreencast", json!({}), false)?;
-        let pixels = |points: u32| (f64::from(points) * f64::from(scale)).round();
-        self.send(
-            "Page.startScreencast",
-            json!({"format": "jpeg", "quality": 82, "maxWidth": pixels(width), "maxHeight": pixels(height), "everyNthFrame": 1}),
-            false,
-        )?;
         Ok(())
     }
 
@@ -671,29 +521,23 @@ impl Driver {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            if self
-                .step
-                .as_ref()
-                .is_some_and(|(_, since)| since.elapsed() > STEP_WITHIN)
-                && self.photograph_step().is_err()
+            if self.step.is_some_and(|since| since.elapsed() > STEP_WITHIN)
+                && self.next_step().is_err()
             {
                 return;
             }
-            if self.next_input.is_some_and(|due| Instant::now() >= due)
-                && self.input_again().is_err()
+            // A window shown is held once the system has it: placed again,
+            // its frame gone.
+            if let Some(place) = self.placed
+                && !self.holding
+                && self.held.can_hold()
+                && self.looked.elapsed() > LOOKED_FOR
             {
-                return;
-            }
-            if self.last_frame.is_some_and(|at| at.elapsed() > STILL_AFTER) {
-                self.last_frame = None;
-                (self.sink)(Event::Still);
-            }
-            if let Some((due, _)) = &self.after
-                && Instant::now() >= *due
-                && let Some((_, kept)) = self.after.take()
-                && self.photograph("after".to_owned(), kept).is_err()
-            {
-                return;
+                self.looked = Instant::now();
+                self.holding = self.held.hold();
+                if self.holding && self.bounds(place).is_err() {
+                    return;
+                }
             }
             match self.receive() {
                 Ok(Some(message)) => {
@@ -726,187 +570,106 @@ impl Driver {
                 };
                 self.send("Runtime.evaluate", json!({"expression": expression}), false)?;
             }
-            Request::Pointer(pointer) => self.pointer(pointer)?,
-            Request::Key(key) => self.key(&key)?,
-            Request::Text(text) => {
-                self.send("Input.insertText", json!({"text": text}), false)?;
-            }
-            Request::Size(width, height, scale) => {
-                if self.size != (width, height, scale) {
-                    self.size = (width, height, scale);
-                    self.resize()?;
+            Request::Place(Some(place)) => self.place(place)?,
+            Request::Place(None) => {
+                if self.placed.take().is_some() {
+                    self.hide()?;
                 }
             }
-            Request::Shot(label) => self.photograph(label, None)?,
-            Request::Play(play) => {
-                if let Some(size) = play.size
-                    && size != self.size
-                {
-                    self.size = size;
-                    self.resize()?;
-                }
-                self.playing = play.steps.into();
-                self.inputs = play.inputs.into();
-                self.after_kept = play.after;
-                self.next_input = None;
-                self.after = None;
+            Request::Play(steps) => {
+                self.playing = steps.into();
                 self.next_step()?;
             }
         }
         Ok(())
     }
 
-    /// Shows the next step of the workflow; once none is left, does again
-    /// what the person did.
-    fn next_step(&mut self) -> Result<(), PreviewError> {
-        self.step = None;
-        match self.playing.pop_front() {
-            Some(step) => {
-                self.send("Page.navigate", json!({"url": step.path}), false)?;
-                self.step = Some((step, Instant::now()));
-            }
-            None => match self.inputs.front() {
-                Some(first) => {
-                    self.next_input = Some(Instant::now() + Duration::from_millis(first.after_ms));
-                }
-                None => {
-                    if let Some(kept) = self.after_kept.take() {
-                        self.after = Some((Instant::now(), Some(kept)));
-                    }
-                }
-            },
-        }
-        Ok(())
-    }
-
-    /// Does again the next thing the person did, and schedules the one
-    /// after; the last done, the page is photographed once settled.
-    fn input_again(&mut self) -> Result<(), PreviewError> {
-        let Some(recorded) = self.inputs.pop_front() else {
-            self.next_input = None;
+    /// Shows the window with its page at `place`, held over universe's.
+    fn place(&mut self, place: Place) -> Result<(), PreviewError> {
+        let Some(window) = self.window else {
             return Ok(());
         };
-        match recorded.input {
-            Input::Pointer(pointer) => self.pointer(pointer)?,
-            Input::Key(key) => self.key(&key)?,
-            Input::Text(text) => {
-                self.send("Input.insertText", json!({"text": text}), false)?;
+        if self.placed.is_none() {
+            self.send(
+                "Browser.setWindowBounds",
+                json!({"windowId": window, "bounds": {"windowState": "normal"}}),
+                true,
+            )?;
+            // How much of the window is its frame, where it keeps one.
+            if !self.held.can_hold() {
+                let id = self.send(
+                    "Runtime.evaluate",
+                    json!({"expression": "[outerWidth - innerWidth, outerHeight - innerHeight]", "returnByValue": true}),
+                    false,
+                )?;
+                self.pending.insert(id, Pending::Frame);
             }
         }
-        self.next_input = self
-            .inputs
-            .front()
-            .map(|next| Instant::now() + Duration::from_millis(next.after_ms));
-        if self.next_input.is_none() {
-            self.after = Some((Instant::now() + ACTED_SETTLES, self.after_kept.take()));
+        if self.holding {
+            self.holding = self.held.hold();
         }
-        Ok(())
+        self.placed = Some(place);
+        self.bounds(place)
     }
 
-    /// Photographs the step showing.
-    fn photograph_step(&mut self) -> Result<(), PreviewError> {
-        if let Some((step, _)) = self.step.take() {
-            let id = self.send("Page.captureScreenshot", json!({"format": "png"}), false)?;
-            self.pending.insert(
-                id,
-                Pending::Shot {
-                    label: step.label,
-                    kept: step.kept,
-                    step: true,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Photographs the page under `label`, to be compared with `kept`.
-    fn photograph(&mut self, label: String, kept: Option<PathBuf>) -> Result<(), PreviewError> {
-        let id = self.send("Page.captureScreenshot", json!({"format": "png"}), false)?;
-        self.pending.insert(
-            id,
-            Pending::Shot {
-                label,
-                kept,
-                step: false,
-            },
-        );
-        Ok(())
-    }
-
-    fn pointer(&mut self, pointer: Pointer) -> Result<(), PreviewError> {
-        let name = |button: Button| match button {
-            Button::None => "none",
-            Button::Left => "left",
-            Button::Middle => "middle",
-            Button::Right => "right",
+    /// Sets the window's bounds for its page to be at `place`, its frame
+    /// above and around it.
+    fn bounds(&mut self, place: Place) -> Result<(), PreviewError> {
+        let Some(window) = self.window else {
+            return Ok(());
         };
-        let params = match pointer {
-            Pointer::Move { x, y } => json!({"type": "mouseMoved", "x": x, "y": y}),
-            Pointer::Press {
-                x,
-                y,
-                button,
-                clicks,
-            } => {
-                json!({"type": "mousePressed", "x": x, "y": y, "button": name(button), "buttons": 1, "clickCount": clicks})
-            }
-            Pointer::Release {
-                x,
-                y,
-                button,
-                clicks,
-            } => {
-                json!({"type": "mouseReleased", "x": x, "y": y, "button": name(button), "clickCount": clicks})
-            }
-            Pointer::Wheel { x, y, dx, dy } => {
-                json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy})
-            }
-        };
-        self.send("Input.dispatchMouseEvent", params, false)?;
-        Ok(())
-    }
-
-    fn key(&mut self, key: &Key) -> Result<(), PreviewError> {
-        let modifiers = key.modifiers.bits();
-        let mut down = json!({
-            "type": if key.text.is_some() { "keyDown" } else { "rawKeyDown" },
-            "key": key.key, "code": key.code,
-            "windowsVirtualKeyCode": key.number, "nativeVirtualKeyCode": key.number,
-            "modifiers": modifiers,
-        });
-        if let Some(text) = &key.text {
-            down["text"] = Value::String(text.clone());
-            down["unmodifiedText"] = Value::String(text.clone());
-        }
-        self.send("Input.dispatchKeyEvent", down, false)?;
+        let (wider, taller) = self.frame;
+        let side = wider / 2;
         self.send(
-            "Input.dispatchKeyEvent",
-            json!({"type": "keyUp", "key": key.key, "code": key.code, "windowsVirtualKeyCode": key.number, "nativeVirtualKeyCode": key.number, "modifiers": modifiers}),
-            false,
+            "Browser.setWindowBounds",
+            json!({"windowId": window, "bounds": {
+                "left": place.left - side,
+                "top": place.top - (taller - side).max(0),
+                "width": i64::from(place.width) + i64::from(wider),
+                "height": i64::from(place.height) + i64::from(taller),
+            }}),
+            true,
         )?;
         Ok(())
     }
 
-    /// Tells what a message of the browser says.
+    fn hide(&mut self) -> Result<(), PreviewError> {
+        if let Some(window) = self.window {
+            self.send(
+                "Browser.setWindowBounds",
+                json!({"windowId": window, "bounds": {"windowState": "minimized"}}),
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shows the next step of the workflow, if one is left.
+    fn next_step(&mut self) -> Result<(), PreviewError> {
+        self.step = None;
+        if let Some(address) = self.playing.pop_front() {
+            self.send("Page.navigate", json!({"url": address}), false)?;
+            self.step = Some(Instant::now());
+        }
+        Ok(())
+    }
+
     fn told(&mut self, message: &Value) -> Result<(), PreviewError> {
         if let Some(id) = message["id"].as_u64() {
-            if let Some(Pending::Shot { label, kept, step }) = self.pending.remove(&id) {
-                let png = message["result"]["data"]
-                    .as_str()
-                    .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-                    .unwrap_or_default();
-                if let Some(kept) = kept {
-                    let changed = std::fs::read(&kept)
-                        .ok()
-                        .and_then(|was| crate::kept::difference(&was, &png));
-                    (self.sink)(Event::Compared {
-                        label: label.clone(),
-                        changed,
-                    });
-                }
-                (self.sink)(Event::Shot { label, png });
-                if step {
-                    self.next_step()?;
+            if let Some(Pending::Frame) = self.pending.remove(&id) {
+                let value = &message["result"]["result"]["value"];
+                let thickness = |i: usize| {
+                    value[i]
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .unwrap_or(0)
+                        .max(0)
+                };
+                self.frame = (thickness(0), thickness(1));
+                if self.frame != (0, 0)
+                    && let Some(place) = self.placed
+                {
+                    self.bounds(place)?;
                 }
             }
             return Ok(());
@@ -931,31 +694,6 @@ impl Driver {
                     (self.sink)(Event::Console(format!(
                         "Kept from leaving this machine: the page went to {url}"
                     )));
-                }
-            }
-            "Page.screencastFrame" => {
-                let decoded = params["data"]
-                    .as_str()
-                    .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-                    .and_then(|jpeg| {
-                        image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()
-                    });
-                // Taken: the next may come.
-                self.send(
-                    "Page.screencastFrameAck",
-                    json!({"sessionId": params["sessionId"]}),
-                    false,
-                )?;
-                if let Some(picture) = decoded {
-                    let rgba = picture.to_rgba8();
-                    self.frames += 1;
-                    self.last_frame = Some(Instant::now());
-                    (self.sink)(Event::Frame(Frame {
-                        width: rgba.width(),
-                        height: rgba.height(),
-                        rgba: rgba.into_raw(),
-                        seq: self.frames,
-                    }));
                 }
             }
             "Page.frameNavigated" => {
@@ -993,10 +731,9 @@ impl Driver {
                     (self.sink)(Event::Quiet);
                     if self
                         .step
-                        .as_ref()
-                        .is_some_and(|(_, since)| since.elapsed() > STEP_SETTLES)
+                        .is_some_and(|since| since.elapsed() > STEP_SETTLES)
                     {
-                        self.photograph_step()?;
+                        self.next_step()?;
                     }
                 }
             }
@@ -1009,18 +746,8 @@ impl Driver {
                 (self.sink)(Event::Console(first_lines(text)));
             }
             "Runtime.consoleAPICalled" if params["type"] == "error" => {
-                let text: Vec<String> = params["args"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| {
-                        a["value"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .or_else(|| a["description"].as_str().map(str::to_owned))
-                    })
-                    .collect();
-                (self.sink)(Event::Console(first_lines(&text.join(" "))));
+                let args = params["args"].as_array().map_or(&[][..], Vec::as_slice);
+                (self.sink)(Event::Console(first_lines(&console_text(args))));
             }
             "Log.entryAdded" if params["entry"]["level"] == "error" => {
                 let entry = &params["entry"];
@@ -1043,10 +770,64 @@ impl Driver {
                 };
                 (self.sink)(Event::Console(first_lines(&said)));
             }
+            // Its window closed: the browser is gone with it.
+            "Target.detachedFromTarget" if params["sessionId"].as_str() == Some(&self.session) => {
+                (self.sink)(Event::Gone);
+            }
             _ => {}
         }
         Ok(())
     }
+}
+
+/// What a call to `console.error` printed: its first argument's `%s`,
+/// `%d`, `%o` and the like each given the next argument, as the console
+/// shows it, then the arguments left.
+fn console_text(args: &[Value]) -> String {
+    let shown = |arg: &Value| {
+        arg["value"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| arg["value"].as_number().map(ToString::to_string))
+            .or_else(|| arg["description"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let Some((first, rest)) = args.split_first() else {
+        return String::new();
+    };
+    let Some(format) = first["value"].as_str() else {
+        return args.iter().map(shown).collect::<Vec<_>>().join(" ");
+    };
+    let mut rest = rest.iter();
+    let mut text = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            text.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('s' | 'd' | 'i' | 'f' | 'o' | 'O') => {
+                chars.next();
+                text.push_str(&rest.next().map(shown).unwrap_or_default());
+            }
+            // Styles, which a line of text does without.
+            Some('c') => {
+                chars.next();
+                rest.next();
+            }
+            Some('%') => {
+                chars.next();
+                text.push('%');
+            }
+            _ => text.push('%'),
+        }
+    }
+    for arg in rest {
+        text.push(' ');
+        text.push_str(&shown(arg));
+    }
+    text
 }
 
 /// An address of this machine as its path: `/v1/products/?page=2`.
@@ -1086,11 +867,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_page_stays_on_this_machine() {
+    fn only_this_machine_s_pages_load() {
         assert!(stays_here("http://127.0.0.1:3000/dashboard"));
         assert!(stays_here("http://localhost:5173/"));
+        assert!(stays_here("http://[::1]:8000/"));
         assert!(stays_here("http://app.localhost/"));
-        assert!(stays_here("http://[::1]:3000/"));
         assert!(stays_here("about:blank"));
         assert!(stays_here("data:text/html,hi"));
         assert!(!stays_here("https://shop.example.com/dashboard"));
@@ -1109,21 +890,20 @@ mod tests {
     }
 
     #[test]
-    fn keys_as_the_protocol_names_them() {
-        let enter = Key::named("Enter", Modifiers::default()).unwrap();
-        assert_eq!((enter.number, enter.text.as_deref()), (13, Some("\r")));
-        assert!(Key::named("F13", Modifiers::default()).is_none());
-        let select = Key::shortcut(
-            'a',
-            Modifiers {
-                ctrl: true,
-                ..Modifiers::default()
-            },
-        );
+    fn a_console_line_reads_as_the_console_shows_it() {
+        let args = [
+            json!({"type": "string", "value": "Mounting a new %s while <%s> is: %o%c."}),
+            json!({"type": "string", "value": "html"}),
+            json!({"type": "string", "value": "html"}),
+            json!({"type": "object", "description": "TypeError: x is null"}),
+            json!({"type": "string", "value": "color: red"}),
+            json!({"type": "number", "value": 3}),
+        ];
         assert_eq!(
-            (select.code.as_str(), select.number, select.modifiers.bits()),
-            ("KeyA", 65, 2)
+            console_text(&args),
+            "Mounting a new html while <html> is: TypeError: x is null. 3"
         );
-        assert_eq!(Key::shortcut('1', Modifiers::default()).code, "Digit1");
+        assert_eq!(console_text(&[json!({"type": "number", "value": 7})]), "7");
+        assert_eq!(console_text(&[]), "");
     }
 }

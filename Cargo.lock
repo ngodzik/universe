@@ -5834,6 +5834,7 @@ dependencies = [
  "bevy_egui",
  "egui_plot",
  "image",
+ "raw-window-handle",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -5878,14 +5879,13 @@ dependencies = [
 name = "universe-preview"
 version = "0.1.0"
 dependencies = [
- "base64",
- "image",
  "regex",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tungstenite",
+ "x11rb",
  "yaml-rust2",
 ]
 

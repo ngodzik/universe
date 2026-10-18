@@ -461,13 +461,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn it_is_ready_once_its_port_answers_and_says_why_it_stopped() {
-        let port = free_port().unwrap();
+        // A server of its own stands in for the front end's, its port
+        // taken at once: one only found free may be another test's by now.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
         let said: Arc<Mutex<Vec<String>>> = Arc::default();
         let kept = Arc::clone(&said);
         let lines: Arc<dyn Fn(String) + Send + Sync> =
             Arc::new(move |l| kept.lock().unwrap().push(l));
-        // A server of its own stands in for the front end's.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         let run = Run {
             folder: std::env::temp_dir(),
             command: Some("echo starting on {port}; sleep 30".to_owned()),

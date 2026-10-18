@@ -533,12 +533,16 @@ fn drive<M, D>(
     if window.title != title {
         window.title = title;
     }
-    // The page of the App view moves as it is used: its frames are drawn
-    // as they come, while it shows.
-    let page = shell.app.map_view() == Some(MapView::App) && shell.app.app_preview().is_on();
-    let wait = if page {
+    // The App view's wait moves until its first page has loaded; then
+    // Chrome draws the page, and the pilot only follows what it tells.
+    let app_view = shell.app.map_view() == Some(MapView::App);
+    let preview = shell.app.app_preview();
+    let wait = if app_view && preview.is_on() && !preview.page_shown() {
         FRAME_WAIT
-    } else if shell.app.is_running() || shell.app.docker().is_some() {
+    } else if (app_view && preview.is_on())
+        || shell.app.is_running()
+        || shell.app.docker().is_some()
+    {
         BUSY_WAIT
     } else if shell.app.mode() != Mode::Normal {
         BLINK
@@ -820,6 +824,38 @@ where
     );
     shell.plan.take_read(now);
     shell.app_view.update(&shell.plan, &mut shell.app);
+    // Where this window is, for Chrome's to show the App view's page over
+    // it; hidden with the view.
+    shell.app_view.screen = window.single().ok().and_then(|entity| {
+        bevy::winit::WINIT_WINDOWS.with_borrow(|windows| {
+            windows.get_window(entity).map(|w| {
+                use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+                let at = w.inner_position().ok();
+                let parent = w.window_handle().ok().and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Xlib(x) => {
+                        #[allow(
+                            clippy::useless_conversion,
+                            reason = "an X11 window's number is a u64 on 64-bit systems only"
+                        )]
+                        let id = u64::try_from(x.window).ok();
+                        id
+                    }
+                    RawWindowHandle::Xcb(x) => Some(u64::from(x.window.get())),
+                    _ => None,
+                });
+                app_view::Screen {
+                    left: at.map_or(0.0, |p| f64::from(p.x)),
+                    top: at.map_or(0.0, |p| f64::from(p.y)),
+                    scale: w.scale_factor(),
+                    minimized: w.is_minimized().unwrap_or(false) || at.is_none(),
+                    parent,
+                }
+            })
+        })
+    });
+    if view != Some(MapView::App) {
+        app_view::hidden(&mut shell.app, &mut shell.effects);
+    }
     if view == Some(MapView::Database) {
         shell.database.update(&shell.plan);
     }

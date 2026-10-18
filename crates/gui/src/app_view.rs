@@ -1,6 +1,7 @@
-//! The App view: the project's front end running in a headless browser
-//! against a back end simulated from its spec. Its page on the left, live,
-//! given the person's pointer, wheel and, once clicked, keys; on the right
+//! The App view: the project's front end running in the system's Chrome
+//! against a back end simulated from its spec. Its page on the left, in
+//! Chrome's own window held over this one's, used there as in any
+//! browser; the wait drawn until its first page has loaded. On the right
 //! the pilot, sized by its edge and hidden or shown again with Ctrl-J or
 //! its tab: how the front end runs, the states the back end answers in,
 //! the workflows to show step by step, the screens, the calls of the page
@@ -12,13 +13,12 @@
 use std::path::{Path, PathBuf};
 
 use bevy_egui::egui::{
-    self, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Id, Layout, Margin,
-    PointerButton, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin, Rect,
+    RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 use universe_codemap::{Cache, CodeMap, FrontEnd, Workflow, cache_folder, example_url};
-use universe_preview::{Answer, Button, Pointer, Source, Status};
-use universe_ui::app_preview::{Change, Shown};
+use universe_preview::{Answer, Source, Status};
+use universe_ui::app_preview::Change;
 use universe_ui::{App, Effect};
 
 use crate::plan::Plan;
@@ -48,20 +48,29 @@ pub(crate) struct AppView {
     from_read: Option<u64>,
     /// The front end chosen, by its place.
     chosen: usize,
-    /// The page's texture, and the frame it holds.
-    page: Option<(u64, TextureHandle)>,
-    /// The photographs of a workflow's steps, as textures.
-    shots: Vec<TextureHandle>,
     /// The call open in the pilot, by its place among the calls.
     open_call: Option<u64>,
-    /// Where the pointer was last said to be on the page.
-    pointer: Option<Pos2>,
     /// The pilot's width while its edge is dragged.
     dragged: Option<f32>,
-    /// The room for the page, in its pixels, and the scale it is drawn at.
-    room: (u32, u32, f32),
     /// How the chosen front end runs: its folder, its command, its spec.
     how: Option<(String, String, String)>,
+    /// Where universe's window is on the screen, as the window last said.
+    pub(crate) screen: Option<Screen>,
+}
+
+/// Where universe's window is on the screen, for Chrome's to be placed
+/// over its page area.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Screen {
+    /// The top left of what it draws, in the screen's pixels.
+    pub(crate) left: f64,
+    pub(crate) top: f64,
+    /// The screen's pixels to a device-independent one.
+    pub(crate) scale: f64,
+    /// Whether it is minimized: Chrome's window then hides too.
+    pub(crate) minimized: bool,
+    /// Its window on X11, which Chrome's is held over.
+    pub(crate) parent: Option<u64>,
 }
 
 impl AppView {
@@ -77,13 +86,10 @@ impl AppView {
             fronts,
             from_read: None,
             chosen: 0,
-            page: None,
-            shots: Vec::new(),
             open_call: None,
-            pointer: None,
             dragged: None,
-            room: (1280, 800, 1.0),
             how: None,
+            screen: None,
         }
     }
 
@@ -276,30 +282,21 @@ fn status_line(app: &App) -> String {
         Some(Status::Starting { api, line }) => {
             format!("Starting `{line}`, its API simulated on port {api}…")
         }
-        Some(Status::Opening) => "Opening it in the browser…".to_owned(),
-        Some(Status::Running { .. }) if preview.is_focused() => {
-            "The keys go to the page: Esc gives them back".to_owned()
+        Some(Status::Opening) => "Opening it in Chrome…".to_owned(),
+        Some(Status::Running { .. }) if !preview.page_shown() => {
+            format!("Building {}…", preview.loading_page())
         }
         Some(Status::Running { address }) => {
-            format!("Running at {address}, its API simulated: click the page to use it")
+            format!("Running at {address}, its API simulated: use the page as in any browser")
         }
         Some(Status::Failed(why)) => format!("Stopped: {}", why.lines().next().unwrap_or_default()),
         Some(Status::Stopped) => "Stopped".to_owned(),
     }
 }
 
-/// The page, live: its last frame, given the person's pointer and wheel.
-fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mut Vec<Effect>) {
-    let scale = ui.pixels_per_point();
-    // The page is as large as the room for it, in its own pixels.
-    view.room = (
-        area.width().round() as u32,
-        area.height().round() as u32,
-        scale,
-    );
-    if let Some(effect) = app.app_size(view.room.0, view.room.1, scale) {
-        effects.push(effect);
-    }
+/// The page: Chrome's window over this area once its first page has
+/// loaded, the wait drawn until then.
+fn page(ui: &mut Ui, view: &AppView, area: Rect, app: &mut App, effects: &mut Vec<Effect>) {
     let preview = app.app_preview();
     let painter = ui.painter_at(area);
     painter.rect_filled(area, CornerRadius::same(8), Color32::from_rgb(8, 9, 12));
@@ -308,7 +305,7 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
             Some(Status::Failed(why)) => ("It stopped", why.clone()),
             _ => (
                 "Not running",
-                "Start it in the pilot, on the right".to_owned(),
+                "Start it in the pilot, on the right: the page opens here, in Chrome".to_owned(),
             ),
         };
         painter.text(
@@ -331,173 +328,47 @@ fn page(ui: &mut Ui, view: &mut AppView, area: Rect, app: &mut App, effects: &mu
         );
         return;
     }
-    // A blank frame is never drawn: what the page showed last, there or
-    // before, shows as it loads; nothing yet, the wait is drawn instead.
-    let (frame, stale) = match preview.shown() {
-        Shown::Live(frame) => (frame, false),
-        Shown::Stale(frame) => (frame, true),
-        Shown::Waiting => {
-            let deep = app.bullets() != universe_ui::markdown::Bullets::Plain;
-            waiting(ui, &painter, area, app, deep);
-            ui.ctx().request_repaint();
-            return;
-        }
-    };
-    // The frame's texture, made again only for another frame.
-    let size = [frame.width as usize, frame.height as usize];
-    match &mut view.page {
-        Some((seq, texture)) if *seq != frame.seq => {
-            texture.set(
-                ColorImage::from_rgba_unmultiplied(size, &frame.rgba),
-                TextureOptions::LINEAR,
-            );
-            *seq = frame.seq;
-        }
-        Some(_) => {}
-        None => {
-            let texture = ui.ctx().load_texture(
-                "app-page",
-                ColorImage::from_rgba_unmultiplied(size, &frame.rgba),
-                TextureOptions::LINEAR,
-            );
-            view.page = Some((frame.seq, texture));
-        }
-    }
-    // Drawn whole, its sides kept, at its own size when there is room.
-    let points = vec2(frame.width as f32, frame.height as f32) / scale;
-    let fit = (area.width() / points.x)
-        .min(area.height() / points.y)
-        .min(1.0);
-    let drawn = Rect::from_min_size(area.min, points * fit);
-    if let Some((_, texture)) = &view.page {
-        painter.image(
-            texture.id(),
-            drawn,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-    }
-    // A load of more than a moment says so, over what shows meanwhile; a
-    // quick one shows nothing, so that nothing flickers.
-    if let Some(waited) = preview.loading_for()
-        && waited > std::time::Duration::from_millis(500)
-    {
-        if stale {
-            painter.rect_filled(drawn, CornerRadius::same(2), Color32::from_black_alpha(90));
-        }
-        let said = format!(
-            "Loading {} · {:.0} s{}",
-            preview.loading_page(),
-            waited.as_secs_f32(),
-            if stale { " · as it last showed" } else { "" }
-        );
-        let galley = painter.layout_no_wrap(said, FontId::proportional(12.0), TEXT);
-        let chip = Rect::from_min_size(
-            pos2(drawn.max.x - galley.size().x - 26.0, drawn.min.y + 10.0),
-            galley.size() + vec2(16.0, 8.0),
-        );
-        painter.rect_filled(
-            chip,
-            CornerRadius::same(6),
-            Color32::from_rgba_unmultiplied(16, 19, 26, 230),
-        );
-        let dot = (ui.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5;
-        painter.circle_filled(
-            chip.left_center() + vec2(-8.0, 0.0),
-            3.0,
-            ACCENT.gamma_multiply(0.4 + dot * 0.6),
-        );
-        painter.galley(chip.min + vec2(8.0, 4.0), galley, TEXT);
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(100));
-    }
-    let focused = preview.is_focused();
-    painter.rect_stroke(
-        drawn,
-        CornerRadius::same(2),
-        Stroke::new(
-            if focused { 2.0 } else { 1.0 },
-            if focused { ACCENT } else { EDGE },
-        ),
-        StrokeKind::Inside,
-    );
-
-    // Where on the page, in its own pixels.
-    let on_page = |at: Pos2| -> (f32, f32) {
-        let x = (at.x - drawn.min.x) / drawn.width() * points.x;
-        let y = (at.y - drawn.min.y) / drawn.height() * points.y;
-        (x, y)
-    };
-    let response = ui.interact(drawn, Id::new("app-page"), Sense::click_and_drag());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::Default);
-    }
-    let input = ui.input(|i| {
-        (
-            i.pointer.hover_pos(),
-            i.pointer.button_pressed(PointerButton::Primary),
-            i.pointer.button_released(PointerButton::Primary),
-            i.pointer.button_pressed(PointerButton::Secondary),
-            i.pointer.button_released(PointerButton::Secondary),
-            i.pointer.button_double_clicked(PointerButton::Primary),
-            i.smooth_scroll_delta,
-        )
-    });
-    let (hover, pressed, released, menu_pressed, menu_released, double, scroll) = input;
-    let Some(at) = hover.filter(|p| drawn.contains(*p) || response.dragged()) else {
-        view.pointer = None;
+    if !preview.page_shown() {
+        let deep = app.bullets() != universe_ui::markdown::Bullets::Plain;
+        waiting(ui, &painter, area, app, deep);
+        ui.ctx().request_repaint();
         return;
-    };
-    let (x, y) = on_page(at);
-    let mut send = |pointer: Pointer| {
-        if let Some(effect) = app.app_pointer(pointer) {
-            effects.push(effect);
-        }
-    };
-    if view.pointer != Some(at) {
-        view.pointer = Some(at);
-        send(Pointer::Move { x, y });
     }
-    let clicks = if double { 2 } else { 1 };
-    if pressed {
-        send(Pointer::Press {
-            x,
-            y,
-            button: Button::Left,
-            clicks,
-        });
+    // Under Chrome's window, seen only while it catches up with a move.
+    painter.text(
+        area.center(),
+        Align2::CENTER_CENTER,
+        "The page shows here, in Chrome",
+        FontId::proportional(14.0),
+        DIM,
+    );
+    let place = view
+        .screen
+        .filter(|screen| !screen.minimized)
+        .map(|screen| place(area, ui.pixels_per_point(), screen));
+    if let Some(effect) = app.app_place(place) {
+        effects.push(effect);
     }
-    if released {
-        send(Pointer::Release {
-            x,
-            y,
-            button: Button::Left,
-            clicks,
-        });
+}
+
+/// Where Chrome's page goes for this area to show it: from the window's
+/// points to the screen's pixels, then to its device-independent ones.
+fn place(area: Rect, pixels_per_point: f32, screen: Screen) -> universe_preview::Place {
+    let pixels = |points: f32| f64::from(points) * f64::from(pixels_per_point);
+    let scale = screen.scale.max(0.1);
+    let dip = |pixels: f64| (pixels / scale).round();
+    universe_preview::Place {
+        left: dip(screen.left + pixels(area.min.x)) as i32,
+        top: dip(screen.top + pixels(area.min.y)) as i32,
+        width: dip(pixels(area.width())).max(1.0) as u32,
+        height: dip(pixels(area.height())).max(1.0) as u32,
     }
-    if menu_pressed {
-        send(Pointer::Press {
-            x,
-            y,
-            button: Button::Right,
-            clicks: 1,
-        });
-    }
-    if menu_released {
-        send(Pointer::Release {
-            x,
-            y,
-            button: Button::Right,
-            clicks: 1,
-        });
-    }
-    if scroll != egui::Vec2::ZERO && drawn.contains(at) {
-        send(Pointer::Wheel {
-            x,
-            y,
-            dx: -scroll.x,
-            dy: -scroll.y,
-        });
+}
+
+/// The App view is not shown: Chrome's window hides with it.
+pub(crate) fn hidden(app: &mut App, effects: &mut Vec<Effect>) {
+    if let Some(effect) = app.app_place(None) {
+        effects.push(effect);
     }
 }
 
@@ -872,12 +743,11 @@ fn running(
             && ui
                 .button(RichText::new("▶ Start").color(GREEN))
                 .on_hover_text(format!(
-                    "Runs its front end ({}), a back end simulated from its spec, and a headless browser: How it runs, at the bottom, says how",
+                    "Runs its front end ({}), a back end simulated from its spec, and Chrome over this view: How it runs, at the bottom, says how",
                     view.how.as_ref().map_or("", |(_, line, _)| line.as_str())
                 ))
                 .clicked()
         {
-            view.page = None;
             effects.push(app.start_app(config));
         }
     });
@@ -988,19 +858,12 @@ fn config(
             .map(|b| cache_folder(b, root).join("app-fixtures")),
         cookies,
         start: example_url(&start_route(front)),
-        size: view.room,
         leftovers: view
             .base
             .as_ref()
             .map(|b| universe_preview::leftovers_file(b, root)),
-        tests: view
-            .base
-            .as_ref()
-            .map(|b| cache_folder(b, root).join("app-tests")),
-        pages: view
-            .base
-            .as_ref()
-            .map(|b| cache_folder(b, root).join("app-pages")),
+        shown: true,
+        parent: view.screen.and_then(|screen| screen.parent),
     })
 }
 
@@ -1058,13 +921,6 @@ fn address(ui: &mut Ui, app: &mut App, effects: &mut Vec<Effect>) {
             .clicked()
         {
             push(app.app_reload());
-        }
-        if ui
-            .small_button("📷")
-            .on_hover_text("Photograph the page")
-            .clicked()
-        {
-            push(app.app_shoot("page"));
         }
     });
 }
@@ -1147,7 +1003,7 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
     };
     heading(ui, &format!("WORKFLOWS · {}", front.workflows.len()));
     if let Some(playing) = app.app_preview().playing().cloned() {
-        let done = app.app_preview().shots().len();
+        let done = playing.shown;
         egui::Frame::NONE
             .fill(RAISED)
             .corner_radius(CornerRadius::same(6))
@@ -1173,8 +1029,6 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                         format!("✓ {} {} called", playing.method, playing.path),
                         GREEN,
                     )
-                } else if done >= playing.steps.len() && playing.replay.is_some() {
-                    ("Doing again what was done on the page…".to_owned(), DIM)
                 } else if done >= playing.steps.len() {
                     (
                         format!(
@@ -1187,24 +1041,8 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                     ("Showing its screens…".to_owned(), DIM)
                 };
                 ui.label(RichText::new(said).size(12.0).color(colour));
-                if playing.replay.is_some() {
-                    compared(ui, app);
-                }
-                shots(ui, view, app);
-                if app.app_preview().shown_whole()
-                    && ui
-                        .button(RichText::new("Keep as a test").size(12.0))
-                        .on_hover_text(
-                            "Its screens, the state, and what you did on the page since its last screen showed: shown again, each screen is compared with these and what you did is done again",
-                        )
-                        .clicked()
-                    && let Some(effect) = app.app_keep_test()
-                {
-                    effects.push(effect);
-                }
             });
     }
-    kept_tests(ui, app, effects);
     let mut groups: Vec<(&str, Vec<&Workflow>)> = Vec::new();
     for flow in &front.workflows {
         match groups.iter_mut().find(|(g, _)| *g == flow.group) {
@@ -1242,7 +1080,6 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                         .filter_map(|&s| front.screens.get(s))
                         .map(|s| (s.route.clone(), example_url(&s.route)))
                         .collect();
-                    view.shots.clear();
                     if let Some(effect) =
                         app.app_play(&flow.name, (&flow.method, &flow.path), steps)
                     {
@@ -1252,115 +1089,6 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
             }
         });
     }
-}
-
-/// How the test shown again compared with what was kept: each screen, and
-/// whether its action was called again.
-fn compared(ui: &mut Ui, app: &App) {
-    let preview = app.app_preview();
-    for (label, changed) in preview.compared() {
-        let (said, colour) = match changed {
-            Some(c) if *c < 0.01 => ("✓ the same".to_owned(), GREEN),
-            Some(c) => (format!("≠ {:.0}% changed", c * 100.0), YELLOW),
-            None => ("no picture to compare".to_owned(), DIM),
-        };
-        ui.label(
-            RichText::new(format!("{label}: {said}"))
-                .size(11.5)
-                .color(colour),
-        );
-    }
-    let Some(playing) = preview.playing() else {
-        return;
-    };
-    let expected = playing
-        .replay
-        .and_then(|i| preview.tests().get(i))
-        .is_some_and(|k| k.test.acted);
-    let ended = preview.compared().iter().any(|(label, _)| label == "after");
-    if expected && ended {
-        let (said, colour) = if playing.acted {
-            (
-                format!("✓ {} {} called again", playing.method, playing.path),
-                GREEN,
-            )
-        } else {
-            (
-                format!("✗ {} {} not called this time", playing.method, playing.path),
-                RED,
-            )
-        };
-        ui.label(RichText::new(said).size(12.0).color(colour));
-    }
-}
-
-/// The workflows kept as tests, each shown again by a click.
-fn kept_tests(ui: &mut Ui, app: &mut App, effects: &mut Vec<Effect>) {
-    let tests: Vec<(String, usize, bool)> = app
-        .app_preview()
-        .tests()
-        .iter()
-        .map(|k| (k.test.name.clone(), k.test.steps.len(), k.test.acted))
-        .collect();
-    if tests.is_empty() {
-        return;
-    }
-    heading(ui, &format!("KEPT TESTS · {}", tests.len()));
-    let running = app.app_preview().is_running();
-    for (i, (name, steps, acted)) in tests.into_iter().enumerate() {
-        ui.horizontal(|ui| {
-            let shown = ui
-                .add_enabled(
-                    running,
-                    egui::Button::new(RichText::new("▶").size(11.0)).small(),
-                )
-                .on_hover_text(
-                    "Show it again: its screens compared with those kept, what was done done again",
-                );
-            if shown.clicked()
-                && let Some(effect) = app.app_replay(i)
-            {
-                effects.push(effect);
-            }
-            let what = if acted { "acts" } else { "screens only" };
-            ui.label(
-                RichText::new(format!("{name} · {steps} screens · {what}"))
-                    .size(12.0)
-                    .color(TEXT),
-            );
-        });
-    }
-}
-
-/// The photographs of a workflow's steps, small, side by side.
-fn shots(ui: &mut Ui, view: &mut AppView, app: &App) {
-    let shots = app.app_preview().shots();
-    while view.shots.len() < shots.len() {
-        let shot = &shots[view.shots.len()];
-        let Ok(picture) = image::load_from_memory_with_format(&shot.png, image::ImageFormat::Png)
-        else {
-            break;
-        };
-        let rgba = picture.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        view.shots.push(ui.ctx().load_texture(
-            format!("app-shot-{}", view.shots.len()),
-            ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
-            TextureOptions::LINEAR,
-        ));
-    }
-    if view.shots.is_empty() {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        for (texture, shot) in view.shots.iter().zip(shots) {
-            let [w, h] = texture.size();
-            let width = 100.0;
-            let size = vec2(width, width * h as f32 / w.max(1) as f32);
-            ui.add(egui::Image::new((texture.id(), size)).corner_radius(3))
-                .on_hover_text(&shot.label);
-        }
-    });
 }
 
 /// The screens, each opened by a click.
@@ -1558,4 +1286,49 @@ fn errors(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_s_page_goes_over_the_area_whatever_the_scales() {
+        let area = Rect::from_min_size(pos2(12.0, 92.0), vec2(1000.0, 700.0));
+        let screen = Screen {
+            left: 50.0,
+            top: 40.0,
+            scale: 1.0,
+            minimized: false,
+            parent: None,
+        };
+        assert_eq!(
+            place(area, 1.0, screen),
+            universe_preview::Place {
+                left: 62,
+                top: 132,
+                width: 1000,
+                height: 700
+            }
+        );
+        // Text drawn larger: more of the screen's pixels for each point.
+        let larger = place(area, 1.25, screen);
+        assert_eq!((larger.left, larger.width), (65, 1250));
+        // A screen of two pixels to the point, which Chrome counts as one.
+        let dense = Screen {
+            left: 100.0,
+            top: 80.0,
+            scale: 2.0,
+            ..screen
+        };
+        assert_eq!(
+            place(area, 2.0, dense),
+            universe_preview::Place {
+                left: 62,
+                top: 132,
+                width: 1000,
+                height: 700
+            }
+        );
+    }
 }
