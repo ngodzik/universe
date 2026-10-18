@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use universe_core::McpServer;
 
 use crate::backdrop::{Motion, Pattern};
+use crate::markdown::Bullets;
 use serde::{Deserialize, Serialize};
 
 /// What a new session starts with, unless the command line says otherwise.
@@ -118,6 +119,9 @@ pub struct Defaults {
     /// Whether it moves: still (unsaid) or slow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_motion: Option<Motion>,
+    /// How a reply's bullets are drawn: 3d (unsaid), planets or plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bullets: Option<Bullets>,
     /// The folders a new conversation may work in, `~` allowed: asked at
     /// the start, the first chosen. Set in the file only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -133,6 +137,9 @@ pub struct Defaults {
     pub summarize_when_cold: Vec<String>,
     /// MCP servers, `[mcp.<name>]`, each a `url` (with `headers`) or a
     /// `command` (with `env`). Set in the file only: it may hold tokens.
+    /// Behind a proxy that signs TLS again, as some company networks do, a
+    /// server started with `npx` needs `NODE_EXTRA_CA_CERTS` in its `env`,
+    /// the path of the proxy's certificate.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
     /// Ticket trackers, `[trackers.<name>]`, each read through an MCP
@@ -387,6 +394,7 @@ mod tests {
             cache_ttl: Some(CacheTtl::OneHour),
             background: Some(Pattern::Rain),
             background_motion: Some(Motion::Slow),
+            bullets: Some(Bullets::Planets),
             workspaces: vec!["~/code/shop".into()],
             context_warning: Some(90),
             summarize_when_cold: vec!["b/strong".into()],
@@ -405,6 +413,7 @@ mod tests {
                     issue: "get_issue".into(),
                     comments: None,
                     argument: "id".into(),
+                    comments_argument: Some("issueId".into()),
                     ids: "[A-Z]+-[0-9]+".into(),
                     hosts: vec!["issues.example.com".into()],
                 },

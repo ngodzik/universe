@@ -460,6 +460,7 @@ async fn interface(
             pattern: defaults.background,
             motion: defaults.background_motion.unwrap_or_default(),
         },
+        bullets: defaults.bullets.unwrap_or_default(),
         provider: provider.name(),
         detect_checks,
         notes,
@@ -843,6 +844,8 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        // Shown once it ran.
+        Event::Running { .. } => {}
         Event::Command {
             command,
             status,

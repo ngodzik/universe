@@ -20,6 +20,7 @@ pub mod defaults;
 pub mod diagrams;
 pub mod diff_stream;
 pub mod editor;
+pub mod flight;
 mod guides;
 mod highlight;
 mod host;

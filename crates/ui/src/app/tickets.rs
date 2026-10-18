@@ -2,7 +2,7 @@
 //! was verified elsewhere, checks progress; the pane (Ctrl-L) shows them,
 //! and a click on an item or a file shows its pieces of the diff.
 
-use super::{App, Effect};
+use super::{App, Effect, Entry, TicketsJob};
 use crate::tickets::{Progress, Ticket, Tickets};
 use universe_core::ModelId;
 
@@ -13,6 +13,8 @@ pub enum Shown {
     Item(usize, usize),
     /// The pieces of a file.
     File(String),
+    /// The pieces several items need alike.
+    Common,
 }
 
 /// The pieces shown, and how many lines around each.
@@ -99,6 +101,7 @@ impl App {
         };
         let tracker = self.settings.trackers.get(&named.tracker)?.clone();
         let (model, candidates) = self.fresh_or_cheapest();
+        self.start_tickets_job();
         self.tickets_busy = Some(format!("Reading {}…", named.id));
         self.tickets_open = true;
         Some(Effect::ReadTicket {
@@ -117,6 +120,7 @@ impl App {
             return None;
         }
         let (model, candidates) = self.fresh_or_cheapest();
+        self.start_tickets_job();
         self.tickets_busy = Some("Checking progress…".to_owned());
         Some(Effect::CheckProgress {
             tickets: self.tickets.tickets.clone(),
@@ -124,6 +128,43 @@ impl App {
             model,
             candidates,
         })
+    }
+
+    /// The pane's calls start; while a request runs, they count with it.
+    fn start_tickets_job(&mut self) {
+        if !self.is_running() {
+            self.tickets_job = Some(TicketsJob::start());
+        }
+    }
+
+    /// The pane's calls are done: a cost line of their own, naming their
+    /// models, with the context of the last.
+    fn end_tickets_job(&mut self) {
+        let Some(job) = self.tickets_job.take() else {
+            return;
+        };
+        if job.runs.is_empty() {
+            return;
+        }
+        let mut spent = super::Spent::default();
+        let mut complete = true;
+        for (_, run) in &job.runs {
+            spent.usage += run.usage;
+            spent.cost += run.cost;
+            spent.subscription |= run.subscription;
+            // No cost, and no subscription to explain it: unknown.
+            complete &= run.cost.0 > 0.0 || run.subscription;
+        }
+        self.chat.transcript.push(Entry::Cost {
+            usage: spent.usage,
+            cost: spent.cost,
+            complete,
+            seconds: job.started.elapsed().as_secs(),
+            subscription: spent.subscription,
+            context: job.context,
+            runs: job.runs,
+            flight: crate::flight::Flight::default(),
+        });
     }
 
     /// A ticket read, or why it could not be.
@@ -152,6 +193,8 @@ impl App {
             }
             Err(why) => self.error(why),
         }
+        // Under what was said of it.
+        self.end_tickets_job();
     }
 
     /// A check of progress, or why it failed.
@@ -172,6 +215,7 @@ impl App {
             }
             Err(why) => self.error(why),
         }
+        self.end_tickets_job();
     }
 
     /// Unlinks the ticket at `at`.

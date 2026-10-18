@@ -20,9 +20,16 @@ pub(crate) struct TicketsPane {
     files: HashMap<String, (Vec<String>, LineChanges)>,
     /// The check the files were read for.
     read_for: Option<usize>,
+    /// What the pieces showed when last drawn: another starts at the top.
+    shown: Option<Shown>,
 }
 
 impl TicketsPane {
+    /// The pieces are not shown: the next shown starts at the top.
+    pub(crate) fn hidden(&mut self) {
+        self.shown = None;
+    }
+
     /// `path` as it is now, and how it differs from where the branch left
     /// the main one.
     fn file(&mut self, root: &Path, path: &str) -> &(Vec<String>, LineChanges) {
@@ -142,6 +149,43 @@ pub(crate) fn show(ui: &mut Ui, pane: &mut TicketsPane, app: &mut App, effects: 
             }
         }
     }
+    // What several items need alike, given to none of them.
+    if let Some(common) = progress.and_then(|p| p.common.as_ref()) {
+        ui.add_space(6.0);
+        let chosen = shown == Some(Shown::Common);
+        let row = Frame::new()
+            .fill(if chosen {
+                ui.visuals().selection.bg_fill
+            } else {
+                Color32::TRANSPARENT
+            })
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("◆").color(CYAN));
+                    ui.label(
+                        RichText::new("Common to several items")
+                            .size(13.0)
+                            .color(TEXT),
+                    );
+                    ui.label(RichText::new(percent(common.share)).size(11.5).color(DIM));
+                });
+            })
+            .response;
+        let row = ui
+            .interact(row.rect, ui.id().with("common"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let row = if common.why.is_empty() {
+            row
+        } else {
+            row.on_hover_text(&common.why)
+        };
+        if row.clicked() {
+            app.show_ticket_part(Shown::Common);
+        }
+    }
 
     ui.add_space(12.0);
     ui.label(RichText::new("Verified elsewhere").size(14.0).color(TEXT));
@@ -197,6 +241,7 @@ fn files(
         .iter()
         .flatten()
         .flatten()
+        .chain(&progress.common)
         .map(|p| p.share)
         .sum();
     ui.label(
@@ -249,6 +294,9 @@ fn files(
                 if !served.is_empty() {
                     ui.label(RichText::new(served.join(" ")).size(11.5).color(GREEN));
                 }
+                if file.common {
+                    ui.label(RichText::new("common").size(11.5).color(CYAN));
+                }
                 if file.unattached > 0 {
                     ui.label(
                         RichText::new(format!("{} lines serve none", file.unattached))
@@ -257,6 +305,25 @@ fn files(
                     );
                 }
             });
+        }
+    }
+    if !progress.repeats.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Lines that repeat code already in the project")
+                .size(14.0)
+                .color(TEXT),
+        );
+        for repeat in &progress.repeats {
+            let (first, last) = repeat.lines;
+            ui.label(
+                RichText::new(format!(
+                    "{}:{first}-{last} repeats {}:{}",
+                    repeat.path, repeat.found, repeat.found_line
+                ))
+                .size(12.0)
+                .color(YELLOW),
+            );
         }
     }
 }
@@ -293,6 +360,14 @@ pub(crate) fn pieces(ui: &mut Ui, pane: &mut TicketsPane, app: &mut App) {
                 .filter(|h| progress.hunks[*h].path == *path)
                 .collect(),
         ),
+        Shown::Common => (
+            "Common to several items".to_owned(),
+            progress
+                .common
+                .as_ref()
+                .map(|p| p.hunks.clone())
+                .unwrap_or_default(),
+        ),
     };
     ui.horizontal(|ui| {
         ui.label(RichText::new(&title).size(16.0).color(TEXT));
@@ -306,7 +381,13 @@ pub(crate) fn pieces(ui: &mut Ui, pane: &mut TicketsPane, app: &mut App) {
     }
     let root = app.root().to_owned();
     let mut widen = false;
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // Each item or file from its first piece, not where the last was left.
+    let mut area = egui::ScrollArea::vertical();
+    if pane.shown.as_ref() != Some(&view.shown) {
+        pane.shown = Some(view.shown.clone());
+        area = area.vertical_scroll_offset(0.0);
+    }
+    area.show(ui, |ui| {
         for h in chosen {
             let Some(piece) = progress.hunks.get(h) else {
                 continue;

@@ -32,18 +32,16 @@ pub(crate) fn show(ui: &mut Ui, app: &App, seen: &mut usize, effects: &mut Vec<E
                 ui.label(RichText::new("Sub-agent").strong().color(MAGENTA));
                 ui.label(RichText::new(sub.to.to_string()).strong().color(TEXT));
                 ui.label(RichText::new(format!("for {}", sub.from)).color(DIM));
-                let state = if sub.working {
-                    format!(
-                        "working {}",
-                        crate::SPINNER[app.spinner() % crate::SPINNER.len()]
-                    )
+                if sub.working {
+                    ui.label(RichText::new("working").color(MAGENTA));
+                    crate::orbits::working(ui);
                 } else {
-                    format!(
+                    let state = format!(
                         "done · {}",
                         transcript::plural(sub.work.len(), "step", "steps")
-                    )
-                };
-                ui.label(RichText::new(state).color(MAGENTA));
+                    );
+                    ui.label(RichText::new(state).color(MAGENTA));
+                }
                 ui.label(RichText::new(sub.spent.to_string()).small().color(DIM));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("Ctrl-T hides").small().color(DIM));

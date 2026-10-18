@@ -70,6 +70,8 @@ fn sized_window(
         .max_width(*widths.end())
         .frame(
             Frame::window(&ctx.global_style())
+                // As see-through as the window: its menus stay opaque.
+                .fill(ctx.global_style().visuals.faint_bg_color)
                 .stroke(Stroke::new(1.5, colour))
                 .inner_margin(Margin::same(18)),
         )
@@ -138,6 +140,15 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
             vec![
                 ('y', "Add it for this conversation".to_owned()),
                 ('n', "Refuse".to_owned()),
+            ],
+        ),
+        Question::Remember { .. } => (
+            CYAN,
+            "Remember this?",
+            vec![
+                ('y', "Remember it".to_owned()),
+                ('n', "No".to_owned()),
+                ('c', "Copy".to_owned()),
             ],
         ),
         Question::MoreTurns { .. } => (
@@ -223,6 +234,19 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                     path.display(),
                     folder.display()
                 ));
+            }
+            Question::Remember { rule } => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} would keep this rule for every conversation, in every project, in \
+                         your own instructions (~/.universe/instructions.md, /instructions \
+                         edits them):",
+                        approval.model
+                    ))
+                    .color(DIM),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(rule).strong().color(CYAN));
             }
             Question::MoreTurns { turns } => {
                 ui.label(format!(

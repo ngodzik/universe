@@ -15,6 +15,7 @@ mod definitions;
 mod detect;
 mod diff;
 mod docker;
+mod duplicates;
 mod error;
 mod git;
 mod gitview;
@@ -38,6 +39,7 @@ pub use definitions::{Definition, definitions, uses};
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};
+pub use duplicates::{Repeat, repeats, repeats_said};
 pub use error::ToolError;
 pub use git::{changes_text, diff_stat, is_clean, project_context, project_files, tracked_files};
 pub use gitview::{

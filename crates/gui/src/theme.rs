@@ -43,6 +43,16 @@ pub(crate) fn see(colour: Color32, opacity: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, (opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+/// `a` turned toward `b` by `t`, from 0 to 1, opaque.
+pub(crate) fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color32::from_rgb(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
+    )
+}
+
 /// A colour of the state, as egui draws it.
 pub(crate) fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
@@ -76,8 +86,26 @@ const FALLBACK_FONTS: [(&str, &str); 5] = [
     ("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
 ];
 
-/// Adds the fallback fonts the system has. One missing costs only its
-/// characters, drawn as boxes.
+/// The family bold text is drawn in: the first of [`BOLD_FONTS`] the
+/// system has, then the regular ones for what it lacks or when it has none.
+const BOLD: &str = "bold";
+
+/// Bold faces the system may have: Ubuntu's medium weight beside egui's
+/// light one, else DejaVu's, Noto's or Arial's bold.
+const BOLD_FONTS: [&str; 4] = [
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+];
+
+/// Bold text at `size`, as heavy as the system's fonts allow.
+pub(crate) fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(BOLD.into()))
+}
+
+/// Adds the fallback fonts the system has, and a bold face. One missing
+/// costs only its characters, drawn as boxes; no bold face, only weight.
 fn fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, path) in FALLBACK_FONTS {
@@ -96,15 +124,33 @@ fn fonts(ctx: &egui::Context) {
                 .push(name.to_owned());
         }
     }
+    let mut bold = Vec::new();
+    if let Some(bytes) = BOLD_FONTS.iter().find_map(|path| std::fs::read(path).ok()) {
+        fonts.font_data.insert(
+            BOLD.to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        bold.push(BOLD.to_owned());
+    }
+    bold.extend(
+        fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts.families.insert(FontFamily::Name(BOLD.into()), bold);
     ctx.set_fonts(fonts);
 }
 
-/// Makes every surface egui fills, windows and menus included, as opaque
-/// as the window: Ctrl-M fades them all together.
+/// Makes every surface egui fills as opaque as the window, so that Ctrl-M
+/// fades them all together; but menus and tooltips, which egui fills with
+/// its windows' colour: see-through over text, they could not be read.
+/// Windows take [`Visuals::faint_bg_color`] instead, and fade.
 pub(crate) fn follow(ctx: &egui::Context, opacity: f32) {
     let mut visuals = ctx.global_style().visuals.clone();
     visuals.panel_fill = see(PANEL, opacity);
-    visuals.window_fill = see(RAISED, opacity);
+    visuals.window_fill = RAISED;
     visuals.extreme_bg_color = see(BACKGROUND, opacity);
     visuals.faint_bg_color = see(RAISED, opacity);
     visuals.selection.bg_fill = see(SELECTED, opacity);

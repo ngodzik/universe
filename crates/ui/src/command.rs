@@ -109,6 +109,9 @@ pub(crate) enum Command {
     /// `/background [pattern|off] [still|slow]`: what is drawn behind the
     /// window's panels; alone, what is set.
     Background(Option<String>),
+    /// `/bullets [3d|planets|plain]`: how a reply's bullets are drawn;
+    /// alone, what is set.
+    Bullets(Option<String>),
 }
 
 /// Parses the text typed after `:`. Errors are messages for the person.
@@ -177,6 +180,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "work" => Ok(Command::Work(rest_opt)),
         "walk" => Ok(Command::Walk(rest_opt)),
         "background" | "bg" => Ok(Command::Background(rest_opt)),
+        "bullets" => Ok(Command::Bullets(rest_opt)),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
     }
@@ -232,6 +236,7 @@ pub(crate) const NAMES: &[&str] = &[
     "walk",
     "background",
     "bg",
+    "bullets",
 ];
 
 /// Commands of the Vim editor, completed on top of universe's inside a file.
@@ -378,6 +383,8 @@ Type a question or a change and press Enter. Changes are checked before they are
                      grid, rain or off; still (costs nothing) or slow (about twelve
                      frames a second while the window has the focus). Ctrl-X: the
                      next one. Alone, what is set
+/bullets [b]         how a reply's bullets are drawn: 3d (small turning spheres),
+                     planets or plain. Alone, what is set
 /clear               start a new conversation in place of this one
 /newchat             open a new conversation beside this one, which goes on
 /chats               the open conversations: Enter shows one, n opens a new one,

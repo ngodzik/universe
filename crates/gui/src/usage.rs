@@ -329,7 +329,13 @@ fn base_plot(id: &str, window: u64, top: f64) -> Plot<'static> {
         .include_x(0.0)
         .include_y(0.0)
         .include_y(top)
+        // Still: a trackpad's scroll and pinch go to the pane, which then
+        // scrolls, rather than panning and zooming the chart under it.
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_scroll(false)
         .allow_boxed_zoom(false)
+        .allow_double_click_reset(false)
         .x_grid_spacer(uniform_grid_spacer(move |_| [step / 2.0, step, step * 3.0]))
         .y_grid_spacer(uniform_grid_spacer(move |_| {
             [level / 2.0, level, level * 4.0]

@@ -803,10 +803,17 @@ where
                 model: chosen,
                 candidates,
             } => {
-                let (model, tx) = (Arc::clone(model), tx.clone());
+                let (model, delegate, tx) = (Arc::clone(model), Arc::clone(delegate), tx.clone());
                 tokio::spawn(async move {
-                    let said =
-                        summarize(&*model, &copy, &pull, &areas, chosen, &candidates, &tx).await;
+                    let asker = Asker {
+                        model: &*model,
+                        delegate: Some(&*delegate),
+                        directory: &copy,
+                        chosen,
+                        candidates: &candidates,
+                        tx: &tx,
+                    };
+                    let said = summarize(&asker, &copy, &pull, &areas).await;
                     let _ = tx.send(AgentMessage::Summaries(said));
                 });
             }
@@ -927,18 +934,18 @@ where
                 model: chosen,
                 candidates,
             } => {
-                let (model, tx) = (Arc::clone(model), tx.clone());
+                let (model, delegate, tx) = (Arc::clone(model), Arc::clone(delegate), tx.clone());
+                let root = workspace.root().to_owned();
                 tokio::spawn(async move {
-                    let read = read_ticket(
-                        &*model,
-                        &named,
-                        &tracker,
-                        external.as_ref(),
+                    let asker = Asker {
+                        model: &*model,
+                        delegate: Some(&*delegate),
+                        directory: &root,
                         chosen,
-                        &candidates,
-                        &tx,
-                    )
-                    .await;
+                        candidates: &candidates,
+                        tx: &tx,
+                    };
+                    let read = read_ticket(&asker, &named, &tracker, external.as_ref()).await;
                     let _ = tx.send(AgentMessage::Ticket(read));
                 });
             }
@@ -948,12 +955,18 @@ where
                 model: chosen,
                 candidates,
             } => {
-                let (model, tx) = (Arc::clone(model), tx.clone());
+                let (model, delegate, tx) = (Arc::clone(model), Arc::clone(delegate), tx.clone());
                 let root = workspace.root().to_owned();
                 tokio::spawn(async move {
-                    let checked =
-                        check_progress(&*model, &root, &tickets, &notes, chosen, &candidates, &tx)
-                            .await;
+                    let asker = Asker {
+                        model: &*model,
+                        delegate: Some(&*delegate),
+                        directory: &root,
+                        chosen,
+                        candidates: &candidates,
+                        tx: &tx,
+                    };
+                    let checked = check_progress(&asker, &tickets, &notes).await;
                     let _ = tx.send(AgentMessage::Progress(checked));
                 });
             }
@@ -1112,63 +1125,78 @@ fn spawn_ticks<M: ChatModel + 'static, D: Delegate + 'static>(
     });
 }
 
-/// One question to `chosen`, else to the cheapest of `candidates`; its cost
-/// counts with the conversation.
-async fn ask_one<M: ChatModel>(
-    model: &M,
+/// Who answers one of the interface's own questions, such as a summary
+/// or a ticket's work: `chosen`, the model marked for fresh work, else the
+/// cheapest of `candidates` with a price, else Claude Code's smallest model
+/// on the person's subscription, reading only in `directory`. What each
+/// call used counts with the conversation, through `tx`.
+struct Asker<'a, M, D> {
+    model: &'a M,
+    delegate: Option<&'a D>,
+    directory: &'a std::path::Path,
     chosen: Option<universe_core::ModelId>,
-    candidates: &[universe_core::ModelId],
-    system: &str,
-    question: String,
-    tx: &mpsc::UnboundedSender<AgentMessage>,
-) -> Result<String, String> {
-    ask_at(
-        model,
-        chosen,
-        candidates,
-        system,
-        question,
-        universe_core::Effort::Low,
-        tx,
-    )
-    .await
+    candidates: &'a [universe_core::ModelId],
+    tx: &'a mpsc::UnboundedSender<AgentMessage>,
 }
 
-/// As [`ask_one`], at `effort`.
-async fn ask_at<M: ChatModel>(
-    model: &M,
-    chosen: Option<universe_core::ModelId>,
-    candidates: &[universe_core::ModelId],
-    system: &str,
-    question: String,
-    effort: universe_core::Effort,
-    tx: &mpsc::UnboundedSender<AgentMessage>,
-) -> Result<String, String> {
-    let observe = |e| {
-        let _ = tx.send(AgentMessage::Event(e));
-    };
-    let answered = match chosen {
-        Some(to) => universe_agent::ask(model, &to, system, question, effort, observe).await,
-        None => {
-            universe_agent::ask_cheapest(model, candidates, system, question, effort, observe).await
-        }
-    };
-    answered.map(|a| a.text).ok_or_else(|| {
-        "No model answered: mark one for fresh work with Ctrl-F, or price one".to_owned()
-    })
+impl<M: ChatModel, D: Delegate> Asker<'_, M, D> {
+    /// The answer to `question`, at `effort`.
+    async fn ask(
+        &self,
+        system: &str,
+        question: String,
+        effort: universe_core::Effort,
+    ) -> Result<String, String> {
+        let observe = |e| {
+            let _ = self.tx.send(AgentMessage::Event(e));
+        };
+        let answered = match &self.chosen {
+            Some(to) => {
+                universe_agent::ask(self.model, to, system, question.clone(), effort, observe).await
+            }
+            None => {
+                universe_agent::ask_cheapest(
+                    self.model,
+                    self.candidates,
+                    system,
+                    question.clone(),
+                    effort,
+                    observe,
+                )
+                .await
+            }
+        };
+        let answered = match (answered, self.delegate) {
+            (Some(answered), _) => Some(answered),
+            (None, Some(delegate)) => {
+                universe_agent::ask_agent(
+                    delegate,
+                    self.directory,
+                    system,
+                    question,
+                    effort,
+                    observe,
+                )
+                .await
+            }
+            (None, None) => None,
+        };
+        answered.map(|a| a.text).ok_or_else(|| {
+            "No model answered: mark one for fresh work with Ctrl-F, price one, or install \
+             Claude Code"
+                .to_owned()
+        })
+    }
 }
 
 /// What a model says of a pull request, kept beside its copy per head
 /// commit: asked of the model only when none is kept. Its diff goes to the
 /// model, so the environment's secrets are taken out first.
-async fn summarize<M: ChatModel>(
-    model: &M,
+async fn summarize<M: ChatModel, D: Delegate>(
+    asker: &Asker<'_, M, D>,
     copy: &std::path::Path,
     pull: &universe_tools::PullRequest,
     areas: &[crate::pull_review::AreaDiff],
-    chosen: Option<universe_core::ModelId>,
-    candidates: &[universe_core::ModelId],
-    tx: &mpsc::UnboundedSender<AgentMessage>,
 ) -> Result<crate::pull_review::Summaries, String> {
     let kept = crate::pull_review::kept_at(copy, &pull.head);
     if let Some(summaries) = std::fs::read_to_string(&kept)
@@ -1179,16 +1207,13 @@ async fn summarize<M: ChatModel>(
     }
     let (question, _) =
         universe_tools::redact_secrets(&crate::pull_review::summary_question(pull, areas));
-    let answer = ask_at(
-        model,
-        chosen,
-        candidates,
-        crate::pull_review::SUMMARY_PROMPT,
-        question,
-        universe_core::Effort::High,
-        tx,
-    )
-    .await?;
+    let answer = asker
+        .ask(
+            crate::pull_review::SUMMARY_PROMPT,
+            question,
+            universe_core::Effort::High,
+        )
+        .await?;
     let summaries = crate::pull_review::parse_summaries(&pull.head, &answer);
     if let Ok(text) = serde_json::to_string(&summaries) {
         let _ = std::fs::write(&kept, text);
@@ -1198,14 +1223,11 @@ async fn summarize<M: ChatModel>(
 
 /// Reads a ticket and its comments through its tracker's MCP tools, and has
 /// a model list its work.
-async fn read_ticket<M: ChatModel>(
-    model: &M,
+async fn read_ticket<M: ChatModel, D: Delegate>(
+    asker: &Asker<'_, M, D>,
     named: &crate::tickets::Named,
     tracker: &crate::tickets::Tracker,
     external: &dyn universe_core::ExternalTools,
-    chosen: Option<universe_core::ModelId>,
-    candidates: &[universe_core::ModelId],
-    tx: &mpsc::UnboundedSender<AgentMessage>,
 ) -> Result<crate::tickets::Ticket, String> {
     let arguments = serde_json::json!({ tracker.argument.as_str(): named.id }).to_string();
     let issue = external
@@ -1216,10 +1238,14 @@ async fn read_ticket<M: ChatModel>(
         .await
         .map_err(|e| format!("{} could not be read: {e}", named.id))?;
     let comments = match &tracker.comments {
-        Some(tool) => external
-            .call(&format!("{}__{tool}", tracker.server), &arguments)
-            .await
-            .unwrap_or_default(),
+        Some(tool) => {
+            let arguments =
+                serde_json::json!({ tracker.comments_argument(): named.id }).to_string();
+            external
+                .call(&format!("{}__{tool}", tracker.server), &arguments)
+                .await
+                .unwrap_or_default()
+        }
         None => String::new(),
     };
     // What a tracker says is kept and sent to a model: the environment's
@@ -1243,15 +1269,13 @@ async fn read_ticket<M: ChatModel>(
     } else {
         format!("{issue}\n\nComments:\n{comments}")
     };
-    let answer = ask_one(
-        model,
-        chosen,
-        candidates,
-        crate::tickets::ITEMS_PROMPT,
-        format!("The ticket {}:\n{text}", named.id),
-        tx,
-    )
-    .await?;
+    let answer = asker
+        .ask(
+            crate::tickets::ITEMS_PROMPT,
+            format!("The ticket {}:\n{text}", named.id),
+            universe_core::Effort::Low,
+        )
+        .await?;
     Ok(crate::tickets::Ticket {
         tracker: named.tracker.clone(),
         id: named.id.clone(),
@@ -1264,15 +1288,12 @@ async fn read_ticket<M: ChatModel>(
 /// Judges the branch's work against `tickets`: its diff cut into pieces,
 /// the generated ones set apart and never sent, a model saying which serve
 /// which item, and the rest counted.
-async fn check_progress<M: ChatModel>(
-    model: &M,
-    root: &std::path::Path,
+async fn check_progress<M: ChatModel, D: Delegate>(
+    asker: &Asker<'_, M, D>,
     tickets: &[crate::tickets::Ticket],
     notes: &[String],
-    chosen: Option<universe_core::ModelId>,
-    candidates: &[universe_core::ModelId],
-    tx: &mpsc::UnboundedSender<AgentMessage>,
 ) -> Result<crate::tickets::Progress, String> {
+    let root = asker.directory;
     let base = universe_tools::branch_base(root)
         .ok_or("This branch has not left main or master: nothing to judge")?;
     let hunks = universe_tools::diff_hunks(root, &base).ok_or("git could not say the diff")?;
@@ -1297,17 +1318,29 @@ async fn check_progress<M: ChatModel>(
     // The diff goes to a model: the environment's secrets are taken out.
     let (question, _) =
         universe_tools::redact_secrets(&crate::tickets::judge_question(tickets, notes, &marked));
-    let answer = ask_one(
-        model,
-        chosen,
-        candidates,
-        crate::tickets::JUDGE_PROMPT,
-        question,
-        tx,
-    )
-    .await?;
+    // Judging each piece is the hard part: high effort.
+    let answer = asker
+        .ask(
+            crate::tickets::JUDGE_PROMPT,
+            question,
+            universe_core::Effort::High,
+        )
+        .await?;
     let verdicts = crate::tickets::parse_verdicts(&answer)?;
-    Ok(crate::tickets::progress(tickets, &marked, &verdicts))
+    let mut progress = crate::tickets::progress(tickets, &marked, &verdicts);
+    // What the branch wrote again that the project already had, as a model
+    // is told of it while it works; generated code repeats by nature.
+    let mut written: Vec<String> = marked
+        .iter()
+        .filter(|(_, generated)| !generated)
+        .map(|(hunk, _)| hunk.path.clone())
+        .collect();
+    written.dedup();
+    progress.repeats = universe_tools::repeats(root, &written, &base)
+        .iter()
+        .map(crate::tickets::RepeatRef::from)
+        .collect();
+    Ok(progress)
 }
 
 /// Puts `conversation`'s tools in `folder`, the copy of a pull request it
@@ -1353,6 +1386,7 @@ fn asking(
     });
     config
         .with_instructions(Defaults::instructions())
+        .with_memory(Defaults::instructions_path())
         .with_audit_log(Defaults::audit_log_path())
         .with_project_rules(universe_tools::project_instructions(root))
         .with_approver(approver)
@@ -1478,6 +1512,36 @@ fn find(
 mod tests {
     use super::*;
 
+    /// No agent: a model of the provider answers every question asked here.
+    struct NoAgent;
+
+    impl Delegate for NoAgent {
+        type Error = std::convert::Infallible;
+
+        async fn run(
+            &self,
+            _: &universe_core::DelegateRequest,
+            _: &mut (dyn FnMut(universe_core::DelegateEvent) + Send),
+        ) -> Result<universe_core::DelegateReply, Self::Error> {
+            panic!("no agent here")
+        }
+    }
+
+    fn asker<'a, M>(
+        model: &'a M,
+        directory: &'a std::path::Path,
+        tx: &'a mpsc::UnboundedSender<AgentMessage>,
+    ) -> Asker<'a, M, NoAgent> {
+        Asker {
+            model,
+            delegate: None,
+            directory,
+            chosen: Some(universe_core::ModelId::new("cheap").unwrap()),
+            candidates: &[],
+            tx,
+        }
+    }
+
     #[tokio::test]
     async fn a_walk_question_carries_the_place_and_the_file_s_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1515,13 +1579,17 @@ mod tests {
             arguments: &'a str,
         ) -> universe_core::ExternalCall<'a> {
             Box::pin(async move {
-                assert_eq!(arguments, r#"{"id":"ENG-7"}"#);
                 Ok(match name {
                     "issues__get_issue" => {
+                        assert_eq!(arguments, r#"{"id":"ENG-7"}"#);
                         r#"{"title": "Upload files", "description": "Accept and store files."}"#
                             .to_owned()
                     }
-                    "issues__list_comments" => "Storing can wait.".to_owned(),
+                    // Its own argument for the same id.
+                    "issues__list_comments" => {
+                        assert_eq!(arguments, r#"{"issueId":"ENG-7"}"#);
+                        "Storing can wait.".to_owned()
+                    }
                     other => panic!("no tool {other}"),
                 })
             })
@@ -1569,6 +1637,7 @@ mod tests {
             issue: "get_issue".into(),
             comments: Some("list_comments".into()),
             argument: "id".into(),
+            comments_argument: Some("issueId".into()),
             ids: "[A-Z]+-[0-9]+".into(),
             hosts: Vec::new(),
         };
@@ -1577,17 +1646,10 @@ mod tests {
             id: "ENG-7".into(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let ticket = read_ticket(
-            &model,
-            &named,
-            &tracker,
-            &Tracker,
-            Some(universe_core::ModelId::new("cheap").unwrap()),
-            &[],
-            &tx,
-        )
-        .await
-        .unwrap();
+        let here = tempfile::tempdir().unwrap();
+        let ticket = read_ticket(&asker(&model, here.path(), &tx), &named, &tracker, &Tracker)
+            .await
+            .unwrap();
         assert_eq!(ticket.title, "Upload files");
         assert_eq!(ticket.items, ["accept files"]);
         let asked = model.1.lock().unwrap();
@@ -1651,22 +1713,15 @@ mod tests {
             items: vec!["store files".into()],
         }];
         let (tx, _rx) = mpsc::unbounded_channel();
-        let progress = check_progress(
-            &model,
-            root,
-            &tickets,
-            &[],
-            Some(universe_core::ModelId::new("cheap").unwrap()),
-            &[],
-            &tx,
-        )
-        .await
-        .unwrap();
+        let progress = check_progress(&asker(&model, root, &tx), &tickets, &[])
+            .await
+            .unwrap();
         let item = progress.items[0][0].as_ref().unwrap();
         assert!(item.done && item.share > 0.0);
         assert!(progress.generated > 0.0);
-        // The lock file was never sent to the judge.
-        assert!(!model.1.lock().unwrap()[0].contains("Cargo.lock"));
+        // The lock file was named to the judge, what it holds never sent.
+        let asked = &model.1.lock().unwrap()[0];
+        assert!(asked.contains("not shown: Cargo.lock") && !asked.contains("lots"));
         assert!(
             progress
                 .files

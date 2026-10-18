@@ -9,7 +9,7 @@ use bevy_egui::egui::{
     TextFormat, Ui, text::LayoutJob,
 };
 use universe_tools::{DiffLine, ToolSummary};
-use universe_ui::markdown::{self as md, Block, Marker};
+use universe_ui::markdown::{self as md, Block, Bullets, Marker};
 use universe_ui::references::{self, Reference};
 use universe_ui::{App, Effect, Entry, step_title};
 
@@ -34,6 +34,11 @@ pub(crate) fn show(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
     let selected = app.selected_reply();
     let reveal = app.take_reveal();
     for (index, entry) in app.transcript().iter().enumerate() {
+        // A member's work is its own pane's (Ctrl-T), out of the
+        // conversation.
+        if matches!(entry, Entry::Member { .. }) {
+            continue;
+        }
         let is_selected = selected == Some(index);
         let frame = Frame::new()
             .inner_margin(Margin::symmetric(10, 6))
@@ -150,6 +155,7 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
         Entry::Delegating { from, to, task, .. } => {
             action(ui, MAGENTA, "Delegate", &format!("{from} → {to}"));
             result(ui, task, DIM);
+            result(ui, "Ctrl-T shows its work", DIM);
         }
         Entry::OverBudget { spent, budget } => marked(
             ui,
@@ -215,7 +221,9 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
             complete,
             seconds,
             subscription,
-            ..
+            runs,
+            flight,
+            context,
         } => {
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
@@ -223,16 +231,38 @@ pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
+            // Who it cost: each model once, in the order they worked.
+            let mut models: Vec<&str> = Vec::new();
+            for (model, _) in runs {
+                if !models.contains(&model.as_str()) {
+                    models.push(model.as_str());
+                }
+            }
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!("{} · ", models.join(", "))
+            };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let context = context
+                    .map(|c| format!(" · ctx {}%", c.percent()))
+                    .unwrap_or_default();
                 ui.label(
                     RichText::new(format!(
-                        "{cost} · {} in · {} out · {seconds}s",
+                        "{models}{cost} · {} in · {} out · {seconds}s{context}",
                         usage.input, usage.output
                     ))
                     .small()
                     .color(DIM),
                 );
             });
+            // Where the time went, once it went to more than the model.
+            let legs = flight.0.iter().filter(|(_, ms)| *ms >= 1000).count();
+            if legs > 1 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(flight.line()).small().color(DIM));
+                });
+            }
         }
         Entry::Image(path) => {
             ui.label(RichText::new(path).small().color(DIM));
@@ -456,9 +486,9 @@ pub(crate) fn markdown(ui: &mut Ui, app: &App, text: &str, effects: &mut Vec<Eff
 fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
     for block in list {
         match block {
-            Block::Blank => ui.add_space(4.0),
+            Block::Blank => ui.add_space(8.0),
             Block::Heading { level, spans } => {
-                ui.add_space(4.0);
+                ui.add_space(10.0);
                 let size = match level {
                     1 => BODY_SIZE + 6.0,
                     2 => BODY_SIZE + 3.5,
@@ -473,8 +503,22 @@ fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
                     Color32::WHITE,
                     ui.visuals().faint_bg_color,
                 );
+                // A heading is heavy, but for its code.
+                for section in &mut job.sections {
+                    if section.format.font_id.family == egui::FontFamily::Proportional {
+                        section.format.font_id = crate::theme::bold(size);
+                    }
+                }
                 job.wrap.max_width = ui.available_width();
                 citing(ui, app, job);
+                // A rule that fades out under the higher headings, so that
+                // a long reply's parts show at a glance.
+                if *level <= 3 {
+                    ui.add_space(3.0);
+                    let strength = [1.0, 0.85, 0.55][usize::from(*level).saturating_sub(1)];
+                    fading_rule(ui, ACCENT.gamma_multiply(strength), false);
+                }
+                ui.add_space(4.0);
             }
             Block::Paragraph(lines) => {
                 let mut job = LayoutJob::default();
@@ -503,25 +547,46 @@ fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
                 } else {
                     TEXT
                 };
+                let bullets = app.bullets();
+                ui.add_space(3.0);
                 ui.horizontal_top(|ui| {
                     ui.add_space(4.0 + 16.0 * *depth as f32);
-                    ui.label(RichText::new(mark).size(BODY_SIZE).color(DIM));
-                    let mut job = LayoutJob::default();
-                    runs(
-                        &mut job,
-                        spans,
-                        BODY_SIZE,
-                        colour,
-                        ui.visuals().faint_bg_color,
-                    );
-                    job.wrap.max_width = ui.available_width();
-                    citing(ui, app, job);
+                    if *marker == Marker::Bullet && bullets != Bullets::Plain {
+                        let line = ui.fonts_mut(|f| f.row_height(&FontId::proportional(BODY_SIZE)));
+                        crate::bullets::bullet(ui, bullets, *depth, line);
+                    } else {
+                        ui.label(RichText::new(mark).size(BODY_SIZE).color(DIM));
+                    }
+                    let text = |ui: &mut Ui, spans: &[md::Span], colour: Color32| {
+                        let mut job = LayoutJob::default();
+                        runs(
+                            &mut job,
+                            spans,
+                            BODY_SIZE,
+                            colour,
+                            ui.visuals().faint_bg_color,
+                        );
+                        job.wrap.max_width = ui.available_width();
+                        citing(ui, app, job);
+                    };
+                    // `**Name**: what it is` reads as a name over its
+                    // description.
+                    match md::lead(spans) {
+                        Some((lead, rest)) => {
+                            ui.vertical(|ui| {
+                                text(ui, std::slice::from_ref(&lead), Color32::WHITE);
+                                ui.add_space(1.0);
+                                text(ui, &rest, colour);
+                            });
+                        }
+                        None => text(ui, spans, colour),
+                    }
                 });
             }
             Block::Rule => {
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(8.0);
+                fading_rule(ui, EDGE, true);
+                ui.add_space(8.0);
             }
             Block::Quote { text, blocks } => quote(ui, app, text, blocks, effects),
             Block::Code { language, text } => code_block(ui, language, text, effects),
@@ -554,6 +619,40 @@ fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
     }
 }
 
+/// A line one point thin across the pane, `colour` fading out to the
+/// right, or to both ends from the middle when `both`.
+fn fading_rule(ui: &mut Ui, colour: Color32, both: bool) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), Sense::hover());
+    // On whole pixels: across two, its colour would halve.
+    let rect = {
+        use egui::emath::GuiRounding as _;
+        rect.round_to_pixels(ui.pixels_per_point())
+    };
+    let clear = Color32::TRANSPARENT;
+    let mut mesh = egui::Mesh::default();
+    let stops: &[(f32, Color32)] = if both {
+        &[(0.0, clear), (0.5, colour), (1.0, clear)]
+    } else {
+        &[
+            (0.0, colour),
+            (0.7, colour.gamma_multiply(0.25)),
+            (1.0, clear),
+        ]
+    };
+    for (i, (at, shade)) in stops.iter().enumerate() {
+        let x = rect.left() + rect.width() * at;
+        mesh.colored_vertex(egui::pos2(x, rect.top()), *shade);
+        mesh.colored_vertex(egui::pos2(x, rect.bottom()), *shade);
+        if i > 0 {
+            let n = 2 * i as u32;
+            mesh.add_triangle(n - 2, n - 1, n);
+            mesh.add_triangle(n - 1, n, n + 1);
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
 /// A table on a card, its header bold, its columns aligned as written.
 fn table(
     ui: &mut Ui,
@@ -568,37 +667,51 @@ fn table(
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            egui::Grid::new(ui.next_auto_id())
-                .striped(true)
-                .spacing(egui::vec2(18.0, 4.0))
-                .show(ui, |ui| {
-                    let cells = |ui: &mut Ui, row: &[Vec<md::Span>], colour: Color32| {
-                        for (c, cell) in row.iter().enumerate() {
-                            let mut job = LayoutJob::default();
-                            runs(
-                                &mut job,
-                                cell,
-                                BODY_SIZE - 0.5,
-                                colour,
-                                ui.visuals().faint_bg_color,
-                            );
-                            let align = match aligns.get(c).copied().unwrap_or_default() {
-                                md::Align::Left => Align::Min,
-                                md::Align::Center => Align::Center,
-                                md::Align::Right => Align::Max,
-                            };
-                            // A cell keeps to one line: the grid gives each
-                            // column the room its widest cell needs.
-                            job.wrap.max_width = f32::INFINITY;
-                            ui.with_layout(Layout::top_down(align), |ui| citing(ui, app, job));
-                        }
-                        ui.end_row();
+            // Too wide, it scrolls on its card, not the conversation.
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .show(ui, |ui| table_grid(ui, app, header, aligns, rows));
+        });
+}
+
+/// The table's grid, its header bold, its columns aligned as written.
+fn table_grid(
+    ui: &mut Ui,
+    app: &App,
+    header: &[Vec<md::Span>],
+    aligns: &[md::Align],
+    rows: &[Vec<Vec<md::Span>>],
+) {
+    egui::Grid::new(ui.next_auto_id())
+        .striped(true)
+        .spacing(egui::vec2(18.0, 4.0))
+        .show(ui, |ui| {
+            let cells = |ui: &mut Ui, row: &[Vec<md::Span>], colour: Color32| {
+                for (c, cell) in row.iter().enumerate() {
+                    let mut job = LayoutJob::default();
+                    runs(
+                        &mut job,
+                        cell,
+                        BODY_SIZE - 0.5,
+                        colour,
+                        ui.visuals().faint_bg_color,
+                    );
+                    let align = match aligns.get(c).copied().unwrap_or_default() {
+                        md::Align::Left => Align::Min,
+                        md::Align::Center => Align::Center,
+                        md::Align::Right => Align::Max,
                     };
-                    cells(ui, header, Color32::WHITE);
-                    for row in rows {
-                        cells(ui, row, TEXT);
-                    }
-                });
+                    // A cell keeps to one line: the grid gives each
+                    // column the room its widest cell needs.
+                    job.wrap.max_width = f32::INFINITY;
+                    ui.with_layout(Layout::top_down(align), |ui| citing(ui, app, job));
+                }
+                ui.end_row();
+            };
+            cells(ui, header, Color32::WHITE);
+            for row in rows {
+                cells(ui, row, TEXT);
+            }
         });
 }
 
@@ -646,7 +759,11 @@ fn plain() -> TextFormat {
 fn runs(job: &mut LayoutJob, spans: &[md::Span], size: f32, colour: Color32, background: Color32) {
     for span in spans {
         let mut format = TextFormat {
-            font_id: FontId::proportional(size),
+            font_id: if span.bold {
+                crate::theme::bold(size)
+            } else {
+                FontId::proportional(size)
+            },
             color: if span.bold { Color32::WHITE } else { colour },
             italics: span.italic,
             ..TextFormat::default()
@@ -748,8 +865,16 @@ fn link(job: &mut LayoutJob, range: &Range<usize>) {
 /// A fenced block on its own card, its language above it and a copy button
 /// beside; a diff tinted line by line.
 fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>) {
+    let mermaid = language.split_whitespace().next() == Some("mermaid");
+    // A diagram is drawn for a dark background on a transparent one: on an
+    // opaque card, it reads whatever shows through the window.
+    let fill = if mermaid {
+        crate::theme::RAISED
+    } else {
+        ui.visuals().faint_bg_color
+    };
     Frame::new()
-        .fill(ui.visuals().faint_bg_color)
+        .fill(fill)
         .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(10, 8))
@@ -762,7 +887,7 @@ fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>
                 ui.label(RichText::new(language).small().color(DIM));
             });
             // A diagram drawn takes the place of its code.
-            if language.split_whitespace().next() == Some("mermaid") {
+            if mermaid {
                 let diagrams: Option<crate::diagrams::Diagrams> =
                     ui.data(|d| d.get_temp(egui::Id::new("diagrams")));
                 if diagrams.is_some_and(|d| d.show(ui, code)) {
@@ -770,15 +895,23 @@ fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>
                 }
             }
             let diff = language.split_whitespace().next() == Some("diff");
-            for line in code.lines() {
-                let colour = match line.chars().next() {
-                    Some('+') if diff => GREEN,
-                    Some('-') if diff => RED,
-                    Some('@') if diff => CYAN,
-                    _ => CODE,
-                };
-                ui.label(RichText::new(line).monospace().color(colour));
-            }
+            // Too wide, it scrolls on its card, not the conversation.
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .show(ui, |ui| {
+                    for line in code.lines() {
+                        let colour = match line.chars().next() {
+                            Some('+') if diff => GREEN,
+                            Some('-') if diff => RED,
+                            Some('@') if diff => CYAN,
+                            _ => CODE,
+                        };
+                        ui.add(
+                            egui::Label::new(RichText::new(line).monospace().color(colour))
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
+                });
         });
 }
 

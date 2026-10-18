@@ -73,8 +73,11 @@ impl Diagrams {
         let (Some(renderer), Some(cache)) = (&self.renderer, &self.cache) else {
             return false;
         };
-        let key = renderer.key(source);
-        let (renderer, cache, source) = (renderer.clone(), cache.clone(), source.to_owned());
+        // A model's colours, made readable on the dark theme, are what is
+        // drawn and kept.
+        let source = universe_ui::diagrams::readable(source);
+        let key = renderer.key(&source);
+        let (renderer, cache) = (renderer.clone(), cache.clone());
         self.image(ui, key, Kind::Diagram, move || {
             let done = cache.join(format!("{key:016x}.png"));
             let path = if done.is_file() {
@@ -109,10 +112,18 @@ impl Diagrams {
         };
         match states.get(&key) {
             Some(State::Drawn(texture)) => {
-                let size = texture.size_vec2();
-                let width = size.x.min(ui.available_width());
-                let shown = egui::vec2(width, size.y * width / size.x.max(1.0));
-                ui.add(egui::Image::new((texture.id(), shown)));
+                let response = ui
+                    .add(
+                        egui::Image::new((texture.id(), shown_size(texture.size_vec2(), ui)))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::ZoomIn);
+                if response.clicked() {
+                    let texture = texture.clone();
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(crate::viewer::OPEN), Some(texture))
+                    });
+                }
                 true
             }
             Some(State::Failed(why)) => {
@@ -170,6 +181,28 @@ impl Diagrams {
     }
 }
 
+/// The most a tall image takes of the conversation, in points: a click
+/// shows it whole.
+const TALLEST: f32 = 420.0;
+
+/// How large an image `size` pixels shows in `ui`: at its own size, one of
+/// its pixels to one of the screen's, narrowed to the room there is and
+/// shortened to [`TALLEST`].
+fn shown_size(size: egui::Vec2, ui: &Ui) -> egui::Vec2 {
+    fit_within(size / ui.pixels_per_point(), ui.available_width())
+}
+
+fn fit_within(own: egui::Vec2, width: f32) -> egui::Vec2 {
+    let mut shown = own;
+    if shown.x > width {
+        shown *= width / shown.x;
+    }
+    if shown.y > TALLEST {
+        shown *= TALLEST / shown.y;
+    }
+    shown
+}
+
 /// The PNG at `path` as pixels.
 fn decode(path: &std::path::Path) -> Result<ColorImage, String> {
     let image = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
@@ -191,5 +224,13 @@ mod tests {
         let pixels = decode(&path).unwrap();
         assert_eq!(pixels.size, [3, 2]);
         assert!(decode(&dir.path().join("none.png")).is_err());
+    }
+
+    #[test]
+    fn an_image_keeps_its_own_size_within_the_width_and_a_tall_one_is_capped() {
+        let at = |x: f32, y: f32| fit_within(egui::vec2(x, y), 600.0);
+        assert_eq!(at(300.0, 200.0), egui::vec2(300.0, 200.0));
+        assert_eq!(at(1200.0, 400.0), egui::vec2(600.0, 200.0));
+        assert_eq!(at(300.0, 840.0), egui::vec2(150.0, 420.0));
     }
 }

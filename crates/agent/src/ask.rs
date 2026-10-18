@@ -1,7 +1,12 @@
 //! One question to the cheapest model: for what needs no strong model,
 //! such as judging a command or explaining a few lines of code.
 
-use universe_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Pricing, TokenCount, Usage};
+use std::path::Path;
+
+use universe_core::{
+    Agent, ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Effort, Message,
+    ModelId, Pricing, TokenCount, Usage,
+};
 
 use crate::event::{Event, Purpose};
 
@@ -101,6 +106,59 @@ pub async fn ask_cheapest<M: ChatModel>(
 ) -> Option<Answered> {
     let (to, _) = cheapest(model, candidates, None).await?;
     ask(model, &to, system, question, effort, observe).await
+}
+
+/// Asks Claude Code's smallest model one question, reading only, in
+/// `directory`, in a session kept nowhere: what answers on the person's
+/// subscription when no model of the provider is priced. `None` when it is
+/// not installed, fails, or says nothing.
+pub async fn ask_agent<D: Delegate>(
+    delegate: &D,
+    directory: &Path,
+    system: &str,
+    question: String,
+    effort: Effort,
+    mut observe: impl FnMut(Event) + Send,
+) -> Option<Answered> {
+    let to = ModelId::new("claude-code/haiku").ok()?;
+    let request = DelegateRequest {
+        agent: Agent::ClaudeCode,
+        effort: Some(effort),
+        model: "haiku".into(),
+        prompt: format!("{system}\n\n{question}"),
+        instructions: String::new(),
+        resume: None,
+        fork: false,
+        ephemeral: true,
+        directory: directory.to_owned(),
+        read_only: true,
+    };
+    let mut on_event = |event: DelegateEvent| match event {
+        DelegateEvent::Usage {
+            usage,
+            cost,
+            billed,
+            cache,
+        } => observe(Event::Turn {
+            model: to.clone(),
+            usage,
+            cost: cost.filter(|_| billed),
+            subscription: !billed,
+            context: None,
+            cache,
+            purpose: Purpose::Other,
+        }),
+        DelegateEvent::Quota(quota) => observe(Event::Quota(quota)),
+        _ => {}
+    };
+    let reply = delegate.run(&request, &mut on_event).await.ok()?;
+    let text = reply.text.trim().to_owned();
+    (!text.is_empty()).then(|| Answered {
+        text,
+        model: to.clone(),
+        usage: reply.usage,
+        cost: reply.estimate.filter(|_| reply.billed),
+    })
 }
 
 #[cfg(test)]

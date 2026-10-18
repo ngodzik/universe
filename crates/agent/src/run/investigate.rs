@@ -212,6 +212,7 @@ impl Session {
             last_context: None,
             last_request: None,
             history: None,
+            repeats_told: false,
         };
         let brief = self.brief(&mut ctx, &chat, question).await?;
         (ctx.observe)(Event::Delegating {

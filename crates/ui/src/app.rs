@@ -168,6 +168,8 @@ pub struct Settings {
     pub cache_ttl: CacheTtl,
     /// The pattern behind the window's panels, and whether it moves.
     pub backdrop: crate::backdrop::Backdrop,
+    /// How a reply's bullets are drawn.
+    pub bullets: crate::markdown::Bullets,
     /// The folders a new conversation may work in, as written in the
     /// settings: kept there as written.
     pub workspaces: Vec<String>,
@@ -213,6 +215,50 @@ impl std::fmt::Display for Spent {
             write!(f, "{}", self.cost)?;
         }
         write!(f, " · {} in · {} out", self.usage.input, self.usage.output)
+    }
+}
+
+/// The calls made for the tickets pane, a ticket read or a check of the
+/// branch's progress, while no request runs: shown and counted as a request
+/// of their own once done, rather than with the next one.
+#[derive(Debug, Clone)]
+pub(crate) struct TicketsJob {
+    started: Instant,
+    /// The models that worked, in turn, and what each run cost.
+    runs: Vec<(ModelId, Spent)>,
+    /// How full the context was on the last call.
+    context: Option<ContextUse>,
+}
+
+impl TicketsJob {
+    pub(crate) fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            runs: Vec::new(),
+            context: None,
+        }
+    }
+}
+
+/// Adds a turn of `model` to `runs`: a new run when the model changes.
+fn add_run(
+    runs: &mut Vec<(ModelId, Spent)>,
+    model: &ModelId,
+    usage: Usage,
+    cost: Option<Usd>,
+    subscription: bool,
+) {
+    let run = match runs.last_mut() {
+        Some((last, spent)) if last == model => spent,
+        _ => {
+            runs.push((model.clone(), Spent::default()));
+            &mut runs.last_mut().expect("just pushed").1
+        }
+    };
+    run.usage += usage;
+    match cost {
+        Some(c) => run.cost += c,
+        None => run.subscription |= subscription,
     }
 }
 
@@ -612,6 +658,9 @@ pub enum Entry {
         /// same one together, with what each run cost.
         #[serde(default)]
         runs: Vec<(ModelId, Spent)>,
+        /// Where its time went.
+        #[serde(default)]
+        flight: crate::flight::Flight,
     },
     /// A PNG file the person opened from a reply, shown in the
     /// conversation.
@@ -921,6 +970,10 @@ pub(crate) struct Chat {
     member: Option<ModelId>,
     /// The step of a request in a pair being worked on.
     step: Option<String>,
+    /// Its place among the steps, and how many there are, when numbered.
+    step_place: Option<(u8, u8)>,
+    /// Where the running request's time goes.
+    flight: Option<crate::flight::Log>,
     /// The handover whose work the sub-agent pane shows, by its place in
     /// the transcript.
     sub_view: Option<usize>,
@@ -946,6 +999,8 @@ pub(crate) struct Chat {
     selected_reply: Option<usize>,
     /// How full the context was on the latest call, for the status line.
     context: Option<ContextUse>,
+    /// The context of the member at work, which the gauge shows meanwhile.
+    member_context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
     working_model: Option<ModelId>,
 }
@@ -992,6 +1047,8 @@ impl Chat {
             cost_complete: true,
             member: None,
             step: None,
+            step_place: None,
+            flight: None,
             sub_view: None,
             sub_scroll: Cell::new(0),
             sub_max: Cell::new(0),
@@ -1004,6 +1061,7 @@ impl Chat {
             expanded: BTreeSet::new(),
             selected_reply: None,
             context: None,
+            member_context: None,
             working_model: None,
         }
     }
@@ -1052,6 +1110,8 @@ pub struct App {
     tickets_kept: Option<crate::tickets::Tickets>,
     /// What is being done with them, while it is.
     tickets_busy: Option<String>,
+    /// The tickets pane's calls being made, while no request runs.
+    tickets_job: Option<TicketsJob>,
     /// The pieces of the diff an item or a file is served by, shown.
     ticket_view: Option<TicketView>,
     /// Whether the machine is kept from idle sleep now.
@@ -1219,6 +1279,7 @@ impl App {
             tickets: crate::tickets::Tickets::default(),
             tickets_kept: None,
             tickets_busy: None,
+            tickets_job: None,
             ticket_view: None,
             kept_awake: false,
             approval_scroll: 0,
@@ -2010,9 +2071,29 @@ impl App {
         self.spinner
     }
 
-    /// How long the current request has run, while one does.
+    /// How long the current request has run, while one does: its clock
+    /// stops while the person is asked something.
     pub fn elapsed(&self) -> Option<Duration> {
-        self.chat.running_since.map(|t| t.elapsed())
+        let since = self.chat.running_since?;
+        Some(match &self.chat.flight {
+            Some(log) => log.clock(Instant::now()),
+            None => since.elapsed(),
+        })
+    }
+
+    /// What the running request's time goes to now, while one runs.
+    pub fn leg(&self) -> Option<crate::flight::Leg> {
+        self.chat
+            .flight
+            .as_ref()
+            .filter(|_| self.is_running())
+            .map(crate::flight::Log::leg)
+    }
+
+    /// The running request's step among its numbered ones, and how many
+    /// there are.
+    pub fn step_place(&self) -> Option<(u8, u8)> {
+        self.chat.step_place.filter(|_| self.is_running())
     }
 
     /// What the conversation used and cost so far, and whether every cost was known.
@@ -2022,7 +2103,10 @@ impl App {
 
     /// How full the context was on the latest call, when known.
     pub fn context(&self) -> Option<ContextUse> {
-        self.chat.context
+        match &self.chat.member {
+            Some(_) => self.chat.member_context.or(self.chat.context),
+            None => self.chat.context,
+        }
     }
 
     /// Whether a request is running.
@@ -3023,12 +3107,15 @@ impl App {
                 // Ctrl-T brings it back.
                 self.chat.sub_view = None;
                 self.chat.step = None;
+                self.chat.step_place = None;
                 self.chat.request_spent = Spent::default();
                 self.chat.runs.clear();
                 if self.focus == Focus::SubAgent {
                     self.focus = Focus::Chat;
                 }
-                self.chat.running_since = Some(Instant::now());
+                let now = Instant::now();
+                self.chat.running_since = Some(now);
+                self.chat.flight = Some(crate::flight::Log::start(now));
                 self.chat.member = None;
                 self.chat.working_model = tiers.first().cloned();
                 self.chat.scroll_back.set(0);
@@ -3425,6 +3512,16 @@ impl App {
                 Ok(said) => self.info(said),
                 Err(e) => self.error(e),
             },
+            Command::Bullets(None) => {
+                self.info(format!("Bullets: {}", self.settings.bullets.name()));
+            }
+            Command::Bullets(Some(word)) => match crate::markdown::Bullets::named(&word) {
+                Ok(bullets) => {
+                    self.settings.bullets = bullets;
+                    self.info(format!("Bullets: {}", bullets.name()));
+                }
+                Err(e) => self.error(e),
+            },
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -3608,6 +3705,9 @@ impl App {
                 false
             }
             AgentMessage::Approve(approval, answer) => {
+                if let Some(log) = &mut self.chat.flight {
+                    log.ask(Instant::now());
+                }
                 // One at a time: the agent waits for the answer.
                 if let Some((_, earlier)) = self.chat.approval.replace((approval, answer)) {
                     let _ = earlier.send(Answer::No);
@@ -3623,11 +3723,15 @@ impl App {
                 // The request read its session: the next tick is a full
                 // wait away.
                 self.chat.last_read = Some(crate::sessions::now());
-                let seconds = self
+                let now = Instant::now();
+                let seconds = self.elapsed().map_or(0, |t| t.as_secs());
+                self.chat.running_since = None;
+                let flight = self
                     .chat
-                    .running_since
+                    .flight
                     .take()
-                    .map_or(0, |t| t.elapsed().as_secs());
+                    .map(|log| log.end(now))
+                    .unwrap_or_default();
                 if let Verdict::GaveUp { .. } = outcome.verdict {
                     self.chat.transcript.push(Entry::GaveUp);
                 }
@@ -3640,6 +3744,7 @@ impl App {
                     subscription: outcome.subscription,
                     context: outcome.context,
                     runs: std::mem::take(&mut self.chat.runs),
+                    flight,
                 });
                 let now = crate::sessions::now();
                 let saved = self
@@ -3656,6 +3761,7 @@ impl App {
             AgentMessage::Done(Err(error)) => {
                 self.chat.member = None;
                 self.chat.running_since = None;
+                self.chat.flight = None;
                 self.chat.requests += 1;
                 self.error(error);
                 true
@@ -4202,6 +4308,30 @@ impl App {
         self.settings.tiers.first()
     }
 
+    /// How long the prompt cache of the model that answers has left at
+    /// `now`, in seconds since 1970, and how long it lives unread, in
+    /// seconds: whole while a request runs, then counted from the last
+    /// call, a tick's included. `None` before the conversation's first
+    /// request ended, or with no model.
+    pub fn cache_left(&self, now: u64) -> Option<(u64, u64)> {
+        let model = self.current_model()?;
+        let life = match model.delegate() {
+            Some((agent, _)) => crate::subscriptions::cache_life(agent),
+            // Claude's lives as long as the marks ask; other providers keep
+            // theirs about five minutes.
+            None if model.as_str().contains("claude") => match self.settings.cache_ttl {
+                CacheTtl::FiveMinutes => 5 * 60,
+                CacheTtl::OneHour => 60 * 60,
+            },
+            None => 5 * 60,
+        };
+        if self.is_running() {
+            return Some((life, life));
+        }
+        let last = self.chat.last_read?;
+        Some((life.saturating_sub(now.saturating_sub(last)), life))
+    }
+
     /// The model working right now, while a request runs.
     pub fn working_model(&self) -> Option<&ModelId> {
         self.chat
@@ -4360,6 +4490,7 @@ impl App {
             | Question::KeepWarm { .. }
             | Question::ColdStart { .. }
             | Question::AddFolder { .. }
+            | Question::Remember { .. }
             | Question::ExternalTool { .. } => (Vec::new(), Vec::new(), Vec::new()),
         };
         let answer = match key.code {
@@ -4416,6 +4547,8 @@ impl App {
                     | Question::ColdStart { .. }
                     | Question::AddFolder { .. }
                     | Question::ExternalTool { .. } => None,
+                    // The rule, to keep elsewhere or edit before it is.
+                    Question::Remember { rule } => Some(Effect::Copy(rule.clone())),
                 });
             }
             _ => return Some(None),
@@ -4423,6 +4556,9 @@ impl App {
         if let Some((_, sender)) = self.chat.approval.take() {
             // The agent may have been stopped meanwhile.
             let _ = sender.send(answer);
+            if let Some(log) = &mut self.chat.flight {
+                log.answered(Instant::now());
+            }
         }
         self.approval_scroll = 0;
         Some(None)
@@ -4767,6 +4903,8 @@ impl App {
             background: self.settings.backdrop.pattern,
             background_motion: (self.settings.backdrop.motion != crate::backdrop::Motion::Still)
                 .then_some(self.settings.backdrop.motion),
+            bullets: (self.settings.bullets != crate::markdown::Bullets::default())
+                .then_some(self.settings.bullets),
             // Set in the file only: kept as written there.
             workspaces: self.settings.workspaces.clone(),
             context_warning: self.settings.context_warning,
@@ -5051,6 +5189,11 @@ impl App {
         self.settings.backdrop
     }
 
+    /// How a reply's bullets are drawn.
+    pub fn bullets(&self) -> crate::markdown::Bullets {
+        self.settings.bullets
+    }
+
     /// How large the window's text is: 1 at first.
     pub fn text_size(&self) -> f32 {
         self.settings.text_size.unwrap_or(1.0)
@@ -5128,6 +5271,13 @@ impl App {
         Some(None)
     }
 
+    /// The running request's time goes to `leg` from now.
+    fn fly(&mut self, leg: crate::flight::Leg) {
+        if let Some(log) = &mut self.chat.flight {
+            log.switch(leg, Instant::now());
+        }
+    }
+
     fn on_event(&mut self, event: Event) {
         let entry = match event {
             // Tokens and cost go to the status line, not the transcript.
@@ -5156,25 +5306,25 @@ impl App {
                     role: purpose.name().to_owned(),
                     rewrite_extra: cache.and_then(|c| c.rewrite_extra).map(|u| u.0),
                 });
-                // The model that answers is back: the member is done.
-                if self.chat.member.as_ref().is_some_and(|m| *m != model) {
+                // The model that answers is back: the member is done. A side
+                // question to another model, such as whether a command only
+                // reads, is not that model.
+                if purpose != universe_agent::Purpose::Other
+                    && self.chat.member.as_ref().is_some_and(|m| *m != model)
+                {
                     self.chat.member = None;
                     self.chat.working_model = Some(model.clone());
                 }
-                // Who worked, in turn: a new run when the model changes.
-                let run = match self.chat.runs.last_mut() {
-                    Some((last, spent)) if *last == model => spent,
-                    _ => {
-                        self.chat.runs.push((model.clone(), Spent::default()));
-                        &mut self.chat.runs.last_mut().expect("just pushed").1
-                    }
-                };
-                run.usage += usage;
-                match cost {
-                    Some(c) => run.cost += c,
-                    None => run.subscription |= subscription,
+                let running = self.is_running();
+                if !running && let Some(job) = &mut self.tickets_job {
+                    // The tickets pane's own: its line once done.
+                    add_run(&mut job.runs, &model, usage, cost, subscription);
+                    job.context = context.or(job.context);
+                } else {
+                    // Who worked, in turn.
+                    add_run(&mut self.chat.runs, &model, usage, cost, subscription);
                 }
-                if self.chat.member.is_none() {
+                if running && self.chat.member.is_none() {
                     self.chat.request_spent.usage += usage;
                     match cost {
                         Some(c) => self.chat.request_spent.cost += c,
@@ -5196,8 +5346,14 @@ impl App {
                         None => spent.subscription |= subscription,
                     }
                 }
-                if context.is_some() {
-                    self.chat.context = context;
+                // While a member works, the gauge shows its context, which is
+                // what fills; the conversation's comes back after.
+                if context.is_some() && purpose != universe_agent::Purpose::Other {
+                    if self.chat.member.as_ref() == Some(&model) {
+                        self.chat.member_context = context;
+                    } else {
+                        self.chat.context = context;
+                    }
                 }
                 self.chat.usage += usage;
                 match cost {
@@ -5240,9 +5396,18 @@ impl App {
                     outcome,
                 }
             }
-            Event::Checking { commands } => Entry::Checks(commands),
-            Event::Passed => Entry::Passed,
-            Event::Failed { command, excerpt } => Entry::Failed { command, excerpt },
+            Event::Checking { commands } => {
+                self.fly(crate::flight::Leg::Checks);
+                Entry::Checks(commands)
+            }
+            Event::Passed => {
+                self.fly(crate::flight::Leg::Model);
+                Entry::Passed
+            }
+            Event::Failed { command, excerpt } => {
+                self.fly(crate::flight::Leg::Model);
+                Entry::Failed { command, excerpt }
+            }
             Event::Escalating { from, to } => {
                 self.chat.working_model = Some(to.clone());
                 Entry::Escalating { from, to }
@@ -5259,6 +5424,7 @@ impl App {
                 self.chat.sub_scroll.set(0);
                 self.chat.working_model = Some(to.clone());
                 self.chat.member = Some(to);
+                self.chat.member_context = None;
                 return;
             }
             Event::Step {
@@ -5269,6 +5435,7 @@ impl App {
                 effort,
             } => {
                 self.chat.step = Some(name.clone());
+                self.chat.step_place = (number > 0 && of > 0).then_some((number, of));
                 self.chat.working_model = model.clone();
                 Entry::Step {
                     number,
@@ -5302,19 +5469,27 @@ impl App {
                 ))
             }
             Event::PairEnded { text } => Entry::Ended(text),
+            // Where the request's time goes; the command shows once done.
+            Event::Running { command, .. } => {
+                self.fly(crate::flight::Leg::of_command(&command));
+                return;
+            }
             Event::Command {
                 model,
                 command,
                 status,
                 output,
                 checked_by,
-            } => Entry::Command {
-                model,
-                command,
-                status,
-                output,
-                checked_by,
-            },
+            } => {
+                self.fly(crate::flight::Leg::Model);
+                Entry::Command {
+                    model,
+                    command,
+                    status,
+                    output,
+                    checked_by,
+                }
+            }
             Event::Silent { model } => Entry::Error(format!(
                 "{model} answered nothing, twice: the request ends without a reply"
             )),
@@ -5415,6 +5590,7 @@ impl App {
     /// The request was stopped: the conversation says so and stops waiting for it.
     pub fn on_cancelled(&mut self) {
         self.chat.running_since = None;
+        self.chat.flight = None;
         // Its answer would reach nobody.
         self.chat.approval = None;
         self.chat.transcript.push(Entry::Interrupted);
@@ -5936,6 +6112,43 @@ mod tests {
     }
 
     #[test]
+    fn a_members_gauge_shows_while_it_works_and_a_side_question_does_not_end_it() {
+        let mut app = ready();
+        let turn = |model: &str, used: u64, purpose: universe_agent::Purpose| {
+            AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: universe_core::Usage::default(),
+                cost: None,
+                subscription: true,
+                context: Some(ContextUse {
+                    used: TokenCount(used),
+                    window: TokenCount(100_000),
+                }),
+                cache: None,
+                purpose,
+            })
+        };
+        app.on_agent(turn("cheap", 10_000, universe_agent::Purpose::Chat));
+        app.on_agent(AgentMessage::Event(Event::Delegating {
+            from: ModelId::new("cheap").unwrap(),
+            to: ModelId::new("strong").unwrap(),
+            task: "read a.py".into(),
+        }));
+        app.on_agent(turn("strong", 60_000, universe_agent::Purpose::Chat));
+        assert_eq!(app.context().unwrap().used, TokenCount(60_000));
+        // Whether a command only reads, asked of the cheapest model: the
+        // member goes on, its pane open.
+        app.on_agent(turn("tiny", 900, universe_agent::Purpose::Other));
+        assert!(app.chat.member.is_some());
+        assert!(app.sub_agent().is_some());
+        assert_eq!(app.context().unwrap().used, TokenCount(60_000));
+        // The model that answers is back: the conversation's gauge again.
+        app.on_agent(turn("cheap", 11_000, universe_agent::Purpose::Chat));
+        assert!(app.chat.member.is_none());
+        assert_eq!(app.context().unwrap().used, TokenCount(11_000));
+    }
+
+    #[test]
     fn a_ticket_is_linked_noted_judged_and_kept_with_its_branch() {
         #[derive(Debug)]
         struct Nothing;
@@ -5976,6 +6189,24 @@ mod tests {
         };
         assert_eq!(named.id, "ENG-1");
         assert!(app.tickets_open() && app.tickets_busy().is_some());
+        // The model that read it: counted on a line of its own, not with
+        // the next request.
+        app.on_agent(AgentMessage::Event(Event::Turn {
+            model: ModelId::new("cheap").unwrap(),
+            usage: Usage {
+                input: TokenCount(900),
+                output: TokenCount(40),
+            },
+            cost: Some(Usd(0.001)),
+            subscription: false,
+            context: Some(ContextUse {
+                used: TokenCount(900),
+                window: TokenCount(9_000),
+            }),
+            cache: None,
+            purpose: universe_agent::Purpose::Other,
+        }));
+        assert!(app.chat.runs.is_empty());
         app.on_agent(AgentMessage::Ticket(Ok(crate::tickets::Ticket {
             tracker: "issues".into(),
             id: "ENG-1".into(),
@@ -5984,6 +6215,20 @@ mod tests {
             items: vec!["accept files".into()],
         })));
         assert_eq!(app.tickets().tickets.len(), 1);
+        let Some(Entry::Cost {
+            runs,
+            context,
+            cost,
+            ..
+        }) = app.chat.transcript.last()
+        else {
+            panic!("the ticket's cost line");
+        };
+        assert_eq!(runs[0].0.as_str(), "cheap");
+        assert_eq!(
+            (context.map(|c| c.percent()), *cost),
+            (Some(10), Usd(0.001))
+        );
         run(&mut app, "/ticket note checked on staging");
         assert_eq!(app.tickets().notes, ["checked on staging"]);
         let Some((branch, kept)) = app.tickets_to_keep() else {
@@ -6824,6 +7069,71 @@ mod tests {
     }
 
     #[test]
+    fn the_caches_life_left_counts_from_the_last_call() {
+        let mut app = ready();
+        // No request yet: nothing is cached.
+        assert_eq!(app.cache_left(1_000), None);
+        app.chat.last_read = Some(1_000);
+        assert_eq!(app.cache_left(1_060), Some((240, 300)));
+        assert_eq!(app.cache_left(9_999), Some((0, 300)));
+        app.settings.tiers = vec![ModelId::new("claude-code/opus").unwrap()];
+        assert_eq!(app.cache_left(1_060), Some((3_540, 3_600)));
+        app.settings.tiers = vec![ModelId::new("codex").unwrap()];
+        assert_eq!(app.cache_left(1_060), Some((1_140, 1_200)));
+    }
+
+    #[test]
+    fn a_requests_time_is_told_by_what_it_went_to() {
+        use crate::flight::Leg;
+        let mut app = ready();
+        type_text(&mut app, "run the tests");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.leg(), Some(Leg::Model));
+        let model = ModelId::new("cheap").unwrap();
+        app.on_agent(AgentMessage::Event(Event::Running {
+            model: model.clone(),
+            command: "cargo test -q".into(),
+        }));
+        assert_eq!(app.leg(), Some(Leg::Tests));
+        // Still running: nothing shows until it ran.
+        assert!(!matches!(
+            app.transcript().last(),
+            Some(Entry::Command { .. })
+        ));
+        app.on_agent(AgentMessage::Event(Event::Command {
+            model,
+            command: "cargo test -q".into(),
+            status: "exit status 0".into(),
+            output: String::new(),
+            checked_by: None,
+        }));
+        assert_eq!(app.leg(), Some(Leg::Model));
+        app.on_agent(AgentMessage::Event(Event::Checking {
+            commands: vec!["cargo check".into()],
+        }));
+        assert_eq!(app.leg(), Some(Leg::Checks));
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: vec![],
+        })));
+        assert_eq!(app.leg(), None);
+        let Some(Entry::Cost { flight, .. }) = app.transcript().last() else {
+            panic!("a cost line");
+        };
+        assert!(
+            flight
+                .0
+                .iter()
+                .all(|(leg, _)| matches!(leg, Leg::Model | Leg::Tests | Leg::Checks))
+        );
+    }
+
+    #[test]
     fn a_conversation_is_saved_once_something_was_said_and_comes_back_whole() {
         let mut app = ready();
         assert!(app.to_saved(Session::new()).is_none());
@@ -7145,6 +7455,7 @@ mod tests {
                 cache_ttl: None,
                 background: None,
                 background_motion: None,
+                bullets: None,
                 workspaces: vec![],
                 context_warning: None,
                 summarize_when_cold: vec![],

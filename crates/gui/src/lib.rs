@@ -17,6 +17,7 @@ mod api_view;
 mod arch_view;
 mod backdrop;
 mod branch_pane;
+mod bullets;
 mod database_view;
 mod diagrams;
 mod diff_view;
@@ -25,6 +26,7 @@ mod error;
 mod fleet_view;
 mod infra;
 mod keys;
+mod orbits;
 mod plan;
 mod review_view;
 mod service_board;
@@ -36,6 +38,7 @@ mod tickets_pane;
 mod transcript;
 mod universe;
 mod usage;
+mod viewer;
 mod windows;
 
 use std::sync::Arc;
@@ -44,7 +47,7 @@ use std::time::Duration;
 use bevy::app::AppExit;
 use bevy::camera::CameraOutputMode;
 use bevy::input::ButtonState;
-use bevy::input::keyboard::{KeyCode as PhysicalKey, KeyboardInput};
+use bevy::input::keyboard::{Key, KeyCode as PhysicalKey, KeyboardInput};
 use bevy::prelude::*;
 use bevy::render::render_resource::BlendState;
 use bevy::window::{CompositeAlphaMode, PrimaryWindow};
@@ -76,6 +79,7 @@ use crate::plan::Plan;
 use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
 use crate::universe::{Assets3d, Universe};
 use crate::usage::UsageView;
+use universe_ui::flight::Leg;
 
 /// How the window's pixels blend with what is behind it. Metal offers only
 /// `Opaque` and `PostMultiplied`: asked for another, the surface cannot be
@@ -100,9 +104,6 @@ const BLINK: Duration = Duration::from_millis(530);
 /// How long it may sleep while a background moves: about twelve frames a
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
-
-/// The frames of the spinner.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The width of the usage pane, in points.
 const USAGE_WIDTH: f32 = 460.0;
@@ -163,6 +164,8 @@ where
         relaunch: Arc::clone(&relaunch),
         diagrams,
         branch: branch_pane::BranchPane::default(),
+        bullets_moving: false,
+        viewer: None,
         tickets: tickets_pane::TicketsPane::default(),
     };
 
@@ -227,6 +230,10 @@ where
         .add_systems(EguiPrimaryContextPass, draw::<M, D>)
         .add_systems(Last, close_or_reopen::<M, D>)
         .add_systems(
+            PreUpdate,
+            follow_new_window.before(EguiPreUpdateSet::InitContexts),
+        )
+        .add_systems(
             PostUpdate,
             copy_selection::<M, D>.after(EguiPostUpdateSet::ProcessOutput),
         )
@@ -280,6 +287,11 @@ struct Shell<M, D> {
     diagrams: diagrams::Diagrams,
     /// What the branch changed, as its pane shows it.
     branch: branch_pane::BranchPane,
+    /// Whether a moving bullet was in view when the window last drew: it
+    /// wakes then as a moving background does.
+    bullets_moving: bool,
+    /// An image shown whole over the window, while it is.
+    viewer: Option<viewer::Viewer>,
     /// The branch's tickets, as their pane shows them.
     tickets: tickets_pane::TicketsPane,
 }
@@ -451,6 +463,21 @@ fn read_keys<M, D>(
         if !down {
             continue;
         }
+        // An image shown whole takes the keys: none reaches the state
+        // behind it.
+        if let Some(shown) = &mut shell.viewer {
+            match &event.logical_key {
+                Key::Escape => shell.viewer = None,
+                Key::Character(c) => match c.as_str() {
+                    "f" | "F" | "0" => shown.fit(),
+                    "+" | "=" => shown.zoom(viewer::STEP),
+                    "-" | "_" => shown.zoom(1.0 / viewer::STEP),
+                    _ => {}
+                },
+                _ => {}
+            }
+            continue;
+        }
         match keys::translate(&event.logical_key, *held) {
             Some(Pressed::Key(key)) => shell.key(key),
             Some(Pressed::Paste) => match clipboard::paste() {
@@ -516,7 +543,8 @@ fn drive<M, D>(
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
-    let moving = backdrop.pattern.is_some() && backdrop.motion == Motion::Slow;
+    let moving =
+        backdrop.pattern.is_some() && backdrop.motion == Motion::Slow || shell.bullets_moving;
     let focused = if continuous {
         UpdateMode::Continuous
     } else if moving {
@@ -565,12 +593,21 @@ where
         // behind its back.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         *styled = true;
+        // The fonts set take effect on the next pass: text drawn in a
+        // family they add, bold, would find none now.
+        ctx.request_repaint();
+        return Ok(());
     }
     let size = shell.app.text_size();
     if (ctx.zoom_factor() - size).abs() > 0.001 {
         ctx.set_zoom_factor(size);
     }
     let shell = &mut *shell;
+    // Left by the last frame's bullets, and taken: only those drawn again
+    // keep the window awake.
+    shell.bullets_moving = ctx
+        .data_mut(|d| d.remove_temp::<bool>(Id::new(bullets::MOVING)))
+        .unwrap_or(false);
     // The conversation's diagrams, for the Markdown that draws them.
     ctx.data_mut(|d| d.insert_temp(Id::new("diagrams"), shell.diagrams.clone()));
     let mut root = Ui::new(
@@ -716,7 +753,7 @@ where
     }
 
     // The branch's tickets (Ctrl-L) on the right; an item's or a file's
-    // pieces of the diff on the left.
+    // pieces of the diff in the conversation's place, further down.
     if shell.app.tickets_open() {
         let fill = if shell.app.map_view() == Some(MapView::Universe) {
             theme::see(PANEL, 0.62 * opacity)
@@ -738,14 +775,11 @@ where
                     tickets_pane::show(ui, tickets, app, effects);
                 });
             });
-        if shell.app.ticket_view().is_some() && shell.app.map_view().is_none() {
-            let Shell { tickets, app, .. } = &mut *shell;
-            egui::Panel::left("ticket-pieces")
-                .resizable(true)
-                .default_size(560.0)
-                .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
-                .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
-        }
+    }
+    let pieces = shell.app.tickets_open() && shell.app.ticket_view().is_some();
+    if !pieces {
+        // Shown again, they start at the top.
+        shell.tickets.hidden();
     }
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
@@ -923,6 +957,13 @@ where
             .show(&mut root, |ui| {
                 file(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
             });
+    } else if pieces {
+        // A ticket's pieces take the conversation's room: beside it, both
+        // were too narrow to read.
+        let Shell { tickets, app, .. } = &mut *shell;
+        egui::CentralPanel::default()
+            .frame(pane.fill(background))
+            .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
     } else {
         egui::CentralPanel::default()
             .frame(pane.fill(background))
@@ -941,6 +982,19 @@ where
         ctx.request_repaint();
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
+    // An image clicked while drawing, shown whole over everything.
+    if let Some(texture) = ctx
+        .data_mut(|d| d.remove_temp::<Option<egui::TextureHandle>>(Id::new(viewer::OPEN)))
+        .flatten()
+    {
+        shell.viewer = Some(viewer::Viewer::new(texture));
+    }
+    if let Some(shown) = &mut shell.viewer
+        && !shown.show(&ctx)
+    {
+        shell.viewer = None;
+        ctx.request_repaint();
+    }
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
         ctx.request_repaint();
     }
@@ -988,6 +1042,39 @@ fn close_or_reopen<M, D>(
         warn!("the system took the window away unasked: opening it again");
         let title = format!("{} · universe", shell.app.name());
         commands.spawn((main_window(title), PrimaryWindow));
+    }
+}
+
+/// Points egui's contexts at the primary window when it is made again, as
+/// macOS does after sleep or when a screen is unplugged. bevy_egui maps a
+/// window to its contexts only when a context is made: the new window's
+/// clicks and scrolling would reach nothing, while keys, which universe
+/// reads itself, still arrive. Harmless where windows are never remade.
+fn follow_new_window(
+    added: Query<Entity, Added<PrimaryWindow>>,
+    contexts: Query<(Entity, &bevy::camera::RenderTarget), With<bevy_egui::EguiContext>>,
+    mut map: ResMut<bevy_egui::input::WindowToEguiContextMap>,
+) {
+    let Ok(window) = added.single() else {
+        return;
+    };
+    for (context, target) in &contexts {
+        if !matches!(
+            target,
+            bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Primary)
+        ) {
+            continue;
+        }
+        if let Some(old) = map.context_to_window.insert(context, window)
+            && old != window
+            && let Some(theirs) = map.window_to_contexts.get_mut(&old)
+        {
+            theirs.remove(&context);
+        }
+        map.window_to_contexts
+            .entry(window)
+            .or_default()
+            .insert(context);
     }
 }
 
@@ -1542,14 +1629,11 @@ fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
     let back = shell.app.scroll_back();
     let delta = back as f32 - shell.scroll_seen as f32;
     shell.scroll_seen = back;
-    // A line too long to wrap (a command, a path, code) scrolls sideways
-    // rather than widen the pane: a scroll area that cannot scroll across
-    // grows to its widest line, and the pane with it, back to that width
-    // whenever it is dragged narrower. Text still wraps at the pane's width.
-    // Short of the scroll bar, which a scroll area across leaves to its
-    // content otherwise.
+    // Up and down only: a trackpad's sideways drift shook the conversation.
+    // Text wraps at the pane's width; code and tables too wide scroll on
+    // their own cards. Short of the scroll bar.
     let width = ui.available_width() - ui.spacing().scroll.allocated_width();
-    let output = ScrollArea::both()
+    let output = ScrollArea::vertical()
         .id_salt("transcript")
         .stick_to_bottom(true)
         .auto_shrink(false)
@@ -1576,9 +1660,18 @@ fn activity(ui: &mut Ui, app: &App) {
         }
         return;
     };
+    let leg = app.leg();
+    let asking = leg == Some(Leg::Approvals);
     ui.horizontal(|ui| {
-        let glyph = SPINNER[app.spinner() % SPINNER.len()];
-        ui.label(RichText::new(format!("{glyph} Working…")).color(ACCENT));
+        orbits::working(ui);
+        let doing = match leg {
+            Some(Leg::Approvals) => "Waiting for you…",
+            Some(Leg::Tests) => "Running tests…",
+            Some(Leg::Commands) => "Running a command…",
+            Some(Leg::Checks) => "Checking…",
+            Some(Leg::Model) | None => "Working…",
+        };
+        ui.label(RichText::new(doing).color(if asking { YELLOW } else { ACCENT }));
         if let Some(step) = app.step() {
             ui.label(RichText::new(step.to_lowercase()).color(DIM));
         }
@@ -1589,12 +1682,19 @@ fn activity(ui: &mut Ui, app: &App) {
         if spent.usage.input.0 > 0 {
             ui.label(RichText::new(spent.to_string()).color(DIM));
         }
+        // The person's time is not the request's: its clock waits.
+        let paused = if asking { ", paused" } else { "" };
         ui.label(
-            RichText::new(format!("{}s · Ctrl-C to stop", elapsed.as_secs()))
+            RichText::new(format!("{}s{paused} · Ctrl-C to stop", elapsed.as_secs()))
                 .small()
                 .color(DIM),
         );
     });
+    if let Some((number, of)) = app.step_place() {
+        ui.add_space(2.0);
+        let width = ui.available_width().min(360.0);
+        orbits::steps(ui, number, of, width);
+    }
     ui.add_space(4.0);
 }
 
@@ -1732,17 +1832,24 @@ fn status(ui: &mut Ui, app: &App) {
                     );
                 });
             let (added, removed) = changes.lines();
+            // The base's commit alone: with its subject, the line ran over
+            // what the right of the status line says. Whole on hover.
+            let base = changes
+                .base_line
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
             ui.label(
                 RichText::new(format!(
-                    "{} files · +{added} −{removed} · since {}",
+                    "{} files · +{added} −{removed} · since {base}",
                     changes.files.len(),
-                    changes.base_line
                 ))
                 .small()
                 .color(DIM),
             )
             .on_hover_text(format!(
-                "/{} off ends it",
+                "since {}\n/{} off ends it",
+                changes.base_line,
                 changes.lens.name().to_lowercase()
             ));
             // Who answers while walking: never a surprise.
@@ -1766,6 +1873,7 @@ fn status(ui: &mut Ui, app: &App) {
             None => {}
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            cache_orbit(ui, app);
             let (usage, cost, complete) = app.totals();
             let budget = app
                 .budget()
@@ -1841,6 +1949,37 @@ fn status(ui: &mut Ui, app: &App) {
             });
         });
     });
+}
+
+/// The cache's orbit, at the end of the status line: how full the context
+/// is, and how much of the prompt cache's life is left, said on hover.
+fn cache_orbit(ui: &mut Ui, app: &App) {
+    let context = app.context();
+    let cache = app.cache_left(universe_ui::sessions::now());
+    if context.is_none() && cache.is_none() {
+        return;
+    }
+    let full = context
+        .filter(|c| c.window.0 > 0)
+        .map(|c| (c.used.0 as f32 / c.window.0 as f32).min(1.0));
+    let context_said = context.map_or_else(
+        || "Context: not known yet".to_owned(),
+        |c| format!("Context {}% full: {} of {}", c.percent(), c.used, c.window),
+    );
+    let minutes = |s: u64| s.div_ceil(60);
+    let cache_said = match cache {
+        Some((0, _)) => "Cache cold: the next request writes it again, at full price".to_owned(),
+        Some((left, life)) => format!(
+            "Cache: about {} min left of {}, as long as it is not read again",
+            minutes(left),
+            minutes(life)
+        ),
+        None => "No cache yet: it is written by the first request".to_owned(),
+    };
+    orbits::cache(ui, full, cache).on_hover_text(format!(
+        "{context_said}\n{cache_said}\nThe planet warms as the context fills; the comet goes \
+         round once over the cache's life"
+    ));
 }
 
 /// The file tree, the selected row kept in view.
@@ -2315,5 +2454,43 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     if let Some((row, column)) = definition {
         app.definition_at(row, column);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::camera::RenderTarget;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::window::WindowRef;
+    use bevy_egui::input::WindowToEguiContextMap;
+
+    use super::*;
+
+    #[test]
+    fn a_window_made_again_gets_eguis_contexts() {
+        let mut world = World::new();
+        world.init_resource::<WindowToEguiContextMap>();
+        let context = world
+            .spawn((
+                RenderTarget::Window(WindowRef::Primary),
+                bevy_egui::EguiContext::default(),
+            ))
+            .id();
+        // Mapped to the window that is gone.
+        let gone = world.spawn_empty().id();
+        {
+            let mut map = world.resource_mut::<WindowToEguiContextMap>();
+            map.context_to_window.insert(context, gone);
+            map.window_to_contexts
+                .entry(gone)
+                .or_default()
+                .insert(context);
+        }
+        let window = world.spawn(PrimaryWindow).id();
+        world.run_system_once(follow_new_window).unwrap();
+        let map = world.resource::<WindowToEguiContextMap>();
+        assert_eq!(map.context_to_window[&context], window);
+        assert!(map.window_to_contexts[&window].contains(&context));
+        assert!(!map.window_to_contexts[&gone].contains(&context));
     }
 }
