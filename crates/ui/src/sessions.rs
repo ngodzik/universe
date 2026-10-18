@@ -58,13 +58,9 @@ pub struct Summary {
     pub project: PathBuf,
 }
 
-/// universe's own folder, as the rest of it finds it: `UNIVERSE_HOME`, else
-/// `~/.universe`.
+/// universe's own folder, as the rest of it finds it.
 fn base() -> Option<PathBuf> {
-    Some(match std::env::var_os("UNIVERSE_HOME") {
-        Some(home) => PathBuf::from(home),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
-    })
+    crate::defaults::Defaults::home()
 }
 
 /// The latest conversations of every project, most recent first, at most

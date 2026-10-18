@@ -54,7 +54,7 @@ In `universe-ui`, keys become actions only in `keymap.rs`, and `App` turns actio
 
 A `Delegate` (Claude Code, Codex) is an agent rather than a model: it gets a whole task, edits files and runs commands itself, and reports what it does as events. Claude Code runs in its own auto permission mode, Codex in its sandbox; a planner or reviewer only reads. What their safety checks refuse is shown, for the person to approve in their next message.
 
-A model edits files through `Toolbox` and runs commands through the agent's `run_command`, where `universe_tools::assess` holds what cannot be undone, leaves the machine or cannot be read, for the person to approve; a command held only because it cannot be read is first read by the cheapest priced model. Writing where code runs later (hooks, CI workflows, shell start-up files, tools' settings) is held, and every command is written to `~/.universe/audit.log`. A command that would show a secret is refused outright; secrets reach a command only when a program reads its own or the person allowed one it names, and output is redacted of them. Checks are run by the agent, so a model can neither skip nor fake them; they judge a pair and `universe do`, not a request in the conversation.
+A model edits files through `Toolbox` and runs commands through the agent's `run_command`, where `universe_tools::assess` holds what cannot be undone, leaves the machine or cannot be read, for the person to approve; a command held only because it cannot be read is first read by the cheapest priced model. Writing where code runs later (hooks, CI workflows, shell start-up files, tools' settings) is held, and every command is written to `~/.universe/audit.log`. A command that would show a secret is refused outright; secrets reach a command only when a program reads its own or the person allowed one it names, and what commands and checks print is redacted of them and of those the project's `.env` files hold. A file of secrets is never read, searched or edited through `Toolbox`, nor named by a command: of a `.env` file, a model sees the names it sets, then the value of one whose name and look say it is no secret. Checks are run by the agent, so a model can neither skip nor fake them; they judge a pair and `universe do`, not a request in the conversation.
 
 A new crate (workflows, context) is added when its first real code lands, not before, and this graph is updated in the same commit.
 
@@ -77,6 +77,7 @@ A new crate (workflows, context) is added when its first real code lands, not be
 ### Secrets
 - API keys come from the environment, never from a flag value in shell history, never from a committed file
 - A type that holds a key implements `Debug` by hand and redacts it
+- universe's own folder, `~/.universe`, and all it holds are readable by their owner only: `Defaults::keep_home_private` shuts it when universe starts and when its window closes, so what writes there needs nothing more
 
 ### Unsafe
 - `#![deny(unsafe_code)]` in every crate, the binary included

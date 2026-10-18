@@ -110,7 +110,8 @@ fn split_paths(text: &str) -> (Option<String>, &str) {
 }
 
 /// `text` with each `@path` replaced by that file, when it is inside the
-/// project; paths in backticks or code blocks are left as written.
+/// project and holds no secrets; paths in backticks or code blocks are left
+/// as written.
 fn expand_imports(text: &str, base: &Path, root: &Path, depth: usize) -> String {
     let mut out = String::new();
     let mut in_block = false;
@@ -133,11 +134,15 @@ fn expand_imports(text: &str, base: &Path, root: &Path, depth: usize) -> String 
             };
             let target = target.trim_end_matches(['.', ',', ';', ')']);
             let path = base.join(target);
-            let inside = path
-                .canonicalize()
-                .ok()
+            let real = path.canonicalize().ok();
+            let inside = real
+                .as_ref()
                 .zip(root.canonicalize().ok())
-                .is_some_and(|(p, r)| p.starts_with(r));
+                .filter(|(p, r)| p.starts_with(r))
+                .is_some_and(|(p, _)| {
+                    !crate::secrets::secret_file(target)
+                        && !crate::secrets::secret_file(&p.to_string_lossy())
+                });
             if !inside {
                 continue;
             }
@@ -194,8 +199,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(dir.path().join("secret.md"), "outside").unwrap();
         fs::write(root.join("x.md"), "inside").unwrap();
-        fs::write(root.join("CLAUDE.md"), "@../secret.md and `@x.md`\n").unwrap();
+        fs::write(root.join(".env"), "API_KEY=sk-live-0123").unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "@../secret.md and `@x.md`, with @.env\n",
+        )
+        .unwrap();
         let text = project_instructions(&root).unwrap();
         assert!(!text.contains("outside") && !text.contains("(from x.md)"));
+        assert!(!text.contains("sk-live"), "{text}");
     }
 }

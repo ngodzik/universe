@@ -144,7 +144,7 @@ impl Check {
         );
         Ok(Some(CheckFailure {
             command: self.command(),
-            excerpt: excerpt(&text),
+            excerpt: excerpt(&crate::command::redact_output(&text, dir)),
         }))
     }
 }
@@ -192,7 +192,7 @@ impl Check {
         } else {
             Trial::Failed(CheckFailure {
                 command: self.command(),
-                excerpt: excerpt(&text),
+                excerpt: excerpt(&crate::command::redact_output(&text, root)),
             })
         }
     }
@@ -411,6 +411,26 @@ mod tests {
             trial("echo Ran 0 tests in 0.000s").try_out(root).await,
             Trial::Unusable(why) if why == "it finds no tests to run"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_a_failing_check_prints_of_a_secret_is_taken_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".env"), "API_KEY=sk-live-0123456789\n").unwrap();
+        std::fs::write(
+            root.join("fail.sh"),
+            "echo \"settings: $(cat .env)\"; exit 1\n",
+        )
+        .unwrap();
+        let report = Check::run_all(&[Check::parse("sh fail.sh").unwrap()], root)
+            .await
+            .unwrap();
+        let CheckReport::Failed(failure) = report else {
+            panic!("the check fails: {report:?}");
+        };
+        assert_eq!(failure.excerpt, "settings: API_KEY=<redacted:API_KEY>");
     }
 
     #[test]

@@ -83,7 +83,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A terminal coding agent that lets deterministic tools do the work before any model does."
 
 [[bin]]
 name = "universe"

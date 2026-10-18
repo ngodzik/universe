@@ -3671,10 +3671,17 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
             reasons: found.refused.clone(),
             approved: false,
         });
+        // What a .env file sets is read another way.
+        let variables = if found.refused.iter().any(|r| r.contains("file of secrets")) {
+            " Of a .env file, read_file gives the names it sets, then with `name` the value of \
+             one that is no secret."
+        } else {
+            ""
+        };
         return format!(
             "refused: {}. Secrets are never shown to models, and nobody can allow it. Do not \
              try another way: a tool that needs credentials finds its own, so run the tool \
-             itself.",
+             itself.{variables}",
             found.refused.join("; ")
         );
     }
@@ -5637,6 +5644,7 @@ mod tests {
             seen[1].messages.last(),
             Some(Message::Tool { content, .. })
                 if content.starts_with("refused: it reads or touches a file of secrets. Secrets are never shown")
+                    && content.ends_with("read_file gives the names it sets, then with `name` the value of one that is no secret.")
         ));
         // Named: asked once, allowed for good, then not asked again.
         let asked = asked.lock().unwrap();
