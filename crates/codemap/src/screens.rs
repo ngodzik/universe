@@ -39,6 +39,9 @@ pub struct FrontEnd {
     /// The variable of the environment it reads its API's address from:
     /// `NEXT_PUBLIC_API_URL`.
     pub api_env: Option<String>,
+    /// The variables of the environment it reads its own address from:
+    /// `NEXT_PUBLIC_FRONTEND_BASE_URL`, `NEXTAUTH_URL`.
+    pub own_env: Vec<String>,
     /// The cookies its middleware reads, a session's among them.
     pub cookies: Vec<String>,
     /// Its screens, by route.
@@ -293,6 +296,7 @@ fn front_end(
                 .to_owned()
         });
 
+    let read = env_read(map, text_of, &files);
     let mut front = FrontEnd {
         folder: folder.to_owned(),
         name,
@@ -300,7 +304,8 @@ fn front_end(
         framework,
         runner: runner(&index, folder),
         dev,
-        api_env: api_env(map, text_of, &files),
+        api_env: api_env(&read),
+        own_env: own_env(&read),
         cookies: cookies(map, text_of, folder),
         screens,
         workflows: Vec::new(),
@@ -341,14 +346,19 @@ fn runner(index: &HashMap<&str, usize>, folder: &str) -> String {
     }
 }
 
-/// The variable of the environment a front end reads its API's address
-/// from: the one its code reads most among those that name an API and an
-/// address.
-fn api_env(map: &CodeMap, text_of: &HashMap<usize, &str>, files: &[usize]) -> Option<String> {
+/// The variables of the environment a front end's code reads, each with
+/// how many times.
+fn env_read(
+    map: &CodeMap,
+    text_of: &HashMap<usize, &str>,
+    files: &[usize],
+) -> BTreeMap<String, usize> {
     static READ: LazyLock<Option<Regex>> =
         LazyLock::new(|| Regex::new(r"(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]*)").ok());
-    let read = READ.as_ref()?;
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let Some(read) = READ.as_ref() else {
+        return counts;
+    };
     for file in files {
         if crate::map::is_test(Path::new(&map.nodes[*file].path)) {
             continue;
@@ -357,20 +367,52 @@ fn api_env(map: &CodeMap, text_of: &HashMap<usize, &str>, files: &[usize]) -> Op
             continue;
         };
         for c in read.captures_iter(text) {
-            let name = &c[1];
-            let api = name.contains("API") || name.contains("BACKEND");
-            let address = ["URL", "BASE", "HOST", "ENDPOINT", "SERVER", "ORIGIN"]
-                .iter()
-                .any(|w| name.contains(w));
-            if api && address {
-                *counts.entry(name.to_owned()).or_default() += 1;
-            }
+            *counts.entry(c[1].to_owned()).or_default() += 1;
         }
     }
     counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(name, _)| name)
+}
+
+/// Whether a variable's name says it holds an address: `URL`, `HOST`…
+fn names_address(name: &str) -> bool {
+    ["URL", "BASE", "HOST", "ENDPOINT", "SERVER", "ORIGIN"]
+        .iter()
+        .any(|w| name.contains(w))
+}
+
+/// The variable a front end reads its API's address from: the one its
+/// code reads most among those that name an API and an address.
+fn api_env(read: &BTreeMap<String, usize>) -> Option<String> {
+    read.iter()
+        .filter(|(name, _)| {
+            (name.contains("API") || name.contains("BACKEND")) && names_address(name)
+        })
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(name, _)| name.clone())
+}
+
+/// The variables a front end reads its own address from: those that name
+/// the front end, the site or the app and an address (`FRONTEND_BASE_URL`,
+/// `SITE_URL`), and `NEXTAUTH_URL`. Left unset, a front end may send its
+/// pages to where it is deployed.
+fn own_env(read: &BTreeMap<String, usize>) -> Vec<String> {
+    read.keys()
+        .filter(|name| {
+            let own = [
+                "FRONTEND",
+                "SITE",
+                "APP_URL",
+                "APP_BASE",
+                "WEB_URL",
+                "PUBLIC_URL",
+            ]
+            .iter()
+            .any(|w| name.contains(w));
+            let other = name.contains("API") || name.contains("BACKEND") || name.contains("CDN");
+            (own && names_address(name) && !other) || name.as_str() == "NEXTAUTH_URL"
+        })
+        .cloned()
+        .collect()
 }
 
 /// The cookies a Next.js middleware reads: those it names, and the names
@@ -1140,11 +1182,13 @@ fn workflows(map: &CodeMap, front: &FrontEnd) -> Vec<Workflow> {
     // calls it nearest, then the shortest route.
     let mut best: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
     let mut reached: HashMap<(String, String), usize> = HashMap::new();
-    let rank = |j: usize, depth: usize, path: &str| {
+    let rank = |j: usize, depth: usize, method: &str, path: &str| {
+        let route = &screens[j].route;
         (
-            std::cmp::Reverse(named_in_route(&screens[j].route, path)),
+            std::cmp::Reverse(named_in_route(route, path)),
+            std::cmp::Reverse(acts_in_route(route, method)),
             depth,
-            screens[j].route.matches('/').count(),
+            route.matches('/').count(),
         )
     };
     for (i, screen) in screens.iter().enumerate() {
@@ -1156,7 +1200,8 @@ fn workflows(map: &CodeMap, front: &FrontEnd) -> Vec<Workflow> {
             *reached.entry(key.clone()).or_default() += 1;
             match best.get(&key) {
                 Some(&(j, depth))
-                    if rank(j, depth, &call.path) <= rank(i, call.depth, &call.path) => {}
+                    if rank(j, depth, &call.method, &call.path)
+                        <= rank(i, call.depth, &call.method, &call.path) => {}
                 _ => {
                     best.insert(key, (i, call.depth));
                 }
@@ -1213,6 +1258,17 @@ fn named_in_route(route: &str, path: &str) -> usize {
         .filter(|p| !p.is_empty() && !p.starts_with('{') && !is_version(p) && *p != "api")
         .filter(|p| named.contains(&stem(p)))
         .count()
+}
+
+/// Whether a route's last part says it is where an action of `method` is
+/// done: a `new` page for a `POST`, an `edit` one for a `PATCH`.
+fn acts_in_route(route: &str, method: &str) -> bool {
+    let last = route.rsplit('/').next().unwrap_or_default();
+    match method {
+        "POST" => ["new", "create", "add", "signup", "register"].contains(&last),
+        "PUT" | "PATCH" => last == "edit" || last == "settings" || last.starts_with('['),
+        _ => false,
+    }
 }
 
 /// Whether a part of a path is a version: `v1`, `v2`.
@@ -1316,7 +1372,7 @@ mod tests {
         write(
             root,
             "web/src/api.ts",
-            "export const api = createClient({ baseUrl: process.env.NEXT_PUBLIC_API_URL })\nexport const me = () => api.GET('/v1/users/me')\nexport const track = () => api.POST('/v1/events/')\n",
+            "export const api = createClient({ baseUrl: process.env.NEXT_PUBLIC_API_URL })\nexport const site = process.env.NEXT_PUBLIC_FRONTEND_BASE_URL ?? process.env.NEXT_PUBLIC_CDN_URL\nexport const me = () => api.GET('/v1/users/me')\nexport const track = () => api.POST('/v1/events/')\n",
         );
         // The menu every screen of the dashboard shows, as data.
         write(
@@ -1379,6 +1435,7 @@ mod tests {
         assert_eq!(web.runner, "pnpm");
         assert_eq!(web.dev.as_deref(), Some("next dev --turbopack"));
         assert_eq!(web.api_env.as_deref(), Some("NEXT_PUBLIC_API_URL"));
+        assert_eq!(web.own_env, ["NEXT_PUBLIC_FRONTEND_BASE_URL"]);
         assert_eq!(web.cookies, ["theme", "shop_session"]);
 
         let routes: Vec<&str> = web.screens.iter().map(|s| s.route.as_str()).collect();

@@ -127,6 +127,8 @@ pub enum Action {
     ToggleBranch,
     /// Show or hide the tickets linked to the branch.
     ToggleTickets,
+    /// Show or hide the App view's pilot, beside its page.
+    TogglePilot,
     /// The usage pane's next window: an hour, six, a day.
     NextUsageWindow,
     /// Let what is behind the window show through, or make it opaque again.
@@ -169,6 +171,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "Ctrl-L",
                 "show or hide the branch's tickets and how far the work is (/ticket)",
+            ),
+            (
+                "Ctrl-J",
+                "in the App view, show or hide the pilot beside the page; drag its edge to size it",
             ),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
             ("Ctrl-M", "the window see-through, 80%, 60%, 40%, or opaque"),
@@ -282,6 +288,50 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+/// What a key does while the App view's page has the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageKey {
+    /// Gives the keys back to universe: Esc.
+    Leave,
+    /// Universe's own, wherever the keys are: Ctrl-C, Ctrl-N, Ctrl-J,
+    /// Ctrl-Q.
+    Universe,
+    /// A key the page is given by its name, as the DevTools protocol
+    /// names it: `Enter`, `ArrowLeft`.
+    Named(&'static str),
+    /// A character typed.
+    Text(char),
+    /// A letter or a digit with Ctrl or Alt held: the page's shortcut.
+    Shortcut(char),
+}
+
+/// What `key` does while the App view's page has the keys: all of them go
+/// to the page but Esc, which gives them back, and the few that are
+/// universe's everywhere.
+pub fn page_key(key: KeyEvent) -> PageKey {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => PageKey::Leave,
+        KeyCode::Char('c' | 'n' | 'j' | 'q' | 'g') if ctrl => PageKey::Universe,
+        KeyCode::Char(c) if ctrl || alt => PageKey::Shortcut(c),
+        KeyCode::Char(c) => PageKey::Text(c),
+        KeyCode::Enter => PageKey::Named("Enter"),
+        KeyCode::Tab => PageKey::Named("Tab"),
+        KeyCode::Backspace => PageKey::Named("Backspace"),
+        KeyCode::Delete => PageKey::Named("Delete"),
+        KeyCode::Up => PageKey::Named("ArrowUp"),
+        KeyCode::Down => PageKey::Named("ArrowDown"),
+        KeyCode::Left => PageKey::Named("ArrowLeft"),
+        KeyCode::Right => PageKey::Named("ArrowRight"),
+        KeyCode::Home => PageKey::Named("Home"),
+        KeyCode::End => PageKey::Named("End"),
+        KeyCode::PageUp => PageKey::Named("PageUp"),
+        KeyCode::PageDown => PageKey::Named("PageDown"),
+        KeyCode::Other => PageKey::Universe,
+    }
+}
+
 /// The action bound to `key` in `mode` with `focus`, after `pending` if a
 /// two-key binding was started.
 pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent) -> Option<Action> {
@@ -311,6 +361,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('r') if ctrl => return Some(Action::ToggleBranch),
         // L for the tickets the branch is linked to.
         KeyCode::Char('l') if ctrl => return Some(Action::ToggleTickets),
+        // J, free on both keyboards, beside the others of the window.
+        KeyCode::Char('j') if ctrl => return Some(Action::TogglePilot),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
         KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
         KeyCode::Char('n') if ctrl => return Some(Action::NextMap),
@@ -492,6 +544,22 @@ mod tests {
                 key(KeyCode::Left)
             ),
             Some(Action::FocusLeft)
+        );
+    }
+
+    #[test]
+    fn the_page_takes_every_key_but_esc_and_universe_s_own() {
+        assert_eq!(page_key(key(KeyCode::Esc)), PageKey::Leave);
+        assert_eq!(page_key(key(KeyCode::Char('é'))), PageKey::Text('é'));
+        assert_eq!(page_key(key(KeyCode::Enter)), PageKey::Named("Enter"));
+        assert_eq!(page_key(key(KeyCode::Left)), PageKey::Named("ArrowLeft"));
+        assert_eq!(page_key(ctrl('a')), PageKey::Shortcut('a'));
+        assert_eq!(page_key(ctrl('n')), PageKey::Universe);
+        assert_eq!(page_key(ctrl('j')), PageKey::Universe);
+        assert_eq!(page_key(ctrl('c')), PageKey::Universe);
+        assert_eq!(
+            action(Mode::Normal, Focus::Chat, None, ctrl('j')),
+            Some(Action::TogglePilot)
         );
     }
 }

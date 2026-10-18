@@ -15,6 +15,7 @@
 mod browser;
 mod dev;
 mod error;
+mod leftovers;
 mod made;
 mod mock;
 mod spec;
@@ -25,8 +26,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 pub use browser::{Button, Key, Modifiers, Pointer, browser_found};
-pub use dev::{Framework, Run, command_line, free_port};
+pub use dev::{Framework, Run, command_line, command_shown, free_port};
 pub use error::PreviewError;
+pub use leftovers::{leftovers_file, stop_leftovers};
 pub use made::Tone;
 pub use mock::{Answer, Call, SLOW, Source, State, fixture_name};
 pub use spec::{Operation, Spec};
@@ -65,6 +67,9 @@ pub struct Config {
     pub start: String,
     /// Its page's size in its pixels, and the scale it is drawn at.
     pub size: (u32, u32, f32),
+    /// Where what it starts is written down, to be stopped at the next
+    /// start if it is left running.
+    pub leftovers: Option<PathBuf>,
 }
 
 /// Where a preview is.
@@ -119,8 +124,16 @@ pub enum Event {
     Call(Call),
     /// A frame of the page.
     Frame(Frame),
-    /// The page's address changed.
-    Address(String),
+    /// A page started loading: the calls from now on are its.
+    Loading,
+    /// The page's address changed: a page loaded, or `within` the one
+    /// shown, as an app that routes itself does.
+    Address {
+        /// The address.
+        url: String,
+        /// Whether the page stayed the same document.
+        within: bool,
+    },
     /// The page's network went quiet: it is loaded.
     Quiet,
     /// An error the page met.
@@ -243,9 +256,14 @@ impl Drop for Preview {
 
 /// Runs a preview until its orders end.
 fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
-    let parts = match start(&config, sink) {
+    if let Some(file) = &config.leftovers {
+        stop_leftovers(file);
+    }
+    let record = leftovers::Record::new(config.leftovers.clone());
+    let parts = match start(&config, sink, &record) {
         Ok(parts) => parts,
         Err(error) => {
+            record.clear();
             sink(Event::Status(Status::Failed(said(&error))));
             // Orders are taken until the preview is dropped, unanswered.
             while taken.recv().is_ok() {}
@@ -277,11 +295,18 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
         }
     }
     drop(browser);
+    drop(server);
+    drop(mock);
+    record.clear();
     sink(Event::Status(Status::Stopped));
 }
 
 /// Starts the back end, the front end and the browser, in that order.
-fn start(config: &Config, sink: &Sink) -> Result<(Mock, DevServer, Browser), PreviewError> {
+fn start(
+    config: &Config,
+    sink: &Sink,
+    record: &leftovers::Record,
+) -> Result<(Mock, DevServer, Browser), PreviewError> {
     sink(Event::Status(Status::Reading));
     let text = match &config.spec {
         SpecSource::Text(text) => text.clone(),
@@ -310,6 +335,7 @@ fn start(config: &Config, sink: &Sink) -> Result<(Mock, DevServer, Browser), Pre
         config.api_env.as_deref().map(|name| (name, api.as_str())),
         Arc::new(move |line| lines(Event::Said(line))),
     )?;
+    record.add(true, server.pid(), server.line());
     sink(Event::Status(Status::Starting {
         api: mock.port(),
         line: server.line().to_owned(),
@@ -323,6 +349,7 @@ fn start(config: &Config, sink: &Sink) -> Result<(Mock, DevServer, Browser), Pre
         config.size,
         Arc::clone(sink),
     )?;
+    record.add(false, browser.pid(), &browser.program());
     sink(Event::Status(Status::Running { address }));
     Ok((mock, server, browser))
 }
@@ -401,6 +428,7 @@ mod tests {
             cookies: Vec::new(),
             start: "/".to_owned(),
             size: (800, 600, 1.0),
+            leftovers: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let failed = wait_for(&events, |e| matches!(e, Event::Status(Status::Failed(_))));
@@ -449,6 +477,7 @@ mod tests {
             cookies: vec![("session".to_owned(), "simulated".to_owned())],
             start: "/index.html".to_owned(),
             size: (640, 400, 1.0),
+            leftovers: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let started = wait_for(&events, |e| {

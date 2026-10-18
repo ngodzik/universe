@@ -207,6 +207,7 @@ pub(crate) enum Request {
 /// A browser, running, with a page open.
 pub struct Browser {
     child: Child,
+    program: PathBuf,
     profile: PathBuf,
     requests: Sender<Request>,
     thread: Option<JoinHandle<()>>,
@@ -304,10 +305,21 @@ impl Browser {
         let thread = std::thread::spawn(move || driver.drive(&asked));
         Ok(Self {
             child,
+            program,
             profile,
             requests,
             thread: Some(thread),
         })
+    }
+
+    /// Its process's id.
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// What it was started as.
+    pub(crate) fn program(&self) -> String {
+        self.program.display().to_string()
     }
 
     /// Asks the browser something; nothing when it is gone.
@@ -524,6 +536,12 @@ impl Driver {
             json!({"enabled": true}),
             false,
         )?;
+        // Pages are held before they load, to keep them on this machine.
+        self.call(
+            "Fetch.enable",
+            json!({"patterns": [{"resourceType": "Document", "requestStage": "Request"}]}),
+            false,
+        )?;
         let cookies: Vec<Value> = cookies
             .iter()
             .map(|(name, value)| json!({"name": name, "value": value, "url": address}))
@@ -720,6 +738,26 @@ impl Driver {
         }
         let params = &message["params"];
         match message["method"].as_str().unwrap_or_default() {
+            // A page that would leave this machine (the front end sending
+            // to where it is deployed, a sign-in elsewhere) is kept from it:
+            // what it shows would not be the front end's, nor its calls
+            // simulated.
+            "Fetch.requestPaused" => {
+                let url = params["request"]["url"].as_str().unwrap_or_default();
+                let id = params["requestId"].clone();
+                if stays_here(url) {
+                    self.send("Fetch.continueRequest", json!({"requestId": id}), false)?;
+                } else {
+                    self.send(
+                        "Fetch.failRequest",
+                        json!({"requestId": id, "errorReason": "BlockedByClient"}),
+                        false,
+                    )?;
+                    (self.sink)(Event::Console(format!(
+                        "Kept from leaving this machine: the page went to {url}"
+                    )));
+                }
+            }
             "Page.screencastFrame" => {
                 let decoded = params["data"]
                     .as_str()
@@ -749,7 +787,10 @@ impl Driver {
                 if frame.get("parentId").is_none() {
                     self.main_frame = frame["id"].as_str().map(str::to_owned);
                     if let Some(url) = frame["url"].as_str() {
-                        (self.sink)(Event::Address(url.to_owned()));
+                        (self.sink)(Event::Address {
+                            url: url.to_owned(),
+                            within: false,
+                        });
                     }
                 }
             }
@@ -757,7 +798,17 @@ impl Driver {
                 if params["frameId"].as_str() == self.main_frame.as_deref()
                     && let Some(url) = params["url"].as_str()
                 {
-                    (self.sink)(Event::Address(url.to_owned()));
+                    (self.sink)(Event::Address {
+                        url: url.to_owned(),
+                        within: true,
+                    });
+                }
+            }
+            "Page.frameStartedLoading" => {
+                let main = self.main_frame.is_none()
+                    || params["frameId"].as_str() == self.main_frame.as_deref();
+                if main {
+                    (self.sink)(Event::Loading);
                 }
             }
             "Page.lifecycleEvent" => {
@@ -805,6 +856,25 @@ impl Driver {
     }
 }
 
+/// Whether an address is of this machine, or one of a page's own (`data:`,
+/// `about:`, `blob:`).
+fn stays_here(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return true;
+    };
+    if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+        return true;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split(']').next().map_or(host, |h| &h[1..])
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") || host.ends_with(".localhost")
+}
+
 /// The first lines of a message: a stack's first frames, not all of it.
 fn first_lines(text: &str) -> String {
     text.lines().take(4).collect::<Vec<_>>().join("\n")
@@ -813,6 +883,19 @@ fn first_lines(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_stays_on_this_machine() {
+        assert!(stays_here("http://127.0.0.1:3000/dashboard"));
+        assert!(stays_here("http://localhost:5173/"));
+        assert!(stays_here("http://app.localhost/"));
+        assert!(stays_here("http://[::1]:3000/"));
+        assert!(stays_here("about:blank"));
+        assert!(stays_here("data:text/html,hi"));
+        assert!(!stays_here("https://shop.example.com/dashboard"));
+        assert!(!stays_here("https://127.0.0.1.example.com/"));
+        assert!(!stays_here("http://user@example.com/"));
+    }
 
     #[test]
     fn keys_as_the_protocol_names_them() {

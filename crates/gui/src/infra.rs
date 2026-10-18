@@ -61,7 +61,7 @@ pub(crate) struct Infra {
 }
 
 /// universe's own folder, as the rest of it finds it.
-fn base() -> Option<PathBuf> {
+pub(crate) fn base() -> Option<PathBuf> {
     match std::env::var_os("UNIVERSE_HOME") {
         Some(home) => Some(PathBuf::from(home)),
         None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".universe")),

@@ -14,6 +14,7 @@
 
 mod activity;
 mod api_view;
+mod app_view;
 mod arch_view;
 mod backdrop;
 mod branch_pane;
@@ -101,6 +102,10 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// wakes at this pace to blink it, and no faster.
 const BLINK: Duration = Duration::from_millis(530);
 
+/// How long it may sleep while the App view's page shows: thirty frames a
+/// second, as the browser sends them.
+const FRAME_WAIT: Duration = Duration::from_millis(33);
+
 /// How long it may sleep while a background moves: about twelve frames a
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
@@ -142,11 +147,16 @@ where
     let relaunch: Arc<std::sync::Mutex<Option<Relaunch>>> = Arc::default();
     let universe = Universe::new(app.root().to_owned());
     let plan = Plan::new(app.root().to_owned());
+    // The front ends kept from the last session: the App view is among
+    // the views at once.
+    let app_view = app_view::AppView::new(app.root().to_owned());
+    app.front_end_found(app_view.found());
     let shell = Shell {
         plan,
         api: api_view::ApiView::default(),
         review: review_view::ReviewView::default(),
         database: database_view::DatabaseView::default(),
+        app_view,
         services: services_view::ServicesView::default(),
         infra: infra::Infra::new(app.root().to_owned()),
         app,
@@ -263,6 +273,8 @@ struct Shell<M, D> {
     review: review_view::ReviewView,
     /// The tables the project's models define.
     database: database_view::DatabaseView,
+    /// The front end running, as the App view draws it.
+    app_view: app_view::AppView,
     /// The services the project runs, and who reaches whom.
     services: services_view::ServicesView,
     /// Where the project runs, read on threads of their own.
@@ -521,7 +533,12 @@ fn drive<M, D>(
     if window.title != title {
         window.title = title;
     }
-    let wait = if shell.app.is_running() || shell.app.docker().is_some() {
+    // The page of the App view moves as it is used: its frames are drawn
+    // as they come, while it shows.
+    let page = shell.app.map_view() == Some(MapView::App) && shell.app.app_preview().is_on();
+    let wait = if page {
+        FRAME_WAIT
+    } else if shell.app.is_running() || shell.app.docker().is_some() {
         BUSY_WAIT
     } else if shell.app.mode() != Mode::Normal {
         BLINK
@@ -793,6 +810,7 @@ where
                     | MapView::Api
                     | MapView::Review
                     | MapView::Database
+                    | MapView::App
             ) // The deployments need the services to render environments; the
               // branch's pane, what serves and calls its routes.
         ) || (view == Some(MapView::Universe) && fleet.active)
@@ -801,6 +819,7 @@ where
         shell.app.transcript(),
     );
     shell.plan.take_read(now);
+    shell.app_view.update(&shell.plan, &mut shell.app);
     if view == Some(MapView::Database) {
         shell.database.update(&shell.plan);
     }
@@ -819,7 +838,8 @@ where
                 | MapView::Services
                 | MapView::Api
                 | MapView::Review
-                | MapView::Database => Frame::NONE.fill(background),
+                | MapView::Database
+                | MapView::App => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe if fleet.active => {
@@ -858,6 +878,13 @@ where
                 MapView::Database => {
                     database_view::show(ui, &mut shell.database, &shell.review, &mut shell.app);
                 }
+                MapView::App => app_view::show(
+                    ui,
+                    &mut shell.app_view,
+                    &shell.plan,
+                    &mut shell.app,
+                    &mut shell.effects,
+                ),
                 MapView::Review => review_view::show(
                     ui,
                     &mut shell.review,

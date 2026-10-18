@@ -203,7 +203,7 @@ impl Maker<'_> {
         for i in 0..ITEMS {
             let item_key = format!("{key}[{i}]");
             let value = self.make(items, &item_key, "", depth + 1);
-            made.push(distinct(value, &item_key, i));
+            made.push(distinct(value, i));
         }
         Value::Array(made)
     }
@@ -225,6 +225,25 @@ impl Maker<'_> {
         }
     }
 
+    /// An id the same wherever the same thing is: the first organization's
+    /// in a list of them, in a session's and as an order's
+    /// `organization_id`. It names the entity of the schema it is in, or
+    /// the one its field names, and its place in a list.
+    fn id(&self, key: &str, field: &str) -> String {
+        let entity = if field == "id" {
+            self.stack.last().map(|name| entity(name))
+        } else {
+            field.strip_suffix("_id").map(|name| name.replace('_', ""))
+        };
+        match entity {
+            Some(entity) if !entity.is_empty() => {
+                let place = if field == "id" { place(key) } else { 0 };
+                uuid(&format!("{entity}#{place}"))
+            }
+            _ => uuid(key),
+        }
+    }
+
     fn boolean(&self, field: &str) -> bool {
         if self.tone.no_rights
             && ["is_admin", "admin", "is_owner", "is_superuser", "is_staff"].contains(&field)
@@ -243,7 +262,7 @@ impl Maker<'_> {
         let format = schema["format"].as_str().unwrap_or_default();
         let id = format == "uuid" || field == "id" || field.ends_with("_id");
         if id {
-            return Value::String(uuid(key));
+            return Value::String(self.id(key, field));
         }
         if format == "date-time" || field.ends_with("_at") {
             return Value::String(format!(
@@ -269,10 +288,10 @@ impl Maker<'_> {
         }
         let word = match field {
             "slug" | "handle" | "username" | "login" => "demo",
-            "currency" => "usd",
-            "country" => "US",
-            "locale" | "language" => "en",
-            "timezone" => "Europe/Paris",
+            _ if field.contains("currency") => "usd",
+            _ if field.contains("country") => "US",
+            _ if field.contains("locale") || field == "language" => "en",
+            _ if field.contains("timezone") => "Europe/Paris",
             "status" | "state" => "active",
             "first_name" | "firstname" => "Ada",
             "last_name" | "lastname" => "Lovelace",
@@ -295,14 +314,24 @@ impl Maker<'_> {
     }
 }
 
-/// An item of a list made its own: an id of its own, and a person's name
-/// and email when it has them.
-fn distinct(item: Value, key: &str, i: usize) -> Value {
+/// An item of a list made its own: a person's name and email when it has
+/// them, else a name numbered after the first's.
+fn distinct(item: Value, i: usize) -> Value {
     let Value::Object(mut fields) = item else {
         return item;
     };
-    if fields.get("id").is_some_and(Value::is_string) {
-        fields.insert("id".to_owned(), Value::String(uuid(key)));
+    // A date a spec's example gives every item alike is a day apart on
+    // each: a page keys its rows by them.
+    for (name, value) in &mut fields {
+        let dated = name.ends_with("_at")
+            || ["timestamp", "date", "day", "period"].contains(&name.as_str());
+        if let Value::String(date) = value
+            && dated
+            && i > 0
+            && let Some(later) = days_later(date, i)
+        {
+            *date = later;
+        }
     }
     let (name, email) = PEOPLE[i % PEOPLE.len()];
     if fields.get("email").is_some_and(Value::is_string) {
@@ -317,6 +346,44 @@ fn distinct(item: Value, key: &str, i: usize) -> Value {
         fields.insert("name".to_owned(), Value::String(numbered));
     }
     Value::Object(fields)
+}
+
+/// `date` (`2026-01-01…`) `days` later, within its month: a day of the
+/// month past 28 wraps around.
+fn days_later(date: &str, days: usize) -> Option<String> {
+    let day: usize = date.get(8..10)?.parse().ok()?;
+    if date.get(4..5) != Some("-") || date.get(7..8) != Some("-") {
+        return None;
+    }
+    let later = (day - 1 + days) % 28 + 1;
+    Some(format!("{}{later:02}{}", &date[..8], &date[10..]))
+}
+
+/// The entity a schema stands for, as a field names it: `organization` for
+/// `#/components/schemas/OrganizationWithRole` or `OrganizationRead`.
+fn entity(reference: &str) -> String {
+    let name = reference.rsplit('/').next().unwrap_or(reference);
+    let name = name.split("With").next().unwrap_or(name);
+    let mut name = name.to_owned();
+    for suffix in [
+        "Read", "Schema", "Public", "Response", "Output", "Out", "Details", "Detail", "Full",
+        "Base", "Item", "Dto", "Model", "Data",
+    ] {
+        if name.len() > suffix.len() && name.ends_with(suffix) {
+            name.truncate(name.len() - suffix.len());
+            break;
+        }
+    }
+    name.to_lowercase()
+}
+
+/// A thing's place in the list it is in, from where it is made: the last
+/// `[n]` of the place; 0 for one alone.
+fn place(key: &str) -> usize {
+    key.rsplit_once('[')
+        .and_then(|(_, rest)| rest.split(']').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 /// A number from a place, the same each time.
@@ -406,6 +473,48 @@ mod tests {
         assert_eq!(items[0]["name"], "Ada Lovelace");
         assert_eq!(items[1]["email"], "grace@example.com");
         assert_eq!(made["customers"]["total_count"], 3);
+    }
+
+    #[test]
+    fn the_same_thing_has_the_same_id_in_every_answer() {
+        let spec = Spec::read(
+            r##"{"paths": {
+                "/orgs": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Organization"}}}}}}}},
+                "/me": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "object", "properties": {"organizations": {"type": "array", "items": {"$ref": "#/components/schemas/OrganizationWithRole"}}}}}}}}}},
+                "/orders/1": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrderRead"}}}}}}}},
+              "components": {"schemas": {
+                "Organization": {"type": "object", "properties": {"id": {"type": "string"}}},
+                "OrganizationWithRole": {"type": "object", "properties": {"id": {"type": "string"}, "role": {"type": "string"}}},
+                "OrderRead": {"type": "object", "properties": {"id": {"type": "string"}, "organization_id": {"type": "string"}}}}}}"##,
+        )
+        .unwrap();
+        let answer = |path: &str| {
+            let index = spec.find("GET", path).unwrap();
+            body(
+                &spec,
+                spec.schema(index, "200").unwrap(),
+                path,
+                Tone::default(),
+            )
+        };
+        let (orgs, me, order) = (answer("/orgs"), answer("/me"), answer("/orders/1"));
+        assert_eq!(orgs[0]["id"], me["organizations"][0]["id"]);
+        assert_eq!(orgs[1]["id"], me["organizations"][1]["id"]);
+        assert_ne!(orgs[0]["id"], orgs[1]["id"]);
+        assert_eq!(order["organization_id"], orgs[0]["id"]);
+        assert_ne!(order["id"], orgs[0]["id"]);
+    }
+
+    #[test]
+    fn dates_alike_are_a_day_apart() {
+        assert_eq!(
+            days_later("2026-01-01T00:00:00Z", 2).as_deref(),
+            Some("2026-01-03T00:00:00Z")
+        );
+        assert_eq!(days_later("2026-01-27", 3).as_deref(), Some("2026-01-02"));
+        assert_eq!(days_later("Monday", 1), None);
+        let item = json!({"timestamp": "2026-01-01T00:00:00Z", "name": "Row"});
+        assert_eq!(distinct(item, 1)["timestamp"], "2026-01-02T00:00:00Z");
     }
 
     #[test]

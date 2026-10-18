@@ -12,6 +12,7 @@ universe-tools.workspace = true
 universe-agent.workspace = true
 universe-ui.workspace    = true
 universe-codemap.workspace = true
+universe-preview.workspace = true
 thiserror.workspace       = true
 bevy.workspace            = true
 bevy_egui.workspace       = true

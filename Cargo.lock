@@ -5841,6 +5841,7 @@ dependencies = [
  "universe-agent",
  "universe-codemap",
  "universe-core",
+ "universe-preview",
  "universe-tools",
  "universe-ui",
 ]
@@ -5923,6 +5924,7 @@ dependencies = [
  "toml",
  "universe-agent",
  "universe-core",
+ "universe-preview",
  "universe-tools",
 ]
 

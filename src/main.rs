@@ -454,6 +454,7 @@ async fn interface(
         opacity: defaults.opacity,
         text_size: defaults.text_size,
         chat_width: defaults.chat_width,
+        pilot_width: defaults.pilot_width,
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
         backdrop: universe_ui::backdrop::Backdrop {

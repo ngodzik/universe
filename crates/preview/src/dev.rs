@@ -46,6 +46,9 @@ pub struct Run {
     /// The variables of its environment, `${NAME}` in a value standing for
     /// that variable's value here.
     pub env: Vec<(String, String)>,
+    /// The variables it reads its own address from, given the address it
+    /// is served at.
+    pub own_env: Vec<String>,
 }
 
 /// The line that runs the front end on `port`: its own command, else its
@@ -63,8 +66,19 @@ pub struct Run {
 /// ```
 #[must_use]
 pub fn command_line(run: &Run, port: u16) -> String {
+    line(run, &port.to_string())
+}
+
+/// The line that runs the front end, as shown before it runs: `<port>`
+/// for the port it will be given.
+#[must_use]
+pub fn command_shown(run: &Run) -> String {
+    line(run, "<port>")
+}
+
+fn line(run: &Run, port: &str) -> String {
     if let Some(command) = &run.command {
-        return command.replace("{port}", &port.to_string());
+        return command.replace("{port}", port);
     }
     let flags = match run.framework {
         Framework::Next => format!("--port {port} --hostname 127.0.0.1"),
@@ -152,6 +166,9 @@ impl DevServer {
         if let Some((name, address)) = api {
             command.env(name, address);
         }
+        for name in &run.own_env {
+            command.env(name, format!("http://127.0.0.1:{port}"));
+        }
         for (name, value) in &run.env {
             command.env(name, expanded(value));
         }
@@ -216,6 +233,12 @@ impl DevServer {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The id of its first process, which leads the group of the others.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// The line it was started with.
@@ -362,6 +385,7 @@ mod tests {
             ..Run::default()
         };
         assert_eq!(command_line(&own, 3100), "make serve PORT=3100");
+        assert_eq!(command_shown(&own), "make serve PORT=<port>");
     }
 
     #[test]
