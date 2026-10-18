@@ -9,6 +9,7 @@ description = "A project's front end run against a back end simulated from its s
 [dependencies]
 base64.workspace     = true
 image.workspace      = true
+serde.workspace      = true
 serde_json.workspace = true
 thiserror.workspace  = true
 tungstenite.workspace = true

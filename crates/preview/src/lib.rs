@@ -15,6 +15,7 @@
 mod browser;
 mod dev;
 mod error;
+mod kept;
 mod leftovers;
 mod made;
 mod mock;
@@ -25,9 +26,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-pub use browser::{Button, Key, Modifiers, Pointer, browser_found};
+pub use browser::{Button, Input, Key, Modifiers, Play, Pointer, Recorded, Step, browser_found};
 pub use dev::{Framework, Run, command_line, command_shown, free_port};
 pub use error::PreviewError;
+pub use kept::{Kept, KeptState, KeptTest, difference, keep_test, kept_tests, png_of};
 pub use leftovers::{leftovers_file, stop_leftovers};
 pub use made::Tone;
 pub use mock::{Answer, Call, SLOW, Source, State, fixture_name};
@@ -70,6 +72,8 @@ pub struct Config {
     /// Where what it starts is written down, to be stopped at the next
     /// start if it is left running.
     pub leftovers: Option<PathBuf>,
+    /// The folder its workflows are kept in as tests.
+    pub tests: Option<PathBuf>,
 }
 
 /// Where a preview is.
@@ -138,6 +142,14 @@ pub enum Event {
     Quiet,
     /// An error the page met.
     Console(String),
+    /// A photograph compared with the one kept: the share of its pixels
+    /// that changed, `None` when either is no picture.
+    Compared {
+        /// The step it was taken at, or `after`.
+        label: String,
+        /// The share changed, from 0 to 1.
+        changed: Option<f32>,
+    },
     /// A photograph of the page, as asked.
     Shot {
         /// What it was asked under.
@@ -227,10 +239,10 @@ impl Preview {
         self.order(Order::Browser(Request::Shot(label.to_owned())));
     }
 
-    /// Shows each of `steps` in turn, a path and its label, each
-    /// photographed once loaded.
-    pub fn play(&self, steps: Vec<(String, String)>) {
-        self.order(Order::Browser(Request::Play(steps)));
+    /// Shows a workflow: its steps in turn, each photographed once loaded,
+    /// then what the person did on the last done again.
+    pub fn play(&self, play: Play) {
+        self.order(Order::Browser(Request::Play(play)));
     }
 
     /// Changes the state the back end answers in.
@@ -277,14 +289,12 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
                 Request::Go(path) if path.starts_with('/') => {
                     Request::Go(format!("http://127.0.0.1:{}{path}", server.port()))
                 }
-                Request::Play(steps) => Request::Play(
-                    steps
-                        .into_iter()
-                        .map(|(label, path)| {
-                            (label, format!("http://127.0.0.1:{}{path}", server.port()))
-                        })
-                        .collect(),
-                ),
+                Request::Play(mut play) => {
+                    for step in &mut play.steps {
+                        step.path = format!("http://127.0.0.1:{}{}", server.port(), step.path);
+                    }
+                    Request::Play(play)
+                }
                 other => other,
             }),
             Order::Change(change) => mock.change(change),
@@ -429,6 +439,7 @@ mod tests {
             start: "/".to_owned(),
             size: (800, 600, 1.0),
             leftovers: None,
+            tests: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let failed = wait_for(&events, |e| matches!(e, Event::Status(Status::Failed(_))));
@@ -478,6 +489,7 @@ mod tests {
             start: "/index.html".to_owned(),
             size: (640, 400, 1.0),
             leftovers: None,
+            tests: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
         let started = wait_for(&events, |e| {
@@ -523,6 +535,42 @@ mod tests {
         };
         assert_eq!(label, "page");
         assert!(png.starts_with(b"\x89PNG"));
+
+        // Shown again as a kept test: its screen compared with the one
+        // kept, what the person did done again, its end photographed.
+        let kept = dir.path().join("kept.png");
+        std::fs::write(&kept, &png).unwrap();
+        preview.play(Play {
+            steps: vec![Step {
+                label: "page".to_owned(),
+                path: format!("/index.html?http://127.0.0.1:{api}"),
+                kept: Some(kept.clone()),
+            }],
+            inputs: vec![Recorded {
+                after_ms: 100,
+                input: Input::Pointer(Pointer::Press {
+                    x: 5.0,
+                    y: 5.0,
+                    button: Button::Left,
+                    clicks: 1,
+                }),
+            }],
+            after: Some(kept),
+            size: None,
+        });
+        let compared = wait_for(
+            &events,
+            |e| matches!(e, Event::Compared { label, .. } if label == "page"),
+        );
+        let Some(Event::Compared { changed, .. }) = compared else {
+            panic!("the step was not compared");
+        };
+        assert!(changed.is_some_and(|c| c < 0.02), "{changed:?}");
+        let after = wait_for(
+            &events,
+            |e| matches!(e, Event::Compared { label, .. } if label == "after"),
+        );
+        assert!(after.is_some(), "the end was not photographed");
         drop(preview);
         assert!(
             events

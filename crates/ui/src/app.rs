@@ -5226,9 +5226,37 @@ impl App {
         Effect::App(self.preview.stop())
     }
 
-    /// Asks the running front end something, when it runs.
-    fn app_order(&self, order: crate::app_preview::AppOrder) -> Option<Effect> {
-        self.preview.is_running().then_some(Effect::App(order))
+    /// Asks the running front end something, when it runs; what the
+    /// person does on the last screen of a workflow is kept with it.
+    fn app_order(&mut self, order: crate::app_preview::AppOrder) -> Option<Effect> {
+        if !self.preview.is_running() {
+            return None;
+        }
+        self.preview.record(&order);
+        Some(Effect::App(order))
+    }
+
+    /// Keeps the workflow shown as a test: its screens, the state, what the
+    /// person did on the last and whether its action was called.
+    pub fn app_keep_test(&mut self) -> Option<Effect> {
+        let order = self.preview.keep_test()?;
+        self.notice =
+            Some("Kept as a test: shown again, it compares each screen with these".to_owned());
+        self.app_order(order)
+    }
+
+    /// Shows kept test `index` again, and compares.
+    pub fn app_replay(&mut self, index: usize) -> Option<Effect> {
+        if !self.preview.is_running() {
+            return None;
+        }
+        let order = self.preview.replay(index)?;
+        Some(Effect::App(order))
+    }
+
+    /// The tests kept, as the host read them.
+    pub fn app_tests_kept(&mut self, tests: Vec<universe_preview::Kept>) {
+        self.preview.tests_kept(tests);
     }
 
     /// Shows the front end's page at `path`.
@@ -5301,6 +5329,7 @@ impl App {
             method: method.to_owned(),
             path: path.to_owned(),
             acted: false,
+            replay: None,
         };
         self.notice = Some(format!(
             "{name}: its screens one after the other; on the last, do it on the page \

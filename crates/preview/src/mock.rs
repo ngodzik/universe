@@ -29,7 +29,7 @@ pub const SLOW: Duration = Duration::from_millis(1500);
 const LARGEST_REQUEST: usize = 4 * 1024 * 1024;
 
 /// How an operation answers, chosen for it alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Answer {
     /// With this status, one the spec declares or a server's failure, and
     /// its body.

@@ -169,6 +169,8 @@ pub struct Host<M, D> {
     pulls_rx: mpsc::UnboundedReceiver<Result<universe_tools::CheckedOut, String>>,
     /// The App view's preview, while one runs, and what it tells.
     preview: Option<universe_preview::Preview>,
+    /// Where its workflows are kept as tests.
+    tests_folder: Option<std::path::PathBuf>,
     preview_tx: mpsc::UnboundedSender<universe_preview::Event>,
     preview_rx: mpsc::UnboundedReceiver<universe_preview::Event>,
 }
@@ -213,6 +215,7 @@ where
             pulls_tx,
             pulls_rx,
             preview: None,
+            tests_folder: None,
             preview_tx,
             preview_rx,
         }
@@ -304,11 +307,15 @@ where
     }
 
     /// Carries out what the App view asks of its preview.
-    fn app_order(&mut self, order: crate::app_preview::AppOrder) {
+    fn app_order(&mut self, app: &mut App, order: crate::app_preview::AppOrder) {
         use crate::app_preview::AppOrder;
         match order {
             AppOrder::Start(config) => {
                 self.stop_preview();
+                self.tests_folder = config.tests.clone();
+                if let Some(folder) = &self.tests_folder {
+                    app.app_tests_kept(universe_preview::kept_tests(folder));
+                }
                 if let universe_preview::SpecSource::Command(command) = &config.spec {
                     audit(self.workspace.root(), command);
                 }
@@ -321,6 +328,17 @@ where
                 ));
             }
             AppOrder::Stop => self.stop_preview(),
+            AppOrder::KeepTest { test, shots, after } => {
+                let Some(folder) = &self.tests_folder else {
+                    app.report_error("No folder to keep tests in: universe has no home".to_owned());
+                    return;
+                };
+                let after = after.and_then(|frame| universe_preview::png_of(&frame));
+                match universe_preview::keep_test(folder, &test, &shots, after.as_deref()) {
+                    Ok(_) => app.app_tests_kept(universe_preview::kept_tests(folder)),
+                    Err(e) => app.report_error(format!("Could not keep the test: {e}")),
+                }
+            }
             order => {
                 let Some(preview) = &self.preview else {
                     return;
@@ -334,10 +352,14 @@ where
                     AppOrder::Text(text) => preview.text(&text),
                     AppOrder::Size(width, height, scale) => preview.size(width, height, scale),
                     AppOrder::Shoot(label) => preview.shoot(&label),
-                    AppOrder::Play(steps) => preview.play(steps),
+                    AppOrder::Play(play) => preview.play(play),
+                    AppOrder::Replay { state, play } => {
+                        preview.change(move |kept| *kept = state);
+                        preview.play(play);
+                    }
                     AppOrder::Change(change) => preview.change(move |state| change.apply(state)),
                     AppOrder::Keep(index) => preview.keep(index),
-                    AppOrder::Start(_) | AppOrder::Stop => {}
+                    AppOrder::Start(_) | AppOrder::Stop | AppOrder::KeepTest { .. } => {}
                 }
             }
         }
@@ -608,7 +630,7 @@ where
             return;
         };
         if let Effect::App(order) = effect {
-            self.app_order(order);
+            self.app_order(app, order);
             return;
         }
         if let Effect::OpenSaved(saved) = &effect {

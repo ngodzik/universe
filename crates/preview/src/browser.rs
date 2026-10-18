@@ -33,7 +33,7 @@ const STEP_WITHIN: Duration = Duration::from_secs(15);
 const STEP_SETTLES: Duration = Duration::from_millis(400);
 
 /// A button of the pointer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Button {
     /// None held.
     None,
@@ -47,7 +47,7 @@ pub enum Button {
 
 /// What the person's pointer does on the page, in its pixels from its top
 /// left.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Pointer {
     /// Moves there.
     Move {
@@ -92,7 +92,7 @@ pub enum Pointer {
 }
 
 /// The keys held with another.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Modifiers {
     /// Alt, Option.
     pub alt: bool,
@@ -115,7 +115,7 @@ impl Modifiers {
 }
 
 /// A key pressed on the page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Key {
     /// What it means: `Enter`, `a`.
     pub key: String,
@@ -180,6 +180,57 @@ impl Key {
     }
 }
 
+/// Something the person did on the page.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Input {
+    /// With the pointer.
+    Pointer(Pointer),
+    /// A key.
+    Key(Key),
+    /// Text typed.
+    Text(String),
+}
+
+/// What the person did, and how long after what they did before.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Recorded {
+    /// How long after the input before, in milliseconds; the first's, after
+    /// the last step showed.
+    pub after_ms: u64,
+    /// What they did.
+    pub input: Input,
+}
+
+/// A step of a workflow shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// Its label.
+    pub label: String,
+    /// Its address, a path of the front end's.
+    pub path: String,
+    /// A photograph of it to compare it with, as PNG.
+    pub kept: Option<PathBuf>,
+}
+
+/// A workflow to show: its steps in turn, each photographed once quiet,
+/// then what the person did on the last, done again as they did it, and
+/// the page photographed once it is done.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Play {
+    /// The steps.
+    pub steps: Vec<Step>,
+    /// What the person did on the last.
+    pub inputs: Vec<Recorded>,
+    /// A photograph of the page once they did it, to compare with.
+    pub after: Option<PathBuf>,
+    /// The page's size to show it at, its own when it was kept.
+    pub size: Option<(u32, u32, f32)>,
+}
+
+/// How long the page is given to settle once what the person did is done
+/// again, before it is photographed.
+const ACTED_SETTLES: Duration = Duration::from_millis(2500);
+
 /// What the browser is asked.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Request {
@@ -199,9 +250,8 @@ pub(crate) enum Request {
     Size(u32, u32, f32),
     /// A photograph, under this label.
     Shot(String),
-    /// Each of these addresses in turn, each photographed under its label
-    /// once quiet.
-    Play(Vec<(String, String)>),
+    /// A workflow, its steps' paths whole addresses.
+    Play(Play),
 }
 
 /// A browser, running, with a page open.
@@ -299,6 +349,10 @@ impl Browser {
             frames: 0,
             playing: VecDeque::new(),
             step: None,
+            inputs: VecDeque::new(),
+            next_input: None,
+            after: None,
+            after_kept: None,
             size: (width, height, scale),
         };
         driver.open(address, cookies)?;
@@ -430,8 +484,13 @@ pub fn browser_found() -> bool {
 
 /// What a command's answer is for, once it comes.
 enum Pending {
-    /// A photograph, under its label.
-    Shot(String),
+    /// A photograph, under its label, to compare with one kept; of a
+    /// step of a workflow, which goes on once it is taken.
+    Shot {
+        label: String,
+        kept: Option<PathBuf>,
+        step: bool,
+    },
 }
 
 /// The socket's side: what is asked, sent; what the browser says, told.
@@ -444,9 +503,19 @@ struct Driver {
     sink: Sink,
     frames: u64,
     /// The steps of a workflow yet to show.
-    playing: VecDeque<(String, String)>,
+    playing: VecDeque<Step>,
     /// The step showing, and since when.
-    step: Option<(String, Instant)>,
+    step: Option<(Step, Instant)>,
+    /// What the person did, to do again once the steps are shown, and
+    /// when the next is due.
+    inputs: VecDeque<Recorded>,
+    next_input: Option<Instant>,
+    /// Once done, when the page is photographed, and what to compare it
+    /// with.
+    after: Option<(Instant, Option<PathBuf>)>,
+    /// The photograph of the end to compare with, until the steps are
+    /// shown.
+    after_kept: Option<PathBuf>,
     size: (u32, u32, f32),
 }
 
@@ -587,13 +656,25 @@ impl Driver {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            if let Some((label, since)) = &self.step
-                && since.elapsed() > STEP_WITHIN
+            if self
+                .step
+                .as_ref()
+                .is_some_and(|(_, since)| since.elapsed() > STEP_WITHIN)
+                && self.photograph_step().is_err()
             {
-                let label = label.clone();
-                if self.photograph(label).is_err() {
-                    return;
-                }
+                return;
+            }
+            if self.next_input.is_some_and(|due| Instant::now() >= due)
+                && self.input_again().is_err()
+            {
+                return;
+            }
+            if let Some((due, _)) = &self.after
+                && Instant::now() >= *due
+                && let Some((_, kept)) = self.after.take()
+                && self.photograph("after".to_owned(), kept).is_err()
+            {
+                return;
             }
             match self.receive() {
                 Ok(Some(message)) => {
@@ -637,33 +718,99 @@ impl Driver {
                     self.resize()?;
                 }
             }
-            Request::Shot(label) => {
-                let id = self.send("Page.captureScreenshot", json!({"format": "png"}), false)?;
-                self.pending.insert(id, Pending::Shot(label));
-            }
-            Request::Play(steps) => {
-                self.playing = steps.into();
+            Request::Shot(label) => self.photograph(label, None)?,
+            Request::Play(play) => {
+                if let Some(size) = play.size
+                    && size != self.size
+                {
+                    self.size = size;
+                    self.resize()?;
+                }
+                self.playing = play.steps.into();
+                self.inputs = play.inputs.into();
+                self.after_kept = play.after;
+                self.next_input = None;
+                self.after = None;
                 self.next_step()?;
             }
         }
         Ok(())
     }
 
-    /// Shows the next step of the workflow, if one is left.
+    /// Shows the next step of the workflow; once none is left, does again
+    /// what the person did.
     fn next_step(&mut self) -> Result<(), PreviewError> {
         self.step = None;
-        if let Some((label, address)) = self.playing.pop_front() {
-            self.send("Page.navigate", json!({"url": address}), false)?;
-            self.step = Some((label, Instant::now()));
+        match self.playing.pop_front() {
+            Some(step) => {
+                self.send("Page.navigate", json!({"url": step.path}), false)?;
+                self.step = Some((step, Instant::now()));
+            }
+            None => match self.inputs.front() {
+                Some(first) => {
+                    self.next_input = Some(Instant::now() + Duration::from_millis(first.after_ms));
+                }
+                None => {
+                    if let Some(kept) = self.after_kept.take() {
+                        self.after = Some((Instant::now(), Some(kept)));
+                    }
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Does again the next thing the person did, and schedules the one
+    /// after; the last done, the page is photographed once settled.
+    fn input_again(&mut self) -> Result<(), PreviewError> {
+        let Some(recorded) = self.inputs.pop_front() else {
+            self.next_input = None;
+            return Ok(());
+        };
+        match recorded.input {
+            Input::Pointer(pointer) => self.pointer(pointer)?,
+            Input::Key(key) => self.key(&key)?,
+            Input::Text(text) => {
+                self.send("Input.insertText", json!({"text": text}), false)?;
+            }
+        }
+        self.next_input = self
+            .inputs
+            .front()
+            .map(|next| Instant::now() + Duration::from_millis(next.after_ms));
+        if self.next_input.is_none() {
+            self.after = Some((Instant::now() + ACTED_SETTLES, self.after_kept.take()));
         }
         Ok(())
     }
 
     /// Photographs the step showing.
-    fn photograph(&mut self, label: String) -> Result<(), PreviewError> {
-        self.step = None;
+    fn photograph_step(&mut self) -> Result<(), PreviewError> {
+        if let Some((step, _)) = self.step.take() {
+            let id = self.send("Page.captureScreenshot", json!({"format": "png"}), false)?;
+            self.pending.insert(
+                id,
+                Pending::Shot {
+                    label: step.label,
+                    kept: step.kept,
+                    step: true,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Photographs the page under `label`, to be compared with `kept`.
+    fn photograph(&mut self, label: String, kept: Option<PathBuf>) -> Result<(), PreviewError> {
         let id = self.send("Page.captureScreenshot", json!({"format": "png"}), false)?;
-        self.pending.insert(id, Pending::Shot(label));
+        self.pending.insert(
+            id,
+            Pending::Shot {
+                label,
+                kept,
+                step: false,
+            },
+        );
         Ok(())
     }
 
@@ -724,13 +871,22 @@ impl Driver {
     /// Tells what a message of the browser says.
     fn told(&mut self, message: &Value) -> Result<(), PreviewError> {
         if let Some(id) = message["id"].as_u64() {
-            if let Some(Pending::Shot(label)) = self.pending.remove(&id) {
+            if let Some(Pending::Shot { label, kept, step }) = self.pending.remove(&id) {
                 let png = message["result"]["data"]
                     .as_str()
                     .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
                     .unwrap_or_default();
+                if let Some(kept) = kept {
+                    let changed = std::fs::read(&kept)
+                        .ok()
+                        .and_then(|was| crate::kept::difference(&was, &png));
+                    (self.sink)(Event::Compared {
+                        label: label.clone(),
+                        changed,
+                    });
+                }
                 (self.sink)(Event::Shot { label, png });
-                if !self.playing.is_empty() {
+                if step {
                     self.next_step()?;
                 }
             }
@@ -815,11 +971,12 @@ impl Driver {
                 let main = params["frameId"].as_str() == self.main_frame.as_deref();
                 if main && params["name"] == "networkIdle" {
                     (self.sink)(Event::Quiet);
-                    if let Some((label, since)) = &self.step
-                        && since.elapsed() > STEP_SETTLES
+                    if self
+                        .step
+                        .as_ref()
+                        .is_some_and(|(_, since)| since.elapsed() > STEP_SETTLES)
                     {
-                        let label = label.clone();
-                        self.photograph(label)?;
+                        self.photograph_step()?;
                     }
                 }
             }

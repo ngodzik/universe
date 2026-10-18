@@ -703,6 +703,10 @@ fn config(
             .base
             .as_ref()
             .map(|b| universe_preview::leftovers_file(b, root)),
+        tests: view
+            .base
+            .as_ref()
+            .map(|b| cache_folder(b, root).join("app-tests")),
     })
 }
 
@@ -875,6 +879,8 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                         format!("✓ {} {} called", playing.method, playing.path),
                         GREEN,
                     )
+                } else if done >= playing.steps.len() && playing.replay.is_some() {
+                    ("Doing again what was done on the page…".to_owned(), DIM)
                 } else if done >= playing.steps.len() {
                     (
                         format!(
@@ -887,9 +893,24 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                     ("Showing its screens…".to_owned(), DIM)
                 };
                 ui.label(RichText::new(said).size(12.0).color(colour));
+                if playing.replay.is_some() {
+                    compared(ui, app);
+                }
                 shots(ui, view, app);
+                if app.app_preview().shown_whole()
+                    && ui
+                        .button(RichText::new("Keep as a test").size(12.0))
+                        .on_hover_text(
+                            "Its screens, the state, and what you did on the page since its last screen showed: shown again, each screen is compared with these and what you did is done again",
+                        )
+                        .clicked()
+                    && let Some(effect) = app.app_keep_test()
+                {
+                    effects.push(effect);
+                }
             });
     }
+    kept_tests(ui, app, effects);
     let mut groups: Vec<(&str, Vec<&Workflow>)> = Vec::new();
     for flow in &front.workflows {
         match groups.iter_mut().find(|(g, _)| *g == flow.group) {
@@ -935,6 +956,84 @@ fn workflows(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<E
                     }
                 }
             }
+        });
+    }
+}
+
+/// How the test shown again compared with what was kept: each screen, and
+/// whether its action was called again.
+fn compared(ui: &mut Ui, app: &App) {
+    let preview = app.app_preview();
+    for (label, changed) in preview.compared() {
+        let (said, colour) = match changed {
+            Some(c) if *c < 0.01 => ("✓ the same".to_owned(), GREEN),
+            Some(c) => (format!("≠ {:.0}% changed", c * 100.0), YELLOW),
+            None => ("no picture to compare".to_owned(), DIM),
+        };
+        ui.label(
+            RichText::new(format!("{label}: {said}"))
+                .size(11.5)
+                .color(colour),
+        );
+    }
+    let Some(playing) = preview.playing() else {
+        return;
+    };
+    let expected = playing
+        .replay
+        .and_then(|i| preview.tests().get(i))
+        .is_some_and(|k| k.test.acted);
+    let ended = preview.compared().iter().any(|(label, _)| label == "after");
+    if expected && ended {
+        let (said, colour) = if playing.acted {
+            (
+                format!("✓ {} {} called again", playing.method, playing.path),
+                GREEN,
+            )
+        } else {
+            (
+                format!("✗ {} {} not called this time", playing.method, playing.path),
+                RED,
+            )
+        };
+        ui.label(RichText::new(said).size(12.0).color(colour));
+    }
+}
+
+/// The workflows kept as tests, each shown again by a click.
+fn kept_tests(ui: &mut Ui, app: &mut App, effects: &mut Vec<Effect>) {
+    let tests: Vec<(String, usize, bool)> = app
+        .app_preview()
+        .tests()
+        .iter()
+        .map(|k| (k.test.name.clone(), k.test.steps.len(), k.test.acted))
+        .collect();
+    if tests.is_empty() {
+        return;
+    }
+    heading(ui, &format!("KEPT TESTS · {}", tests.len()));
+    let running = app.app_preview().is_running();
+    for (i, (name, steps, acted)) in tests.into_iter().enumerate() {
+        ui.horizontal(|ui| {
+            let shown = ui
+                .add_enabled(
+                    running,
+                    egui::Button::new(RichText::new("▶").size(11.0)).small(),
+                )
+                .on_hover_text(
+                    "Show it again: its screens compared with those kept, what was done done again",
+                );
+            if shown.clicked()
+                && let Some(effect) = app.app_replay(i)
+            {
+                effects.push(effect);
+            }
+            let what = if acted { "acts" } else { "screens only" };
+            ui.label(
+                RichText::new(format!("{name} · {steps} screens · {what}"))
+                    .size(12.0)
+                    .color(TEXT),
+            );
         });
     }
 }
