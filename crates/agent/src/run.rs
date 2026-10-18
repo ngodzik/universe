@@ -378,6 +378,10 @@ struct Thread {
     /// How many tokens its context held at its last call, when known.
     #[serde(default)]
     context: Option<u64>,
+    /// The folder it works in: an agent keeps its sessions per folder, so
+    /// one is never resumed in another.
+    #[serde(default)]
+    folder: Option<std::path::PathBuf>,
 }
 
 /// Seconds since 1970, now.
@@ -751,9 +755,16 @@ impl Session {
             // A cold session goes on as it is, unless the model is one the
             // person listed to start afresh, told the conversation, and
             // they say so.
-            let mut thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
+            // A session of another folder, as a review's copy is, is not
+            // resumed here: a new one starts, told what was said.
+            let root = ctx.toolbox.workspace().root().to_owned();
+            let here = |t: &Thread| t.folder.as_ref().is_none_or(|f| *f == root);
+            let mut thread = self
+                .warm(agent)
+                .filter(|t| here(t))
+                .map(|t| (t.session.clone(), t.seen));
             if thread.is_none()
-                && let Some(cold) = self.agents.get(&agent).cloned()
+                && let Some(cold) = self.agents.get(&agent).filter(|t| here(t)).cloned()
             {
                 let idle = now_secs().saturating_sub(cold.used);
                 let answer = if ctx.config.summarize_when_cold.contains(first) {
@@ -777,7 +788,8 @@ impl Session {
         let first_attempt = attempt(ctx, first, &mut self.messages, &mut failure, true).await;
         if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
             let (call, context) = (ctx.last_call.take(), ctx.last_context.take());
-            self.keep_thread(agent, session, call, context);
+            let folder = ctx.toolbox.workspace().root().to_owned();
+            self.keep_thread(agent, session, call, context, folder);
         }
 
         match first_attempt? {
@@ -1328,6 +1340,7 @@ impl Session {
         session: String,
         call: Option<Call>,
         context: Option<u64>,
+        folder: std::path::PathBuf,
     ) {
         let thread = Thread {
             session,
@@ -1335,6 +1348,7 @@ impl Session {
             used: now_secs(),
             call,
             context,
+            folder: Some(folder),
         };
         self.agents.insert(agent, thread);
     }
@@ -1465,6 +1479,7 @@ impl Session {
             used: now_secs(),
             call: Some(call),
             context: None,
+            folder: None,
         };
         self.planners.insert(agent, thread);
     }
@@ -1484,6 +1499,7 @@ impl Session {
             used: now_secs(),
             call: None,
             context: None,
+            folder: None,
         };
         self.coders.insert(agent, thread);
     }
@@ -1639,7 +1655,13 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             )));
         }
 
-        let role = if may_answer { Role::Lead } else { Role::Member };
+        let role = if ctx.config.reading_only {
+            Role::Reader
+        } else if may_answer {
+            Role::Lead
+        } else {
+            Role::Member
+        };
         let edits = ctx.toolbox.edits();
         let finished = converse(ctx, tier, messages, role).await?;
 
@@ -1742,7 +1764,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             ),
             resume: session.clone(),
             directory: root.clone(),
-            read_only: false,
+            read_only: ctx.config.reading_only,
             fork: false,
             ephemeral: false,
         };
@@ -1890,6 +1912,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                     model: tier.clone(),
                     text,
                 },
+                DelegateEvent::Quota(quota) => Event::Quota(quota),
                 DelegateEvent::Denied {
                     name,
                     input,
@@ -4852,6 +4875,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_that_may_only_read_gets_the_reading_tools_and_tells_agents_so() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("It reads well.")]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member::new(ModelId::new("strong").unwrap(), ""))
+            .build()
+            .unwrap()
+            .with_reading_only(true);
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "review it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        {
+            let seen = model.seen.lock().unwrap();
+            let mut names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            let mut reading = READ_TOOLS.to_vec();
+            reading.sort_unstable();
+            // No command, no one to hand a task to, no edit.
+            assert_eq!(names, reading);
+        }
+
+        let claude = FakeClaude {
+            writes_on_round: 0,
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_reading_only(true);
+        Session::new()
+            .send(
+                &Scripted::new(Vec::new()),
+                &claude,
+                &mut toolbox,
+                &config,
+                "review it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(claude.requests.lock().unwrap()[0].read_only);
+    }
+
+    #[tokio::test]
+    async fn an_agents_session_of_another_folder_is_not_resumed() {
+        let (_dir, mut project) = setup();
+        let copy = tempfile::tempdir().unwrap();
+        let mut copy_box = Toolbox::new(Workspace::new(copy.path()).unwrap());
+        let claude = FakeClaude {
+            writes_on_round: 0,
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let model = Scripted::new(Vec::new());
+        let mut session = Session::new();
+        for in_copy in [false, false, true] {
+            let toolbox = if in_copy { &mut copy_box } else { &mut project };
+            session
+                .send(&model, &claude, toolbox, &config, "hello", "", |_| {})
+                .await
+                .unwrap();
+        }
+        let requests = claude.requests.lock().unwrap();
+        // The project's session goes on in the project; the copy's starts
+        // afresh, as the agent keeps its sessions per folder.
+        assert_eq!(requests[0].resume, None);
+        assert_eq!(requests[1].resume.as_deref(), Some("claude-session-1"));
+        assert_eq!(requests[2].resume, None);
+        // The workspace's root has its links resolved, as macOS's temporary
+        // folders need.
+        assert_eq!(requests[2].directory, copy.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
     async fn an_agent_gets_the_rules_kept_outside_the_repository() {
         let (_dir, mut toolbox) = setup();
         let claude = FakeClaude {
@@ -6629,8 +6741,7 @@ mod tests {
         }
     }
 
-    async fn keyed(claude: &KeyedClaude, session: &mut Session) -> Outcome {
-        let (_dir, mut toolbox) = setup();
+    async fn keyed(claude: &KeyedClaude, session: &mut Session, toolbox: &mut Toolbox) -> Outcome {
         let config = AgentConfig::builder()
             .tier(ModelId::new("claude-code/opus").unwrap())
             .build()
@@ -6639,7 +6750,7 @@ mod tests {
             .send(
                 &Scripted::new(vec![]),
                 claude,
-                &mut toolbox,
+                toolbox,
                 &config,
                 "explain",
                 "",
@@ -6658,12 +6769,13 @@ mod tests {
             estimate: Some(Usd(0.65)),
         };
         let mut session = Session::new();
-        let first = keyed(&claude, &mut session).await;
+        let (_dir, mut toolbox) = setup();
+        let first = keyed(&claude, &mut session, &mut toolbox).await;
         assert!((first.cost.0 - 0.04).abs() < 1e-12, "{:?}", first.cost);
         assert!(first.cost_complete && !first.subscription);
         assert_eq!(first.usage.output, TokenCount(200));
         // Resumed, the same: no earlier request billed again.
-        let second = keyed(&claude, &mut session).await;
+        let second = keyed(&claude, &mut session, &mut toolbox).await;
         assert!((second.cost.0 - 0.04).abs() < 1e-12, "{:?}", second.cost);
     }
 
@@ -6674,12 +6786,13 @@ mod tests {
             estimate: Some(Usd(0.05)),
         };
         let mut session = Session::new();
+        let (_dir, mut toolbox) = setup();
         // A new session's total covers this request alone: it fills the gap.
-        let new = keyed(&claude, &mut session).await;
+        let new = keyed(&claude, &mut session, &mut toolbox).await;
         assert!((new.cost.0 - 0.05).abs() < 1e-12, "{:?}", new.cost);
         assert!(new.cost_complete);
         // Resumed, its total cannot say: the cost is marked incomplete.
-        let resumed = keyed(&claude, &mut session).await;
+        let resumed = keyed(&claude, &mut session, &mut toolbox).await;
         assert!((resumed.cost.0 - 0.02).abs() < 1e-12, "{:?}", resumed.cost);
         assert!(!resumed.cost_complete);
     }

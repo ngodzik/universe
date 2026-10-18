@@ -21,6 +21,7 @@ mod gitview;
 mod lsp;
 mod outline;
 mod picture;
+mod pulls;
 mod rules;
 mod search;
 mod secrets;
@@ -40,12 +41,16 @@ pub use docker::{Container, running_containers};
 pub use error::ToolError;
 pub use git::{changes_text, diff_stat, is_clean, project_context, project_files, tracked_files};
 pub use gitview::{
-    Change, ChangedFile, Hunk, LineChanges, LineMark, branch_base, changed_files, commit_line,
-    committed_lines, current_branch, diff_hunks, file_status, is_commit, line_changes, lines_at,
+    Aligned, Change, ChangedFile, Hunk, LineChanges, LineMark, aligned, branch_base, changed_files,
+    commit_line, committed_lines, current_branch, diff_hunks, file_status, is_commit, line_changes,
+    lines_at,
 };
 pub use lsp::{Location, LspError, Servers};
 pub use outline::project_map;
 pub use picture::Picture;
+pub use pulls::{
+    CheckedOut, PullRequest, check_out_pull, diff_between, pull_number, review_folder, stable_hash,
+};
 pub use rules::{folder_guides, folder_instructions, project_instructions};
 pub use snapshot::Snapshot;
 pub use sources::open_source;

@@ -864,6 +864,14 @@ fn show(event: Event) {
             "⇣ {model}'s cache expired: restarted from the summary, {before} → {after} tokens"
         ),
         Event::Notice { model, text } => eprintln!("· {model}: {text}"),
+        Event::Quota(quota) => {
+            let windows: Vec<String> = quota
+                .windows
+                .iter()
+                .map(|w| format!("{} {:.0}%", w.name, w.used))
+                .collect();
+            eprintln!("· {} subscription: {}", quota.agent, windows.join(", "));
+        }
         Event::Denied {
             model,
             action,

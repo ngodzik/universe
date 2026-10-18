@@ -3,9 +3,9 @@
 //! tree shows only them, a file opens folded to its changes, and a review
 //! may read but not change anything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use universe_tools::{Change, ChangedFile};
+use universe_tools::{Change, ChangedFile, CheckedOut, PullRequest};
 
 /// Why the changes are looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,11 @@ impl Lens {
 pub struct ChangeSet {
     /// Why it is looked at.
     pub lens: Lens,
+    /// The folder the files are read in: the project's, or the copy a pull
+    /// request is checked out in.
+    pub root: PathBuf,
+    /// The pull request reviewed, when it is one of GitHub's.
+    pub pull: Option<PullRequest>,
     /// The commit the files are compared with.
     pub base: String,
     /// That commit as one line: its short hash and its title.
@@ -73,7 +78,31 @@ impl ChangeSet {
         let base_line = universe_tools::commit_line(root, &base).unwrap_or_else(|| base.clone());
         Ok(Self {
             lens,
+            root: root.to_owned(),
+            pull: None,
             base,
+            base_line,
+            files,
+        })
+    }
+
+    /// What pull request `checked` changed, read in its copy, against where
+    /// its branch left the one it would be merged into.
+    pub(crate) fn of_pull(checked: CheckedOut) -> Result<Self, String> {
+        let CheckedOut {
+            pull,
+            copy,
+            merge_base,
+        } = checked;
+        let files = universe_tools::changed_files(&copy, &merge_base)
+            .ok_or_else(|| format!("#{}'s changes could not be read", pull.number))?;
+        let base_line =
+            universe_tools::commit_line(&copy, &merge_base).unwrap_or_else(|| merge_base.clone());
+        Ok(Self {
+            lens: Lens::Review,
+            root: copy,
+            pull: Some(pull),
+            base: merge_base,
             base_line,
             files,
         })

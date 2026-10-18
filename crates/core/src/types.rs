@@ -532,6 +532,8 @@ pub enum DelegateEvent {
     /// Something the person should know about how the agent works, such
     /// as a mode it could not use.
     Notice(String),
+    /// The agent's subscription, as it reported its quota.
+    Quota(crate::subscription::Quota),
     /// The agent's own safety checks refused a call, such as a command that
     /// cannot be undone: the person may approve it in their next message.
     Denied {

@@ -25,6 +25,7 @@ pub struct AgentConfig {
     pub(crate) project_rules: Option<String>,
     pub(crate) outside_rules: Option<String>,
     pub(crate) folder_guides: Vec<String>,
+    pub(crate) reading_only: bool,
     pub(crate) approver: Option<Approver>,
     pub(crate) allowed_secrets: Vec<String>,
     pub(crate) strict_commands: bool,
@@ -255,6 +256,14 @@ impl AgentConfig {
         self
     }
 
+    /// Whether the request may only read, as in a review: a model of the
+    /// provider gets the reading tools alone, no command and no one to
+    /// hand a task to, and an agent is told to read only.
+    pub fn with_reading_only(mut self, reading_only: bool) -> Self {
+        self.reading_only = reading_only;
+        self
+    }
+
     /// The project's files of instructions for coding agents, the root's
     /// and its folders', from the root: an agent is told where they are, as
     /// it reads the repository itself.
@@ -474,6 +483,7 @@ impl AgentConfigBuilder {
             project_rules: self.project_rules,
             outside_rules: None,
             folder_guides: Vec::new(),
+            reading_only: false,
         })
     }
 }

@@ -44,6 +44,15 @@ const MIN_OPACITY: f32 = 0.2;
 /// The opacities Ctrl-M goes through, after opaque.
 const OPACITY_STEPS: [f32; 3] = [0.8, 0.6, 0.4];
 
+/// The pages of the usage pane, a Ctrl-O apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePage {
+    /// Where the money goes, how full the conversation is, and the caches.
+    Costs,
+    /// The agents' subscriptions: their windows, what each request took.
+    Subscriptions,
+}
+
 /// How the window draws the codebase instead of the panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapView {
@@ -255,6 +264,26 @@ pub enum Effect {
     /// Say which rules kept outside the repository the project's models
     /// get, and how fresh their copies are.
     ShowRules,
+    /// Have a model summarize the pull request reviewed, unless its
+    /// summaries for this head are kept.
+    SummarizePull {
+        /// The folder it is checked out in.
+        copy: PathBuf,
+        /// The pull request.
+        pull: universe_tools::PullRequest,
+        /// Its diff by area.
+        areas: Vec<crate::pull_review::AreaDiff>,
+        /// The model that summarizes; the cheapest of `candidates` without
+        /// one.
+        model: Option<ModelId>,
+        /// The models to pick the cheapest from.
+        candidates: Vec<ModelId>,
+    },
+    /// Check out pull request `number` apart, for review.
+    FetchPull {
+        /// Its number.
+        number: u64,
+    },
     /// Read the latest conversations of every project, for `/chats`.
     ListEverywhere,
     /// Read a ticket through its tracker's MCP server, and have a model
@@ -457,6 +486,8 @@ pub enum AgentMessage {
     Ticket(Result<crate::tickets::Ticket, String>),
     /// The branch's work judged against its tickets, or why it could not be.
     Progress(Result<crate::tickets::Progress, String>),
+    /// What a model said of the pull request reviewed, or why it did not.
+    Summaries(Result<crate::pull_review::Summaries, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -904,6 +935,8 @@ pub(crate) struct Chat {
     runs: Vec<(ModelId, Spent)>,
     session_id: String,
     session_name: Option<String>,
+    /// The pull request it reviews, when it is a review's.
+    pull: Option<crate::sessions::PullBinding>,
     created: u64,
     requests: usize,
     /// Replies unfolded by the person, by transcript index. Long replies are
@@ -941,6 +974,7 @@ impl Chat {
     fn new(id: ChatId, transcript: Vec<Entry>) -> Self {
         Self {
             id,
+            pull: None,
             usage_log: UsageLog::default(),
             approval: None,
             compact_picker: None,
@@ -990,6 +1024,23 @@ pub struct App {
     usage_window: u64,
     /// Whether the usage pane shows.
     usage_open: bool,
+    /// Which page of it: a second Ctrl-O turns to the subscriptions.
+    usage_page: UsagePage,
+    /// The agents' subscriptions, as they reported them.
+    subscriptions: crate::subscriptions::Subscriptions,
+    /// The agents' calls should be read again from their files.
+    subscriptions_due: bool,
+    /// Lines of a reviewed file picked in the diff, for the next message
+    /// to be about: the file, the first line and the last.
+    picked: Option<(String, usize, usize)>,
+    /// What a model said of the pull request reviewed, once said.
+    summaries: Option<crate::pull_review::Summaries>,
+    /// The conversation shown before a pull request's review took the
+    /// window, shown again when it ends.
+    review_from: Option<ChatId>,
+    /// The head commit summaries were asked for, so that they are asked
+    /// once.
+    summaries_asked: Option<String>,
     /// What the branch changed since it left the main one, while its pane
     /// shows.
     branch: Option<crate::changes::ChangeSet>,
@@ -1154,6 +1205,14 @@ impl App {
             history: History::default(),
             usage_window,
             usage_open: false,
+            usage_page: UsagePage::Costs,
+            subscriptions: crate::subscriptions::Subscriptions::default(),
+            // Read once at startup, for the status line.
+            subscriptions_due: true,
+            picked: None,
+            summaries: None,
+            summaries_asked: None,
+            review_from: None,
             branch: None,
             tickets_open: false,
             tickets_branch: None,
@@ -1300,6 +1359,79 @@ impl App {
     /// The file tree, when open.
     pub fn tree(&self) -> Option<&FileTree> {
         self.tree.as_ref()
+    }
+
+    /// Asks for the pull request reviewed to be summarized, its diff by
+    /// area given by the window, which reads the areas; once per head.
+    pub fn ask_summaries(&mut self, areas: Vec<crate::pull_review::AreaDiff>) -> Option<Effect> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.clone()?;
+        if self.summaries_asked.as_deref() == Some(pull.head.as_str()) {
+            return None;
+        }
+        self.summaries_asked = Some(pull.head.clone());
+        self.summaries = None;
+        let copy = changes.root.clone();
+        let (model, candidates) = self.fresh_or_cheapest();
+        Some(Effect::SummarizePull {
+            copy,
+            pull,
+            areas,
+            model,
+            candidates,
+        })
+    }
+
+    /// Whether the pull request reviewed was asked to be summarized.
+    pub fn summaries_asked(&self) -> bool {
+        self.changes
+            .as_ref()
+            .and_then(|c| c.pull.as_ref())
+            .is_some_and(|p| self.summaries_asked.as_deref() == Some(p.head.as_str()))
+    }
+
+    /// What a model said of the pull request reviewed, once said.
+    pub fn summaries(&self) -> Option<&crate::pull_review::Summaries> {
+        let head = self.changes.as_ref()?.pull.as_ref()?.head.as_str();
+        self.summaries.as_ref().filter(|s| s.head == head)
+    }
+
+    /// Picks `line` of `path` in the diff, or with `extend` the lines from
+    /// the one picked to it; picking the one line picked again lets it go.
+    pub fn pick_line(&mut self, path: &str, line: usize, extend: bool) {
+        self.picked = match self.picked.take() {
+            Some((picked, first, last)) if extend && picked == path => {
+                Some((picked, first.min(line), last.max(line)))
+            }
+            Some((picked, first, last)) if picked == path && first == line && last == line => None,
+            _ => Some((path.to_owned(), line, line)),
+        };
+    }
+
+    /// The lines picked in the diff: the file, the first line and the last.
+    pub fn picked_lines(&self) -> Option<(&str, usize, usize)> {
+        self.picked
+            .as_ref()
+            .map(|(path, first, last)| (path.as_str(), *first, *last))
+    }
+
+    /// Shows `path` in the tree, its folders opened and its row chosen, as
+    /// the diff is read past it.
+    pub fn follow_in_tree(&mut self, path: &str) {
+        let Some(tree) = &mut self.tree else {
+            return;
+        };
+        tree.reveal_one(path);
+        if let Some(index) = tree.rows().iter().position(|r| r.path == Path::new(path)) {
+            tree.select(index);
+        }
+    }
+
+    /// Chooses the tree's row `index` without opening it.
+    pub fn choose_in_tree(&mut self, index: usize) {
+        if let Some(tree) = &mut self.tree {
+            tree.select(index);
+        }
     }
 
     /// The branch's changes, while a review or a piece of work is looked at.
@@ -1479,12 +1611,148 @@ impl App {
 
     /// The file tree, showing only the branch's changes while they are
     /// looked at.
+    /// The folder files are read in: the copy of a pull request while it
+    /// is reviewed, else the project's.
+    fn view_root(&self) -> PathBuf {
+        self.changes
+            .as_ref()
+            .map_or_else(|| self.root.clone(), |c| c.root.clone())
+    }
+
     fn new_tree(&self) -> FileTree {
-        let mut tree = FileTree::new(self.root.clone());
+        let mut tree = FileTree::new(self.view_root());
         if let Some(changes) = &self.changes {
             tree.show_changes(changes.letters());
         }
         tree
+    }
+
+    /// A pull request checked out for review, or why it could not be: its
+    /// files are read in its copy from now on, and it is reviewed in a
+    /// conversation of its own. Returns its number when that conversation
+    /// is not open, for the loop to resume a saved one or to open one.
+    pub fn pull_checked_out(
+        &mut self,
+        checked: Result<universe_tools::CheckedOut, String>,
+    ) -> Option<u64> {
+        let changes = match checked.and_then(crate::changes::ChangeSet::of_pull) {
+            Ok(changes) => changes,
+            Err(e) => {
+                self.error(e);
+                return None;
+            }
+        };
+        let pull = changes.pull.clone()?;
+        let (added, removed) = changes.lines();
+        let count = changes.files.len();
+        self.walk_model = None;
+        self.walk_asking = false;
+        self.changes = Some(changes);
+        self.file = None;
+        self.unzoom();
+        self.tree = Some(self.new_tree());
+        self.focus_on(Focus::Tree);
+        // Its own conversation, the one shown before kept to come back to.
+        let bound = |chat: &Chat| chat.pull.as_ref().is_some_and(|p| p.number == pull.number);
+        if !bound(&self.chat) && self.chat.pull.is_none() {
+            self.review_from = Some(self.chat.id);
+        }
+        let open = if bound(&self.chat) {
+            Some(self.chat.id)
+        } else {
+            self.others.iter().find(|c| bound(c)).map(|c| c.id)
+        };
+        if let Some(id) = open {
+            self.show_chat(id);
+        }
+        self.info(format!(
+            "Reviewing #{} by {}: {}. {count} file{} changed, +{added} −{removed}, read in a copy \
+             of its own: the project's branch and files are left as they are. Nothing can be \
+             edited, and requests here only read; /review off ends it",
+            pull.number,
+            pull.author,
+            pull.title,
+            if count == 1 { "" } else { "s" },
+        ));
+        open.is_none().then_some(pull.number)
+    }
+
+    /// Binds the conversation shown to pull request `number`, when it is
+    /// bound to none: the one just opened or resumed for its review.
+    pub fn bind_to_pull(&mut self, number: u64) {
+        if self.chat.pull.is_none() {
+            self.chat.pull = Some(crate::sessions::PullBinding { number, read: None });
+        }
+    }
+
+    /// The folder the conversation shown works in, when it is not the
+    /// project's: the copy of the pull request it reviews.
+    pub fn chat_folder(&self) -> Option<PathBuf> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.as_ref()?;
+        let bound = self.chat.pull.as_ref()?;
+        (bound.number == pull.number).then(|| changes.root.clone())
+    }
+
+    /// The pull request the conversation shown reviews now: it, its copy,
+    /// and where its branch left the one it would be merged into.
+    fn reviewed(&self) -> Option<(universe_tools::PullRequest, PathBuf, String)> {
+        let changes = self.changes.as_ref()?;
+        let pull = changes.pull.clone()?;
+        let bound = self.chat.pull.as_ref()?;
+        (bound.number == pull.number).then(|| (pull, changes.root.clone(), changes.base.clone()))
+    }
+
+    /// `text` with what the model must know of the pull request reviewed:
+    /// its title, description, files and diff on the first request; a
+    /// reminder after; what new commits changed when there are some.
+    fn with_pull(&mut self, text: String) -> String {
+        const DIFF_BYTES: usize = 60_000;
+        let Some((pull, copy, base)) = self.reviewed() else {
+            return text;
+        };
+        let read = self.chat.pull.as_ref().and_then(|p| p.read.clone());
+        let context = match read.as_deref() {
+            None => {
+                let files: Vec<String> = self
+                    .changes
+                    .as_ref()
+                    .map(|c| c.files.iter().map(|f| f.path.clone()).collect())
+                    .unwrap_or_default();
+                let diff = universe_tools::diff_between(&copy, &base, &pull.head, DIFF_BYTES)
+                    .unwrap_or_default();
+                format!(
+                    "You are reviewing pull request #{} \"{}\" by {} ({}), read only, in a copy \
+                     of its own checked out at its head; the project's own files are not \
+                     changed.\n\nIts description:\n{}\n\nIts files: {}\n\nIts diff:\n```diff\n{}\n```",
+                    pull.number,
+                    pull.title,
+                    pull.author,
+                    pull.url,
+                    pull.body.trim(),
+                    files.join(", "),
+                    diff.trim_end()
+                )
+            }
+            Some(read) if read == pull.head => format!(
+                "(Still reviewing #{}, read only, in its copy.)",
+                pull.number
+            ),
+            Some(read) => {
+                let diff = universe_tools::diff_between(&copy, read, &pull.head, DIFF_BYTES)
+                    .unwrap_or_default();
+                format!(
+                    "#{} has new commits since you last read it; what they changed:\n```diff\n{}\n```",
+                    pull.number,
+                    diff.trim_end()
+                )
+            }
+        };
+        if let Some(binding) = &mut self.chat.pull {
+            binding.read = Some(pull.head.clone());
+        }
+        let (context, _) = universe_tools::redact_secrets(&context);
+        format!("{context}\n\n{text}")
     }
 
     /// Starts looking at the branch's changes through `lens`, against
@@ -1494,10 +1762,30 @@ impl App {
         lens: crate::changes::Lens,
         argument: Option<String>,
     ) -> Option<Effect> {
+        // A pull request of GitHub, by its number or its link: checked out
+        // apart by the loop, the project's branch and files left alone.
+        if lens == crate::changes::Lens::Review
+            && let Some(number) = argument.as_deref().and_then(universe_tools::pull_number)
+        {
+            self.info(format!("Fetching #{number}…"));
+            return Some(Effect::FetchPull { number });
+        }
         if argument.as_deref() == Some("off") {
             self.walk_model = None;
             self.walk_asking = false;
+            // A file open in a pull request's copy closes with it, and the
+            // conversation shown before comes back, the review's closed.
+            if self.changes.as_ref().is_some_and(|c| c.pull.is_some()) {
+                self.file = None;
+                if let Some(from) = self.review_from.take() {
+                    let review = self.chat.id;
+                    if review != from && self.show_chat(from) {
+                        let _ = self.close_chat(review);
+                    }
+                }
+            }
             if self.changes.take().is_some() {
+                self.tree = self.tree.take().map(|_| self.new_tree());
                 if let Some(tree) = &mut self.tree {
                     tree.show_everything();
                 }
@@ -1679,7 +1967,7 @@ impl App {
         };
         let path = file.path();
         let path = path
-            .strip_prefix(&self.root)
+            .strip_prefix(&changes.root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned();
@@ -1991,8 +2279,19 @@ impl App {
                     return Some(Effect::Copy(text));
                 }
             }
+            // Closed, the costs, the subscriptions, then closed again.
             Action::ToggleUsage => {
-                self.usage_open = !self.usage_open;
+                match (self.usage_open, self.usage_page) {
+                    (false, _) => {
+                        self.usage_open = true;
+                        self.usage_page = UsagePage::Costs;
+                    }
+                    (true, UsagePage::Costs) => {
+                        self.usage_page = UsagePage::Subscriptions;
+                        self.subscriptions_due = true;
+                    }
+                    (true, UsagePage::Subscriptions) => self.usage_open = false,
+                }
                 if self.usage_open {
                     self.branch = None;
                     self.tickets_open = false;
@@ -2324,7 +2623,9 @@ impl App {
             return *known;
         }
         let exists = match reference {
-            Reference::File { path, .. } => !path.contains("..") && self.root.join(path).is_file(),
+            Reference::File { path, .. } => {
+                !path.contains("..") && self.view_root().join(path).is_file()
+            }
             Reference::Commit(_) => false,
         };
         self.known_references
@@ -2366,8 +2667,14 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
-        let mut editor = Editor::open(&self.root, self.root.join(path), highlighter);
-        if let Some(base) = universe_tools::branch_base(&self.root) {
+        let root = self.view_root();
+        let mut editor = Editor::open(&root, root.join(path), highlighter);
+        if let Some(base) = self
+            .changes
+            .as_ref()
+            .map(|c| c.base.clone())
+            .or_else(|| universe_tools::branch_base(&root))
+        {
             editor.compare_with(base);
         }
         if let Some(line) = line {
@@ -2482,7 +2789,7 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
-        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.file = Some(Editor::open(&self.view_root(), path, highlighter));
         self.as_changes_want();
         self.focus_on(Focus::File);
     }
@@ -2513,7 +2820,7 @@ impl App {
             return;
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
-        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.file = Some(Editor::open(&self.view_root(), path, highlighter));
         self.as_changes_want();
         self.focus_on(Focus::File);
     }
@@ -2634,13 +2941,16 @@ impl App {
             ));
             return None;
         }
+        // A pull request's review only reads, in its copy: no checks, no
+        // pair.
+        let reviewing = self.reviewed().is_some();
         let mut builder = AgentConfig::builder()
             .rounds_per_tier(self.settings.rounds)
             .max_turns(self.settings.max_turns);
         for tier in &tiers {
             builder = builder.tier(tier.clone());
         }
-        for check in &self.settings.checks {
+        for check in self.settings.checks.iter().filter(|_| !reviewing) {
             builder = builder.check(check.clone());
         }
         for member in self.members() {
@@ -2651,14 +2961,14 @@ impl App {
         }
         builder = builder
             .effort(Some(self.settings.effort))
-            .detect_checks(self.settings.detect_checks)
+            .detect_checks(self.settings.detect_checks && !reviewing)
             .context_warning(
                 self.settings
                     .context_warning
                     .unwrap_or(universe_agent::CONTEXT_WARNING),
             );
         let allowed = self.settings.allowed_secrets.clone();
-        if let Some(pair) = pair {
+        if let Some(pair) = pair.filter(|_| !reviewing) {
             builder = builder.pair(pair);
         }
         match builder.build() {
@@ -2675,9 +2985,40 @@ impl App {
                             .collect(),
                     )
                     .with_external_tools(self.settings.external.clone())
-                    .with_strict_commands(self.settings.strict_commands);
+                    .with_strict_commands(self.settings.strict_commands)
+                    .with_reading_only(reviewing);
                 self.input.take();
-                self.chat.transcript.push(Entry::User(text.clone()));
+                // Lines picked in the diff go with the message, quoted.
+                let text = match self.picked.take() {
+                    Some((path, first, last)) => {
+                        let span = if first == last {
+                            format!("line {first}")
+                        } else {
+                            format!("lines {first}-{last}")
+                        };
+                        self.chat
+                            .transcript
+                            .push(Entry::Info(format!("About {path}, {span}")));
+                        let quoted: Vec<String> =
+                            std::fs::read_to_string(self.view_root().join(&path))
+                                .unwrap_or_default()
+                                .lines()
+                                .skip(first.saturating_sub(1))
+                                .take(last + 1 - first)
+                                .map(str::to_owned)
+                                .collect();
+                        self.chat.transcript.push(Entry::User(text.clone()));
+                        format!(
+                            "About {path}, {span}:\n```\n{}\n```\n\n{text}",
+                            quoted.join("\n")
+                        )
+                    }
+                    None => {
+                        self.chat.transcript.push(Entry::User(text.clone()));
+                        text
+                    }
+                };
+                let text = self.with_pull(text);
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.chat.sub_view = None;
@@ -3175,6 +3516,13 @@ impl App {
                 self.progress_checked(checked);
                 false
             }
+            AgentMessage::Summaries(said) => {
+                match said {
+                    Ok(summaries) => self.summaries = Some(summaries),
+                    Err(e) => self.error(format!("The pull request was not summarized: {e}")),
+                }
+                false
+            }
             AgentMessage::WalkAnswer(answer) => {
                 self.walk_asking = false;
                 match answer {
@@ -3345,6 +3693,7 @@ impl App {
             transcript: self.chat.transcript.clone(),
             session,
             usage_log: self.chat.usage_log.clone(),
+            pull: self.chat.pull.clone(),
         })
     }
 
@@ -3358,6 +3707,7 @@ impl App {
         self.chat.cost = saved.cost;
         self.chat.cost_complete = saved.cost_complete;
         self.chat.transcript = saved.transcript;
+        self.chat.pull = saved.pull;
         self.learn_all_commits();
         self.chat.usage_log = saved.usage_log;
         self.chat.usage_log.prune(sessions::now());
@@ -4101,6 +4451,36 @@ impl App {
     pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
             .then_some((&self.chat.usage_log, self.usage_window))
+    }
+
+    /// Which page of the usage pane shows.
+    pub fn usage_page(&self) -> UsagePage {
+        self.usage_page
+    }
+
+    /// The agents' subscriptions.
+    pub fn subscriptions(&self) -> &crate::subscriptions::Subscriptions {
+        &self.subscriptions
+    }
+
+    /// What was kept of the subscriptions in earlier sessions.
+    pub fn subscriptions_loaded(&mut self, seen: crate::subscriptions::Seen) {
+        self.subscriptions.loaded(seen);
+    }
+
+    /// The agents' calls, as just read from their files.
+    pub fn subscription_calls_read(&mut self, calls: Vec<universe_core::SubscriptionCall>) {
+        self.subscriptions.calls_read(calls);
+    }
+
+    /// Whether the agents' calls should be read again; asking clears it.
+    pub fn take_subscriptions_due(&mut self) -> bool {
+        std::mem::take(&mut self.subscriptions_due)
+    }
+
+    /// The subscriptions' quotas to keep, when they changed since.
+    pub fn subscriptions_to_keep(&mut self) -> Option<crate::subscriptions::Seen> {
+        self.subscriptions.take_to_keep()
     }
 
     /// Asks which folder a new conversation works in, when the settings
@@ -4956,6 +5336,13 @@ impl App {
                 sessions::ago(0, idle_secs).trim_end_matches(" ago")
             )),
             Event::Notice { model, text } => Entry::Info(format!("{model}: {text}")),
+            // For the status line and the subscriptions' page; the calls
+            // that took it are read again.
+            Event::Quota(quota) => {
+                self.subscriptions.add(quota);
+                self.subscriptions_due = true;
+                return;
+            }
             Event::Denied {
                 model,
                 action,
@@ -5288,8 +5675,19 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         app.on_key(ctrl('o'));
         assert_eq!(app.usage_pane().map(|(_, w)| w), Some(3600));
+        assert_eq!(app.usage_page(), UsagePage::Costs);
+        // Again: the subscriptions, their calls read again; again: closed.
+        app.take_subscriptions_due();
+        app.on_key(ctrl('o'));
+        assert_eq!(app.usage_page(), UsagePage::Subscriptions);
+        assert!(app.take_subscriptions_due());
         app.on_key(ctrl('o'));
         assert!(app.usage_pane().is_none());
+        // Opened again, on the costs.
+        app.on_key(ctrl('o'));
+        assert_eq!(app.usage_page(), UsagePage::Costs);
+        app.on_key(ctrl('o'));
+        app.on_key(ctrl('o'));
         // The next window, shown.
         app.on_key(ctrl('p'));
         assert_eq!(app.usage_pane().map(|(_, w)| w), Some(6 * 3600));
@@ -5938,6 +6336,151 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_is_reviewed_in_its_copy_the_project_left_alone() {
+        let project = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(copy.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(copy.path().join("a.py"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(copy.path().join("a.py"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-am", "head"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(project.path().join("a.py"), "the project's own\n").unwrap();
+
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            project.path().to_owned(),
+        );
+        // By its number or its link: fetched by the loop.
+        assert!(matches!(
+            app.run_command("review https://github.com/o/r/pull/5"),
+            Some(Effect::FetchPull { number: 5 })
+        ));
+        let before = app.chat_id();
+        let checked = universe_tools::CheckedOut {
+            pull: universe_tools::PullRequest {
+                number: 5,
+                title: "Two".into(),
+                body: "Adds a line.".into(),
+                author: "someone".into(),
+                url: String::new(),
+                base: "main".into(),
+                head,
+            },
+            copy: copy.path().to_owned(),
+            merge_base: base,
+        };
+        // No conversation of its own yet: the loop opens one, or resumes a
+        // saved one, and binds it.
+        assert_eq!(app.pull_checked_out(Ok(checked.clone())), Some(5));
+        app.open_chat();
+        app.bind_to_pull(5);
+        assert_eq!(app.chat_folder().as_deref(), Some(copy.path()));
+        // Its first request reads the pull request whole; the next is
+        // reminded only.
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "is it sound?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert!(text.starts_with("You are reviewing pull request #5 \"Two\" by someone"));
+        assert!(text.contains("Adds a line.") && text.contains("+two"));
+        assert!(text.ends_with("is it sound?"));
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "and the tests?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert_eq!(
+            text,
+            "(Still reviewing #5, read only, in its copy.)\n\nand the tests?"
+        );
+        // New commits since it last read: what they changed, not all again.
+        let first = app.change_set().unwrap().base.clone();
+        if let Some(binding) = &mut app.chat.pull {
+            binding.read = Some(first);
+        }
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        type_text(&mut app, "and now?");
+        let Some(Effect::Send { text, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a request");
+        };
+        assert!(text.starts_with("#5 has new commits since you last read it"));
+        assert!(text.contains("+two") && text.ends_with("and now?"));
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: universe_core::Usage::default(),
+            cost: Usd(0.0),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: Vec::new(),
+        })));
+        // Reviewed again: its conversation is the one shown.
+        let review = app.chat_id();
+        app.show_chat(before);
+        assert_eq!(app.pull_checked_out(Ok(checked)), None);
+        assert_eq!(app.chat_id(), review);
+        let changes = app.change_set().unwrap();
+        assert_eq!(changes.root, copy.path());
+        assert_eq!(changes.files[0].path, "a.py");
+        // The tree and the editor read the copy, read only.
+        app.click_tree(0);
+        let file = app.file().unwrap();
+        assert_eq!(file.path(), Path::new("a.py"));
+        assert_eq!(file.lines(), ["one", "two"]);
+        // Done: the project again, the copy's file closed, the conversation
+        // shown before back and the review's closed, its file kept.
+        app.run_command("review off");
+        assert!(app.change_set().is_none());
+        assert!(app.file().is_none());
+        assert_eq!(app.chat_id(), before);
+        assert!(!app.chat_ids().contains(&review));
+        assert_eq!(app.chat_folder(), None);
+        // A pull request that could not be fetched says why.
+        app.pull_checked_out(Err("gh could not read #9".into()));
+        assert!(matches!(app.chat.transcript.last(), Some(Entry::Error(e)) if e.contains("#9")));
+    }
+
+    #[test]
     fn a_review_shows_only_the_branch_and_its_files_against_their_base() {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -6342,6 +6885,7 @@ mod tests {
             requests: 1,
             cost: Usd(0.0),
             project: PathBuf::from("/p"),
+            pull: None,
         };
         app.show_picker(vec![item("a"), item("b")]);
         press(&mut app, KeyCode::Down);

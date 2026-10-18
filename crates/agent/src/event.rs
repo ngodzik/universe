@@ -141,6 +141,8 @@ pub enum Event {
         /// What.
         text: String,
     },
+    /// An agent reported its subscription's quota.
+    Quota(universe_core::Quota),
     /// An agent's safety checks refused one of its calls: the person may
     /// approve it in their next message.
     Denied {

@@ -16,6 +16,7 @@ mod error;
 mod openai_compat;
 mod prices;
 mod rankings;
+mod subscriptions;
 
 pub use agents::Agents;
 pub use claude_code::ClaudeCode;

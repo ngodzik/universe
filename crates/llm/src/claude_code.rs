@@ -270,6 +270,15 @@ impl StreamParser {
                 self.deny(&event, on_event);
             }
             Some("stream_event") => self.stream_event(&event["event"], on_event),
+            // Under a subscription, how much of it is left, once a request.
+            Some("rate_limit_event") if !self.billed => {
+                let at = crate::subscriptions::now();
+                if let Some(quota) =
+                    crate::subscriptions::claude_quota(&event["rate_limit_info"], at)
+                {
+                    on_event(DelegateEvent::Quota(quota));
+                }
+            }
             Some("assistant") => {
                 for block in blocks(&event["message"]["content"]) {
                     match block["type"].as_str() {

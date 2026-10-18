@@ -39,8 +39,8 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
 | Crate             | Single responsibility                                                      |
 |-------------------|----------------------------------------------------------------------------|
 | `universe-core`  | Domain types and traits, zero I/O, zero network                            |
-| `universe-llm`   | Model providers, one `impl ChatModel` per protocol, and the Claude Code `Delegate` |
-| `universe-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git, and the document sources the settings name (a file, a page behind an MCP server's tools) |
+| `universe-llm`   | Model providers, one `impl ChatModel` per protocol, the Claude Code and Codex `Delegate`, and what their subscriptions report (quotas, each call from their own files) |
+| `universe-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git, a pull request checked out apart for review, and the document sources the settings name (a file, a page behind an MCP server's tools) |
 | `universe-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
 | `universe-ui`    | The interface's state: modes, keys, commands, the editor. Draws nothing    |
 | `universe-gui`   | Draws `universe-ui`'s state in a window, with egui on Bevy, and runs its loop. Generic over `ChatModel` |

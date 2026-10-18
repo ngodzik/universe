@@ -39,4 +39,8 @@ impl Delegate for Agents {
             Agent::Codex => self.codex.run(request, on_event).await,
         }
     }
+
+    fn subscription_calls(&self, since: u64) -> Vec<universe_core::SubscriptionCall> {
+        crate::subscriptions::LOG.since(since)
+    }
 }

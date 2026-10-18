@@ -120,6 +120,10 @@ pub enum Incoming {
     DockerDue,
     /// Whether to keep the sessions warm is due to be looked at.
     WarmDue,
+    /// The agents' calls under their subscriptions, read from their files.
+    SubscriptionCalls(Vec<universe_core::SubscriptionCall>),
+    /// A pull request checked out for review, or why it could not be.
+    PullCheckedOut(Result<universe_tools::CheckedOut, String>),
 }
 
 /// Carries out the effects the state returns, holds the conversation the
@@ -153,6 +157,14 @@ pub struct Host<M, D> {
     rules: crate::outside_rules::OutsideRules,
     /// The project's files of instructions, for agents to be told of.
     guides: crate::guides::Guides,
+    /// The agents' calls, read on a thread of their own.
+    calls_tx: mpsc::UnboundedSender<Vec<universe_core::SubscriptionCall>>,
+    calls_rx: mpsc::UnboundedReceiver<Vec<universe_core::SubscriptionCall>>,
+    /// They are being read: another read waits for it to end.
+    calls_reading: bool,
+    /// Pull requests checked out, on a thread each as they need the network.
+    pulls_tx: mpsc::UnboundedSender<Result<universe_tools::CheckedOut, String>>,
+    pulls_rx: mpsc::UnboundedReceiver<Result<universe_tools::CheckedOut, String>>,
 }
 
 impl<M, D> Host<M, D>
@@ -166,6 +178,8 @@ where
     pub fn new(model: Arc<M>, delegate: Arc<D>, workspace: Workspace) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (docker_tx, docker_rx) = mpsc::unbounded_channel();
+        let (calls_tx, calls_rx) = mpsc::unbounded_channel();
+        let (pulls_tx, pulls_rx) = mpsc::unbounded_channel();
         let store = Store::for_project(workspace.root());
         let workspace_root = &workspace.root().to_owned();
         Self {
@@ -186,6 +200,11 @@ where
             awake: crate::awake::Awake::default(),
             rules: crate::outside_rules::OutsideRules::default(),
             guides: crate::guides::Guides::default(),
+            calls_tx,
+            calls_rx,
+            calls_reading: false,
+            pulls_tx,
+            pulls_rx,
         }
     }
 
@@ -208,6 +227,14 @@ where
         self.rules.refresh_due();
         // Listed in the background, for the first request to an agent.
         self.guides.get(self.workspace.root());
+        // The quotas heard of in earlier sessions: Claude Code's are kept
+        // nowhere else.
+        if let Some(seen) = quotas_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+        {
+            app.subscriptions_loaded(seen);
+        }
         let state = self
             .store
             .as_ref()
@@ -318,6 +345,8 @@ where
             _ = self.docker_tick.tick(), if waiting.docker && !self.docker_asking => Incoming::DockerDue,
             _ = self.spin.tick(), if waiting.running => Incoming::Spin,
             _ = self.warm_tick.tick() => Incoming::WarmDue,
+            Some(calls) = self.calls_rx.recv() => Incoming::SubscriptionCalls(calls),
+            Some(checked) = self.pulls_rx.recv() => Incoming::PullCheckedOut(checked),
         }
     }
 
@@ -352,6 +381,29 @@ where
                 None
             }
             Incoming::DockerDue => Some(Effect::RefreshDocker),
+            Incoming::SubscriptionCalls(calls) => {
+                self.calls_reading = false;
+                app.subscription_calls_read(calls);
+                None
+            }
+            Incoming::PullCheckedOut(checked) => {
+                // Its conversation: one saved earlier for it, resumed, else
+                // a new one.
+                if let Some(number) = app.pull_checked_out(checked) {
+                    let saved = self.store.as_ref().and_then(|store| {
+                        store
+                            .list()
+                            .into_iter()
+                            .find(|s| s.pull.as_ref().is_some_and(|p| p.number == number))
+                    });
+                    let chat = app.open_chat();
+                    if let Some(saved) = saved {
+                        self.resume_into(app, chat, &saved.id).await;
+                    }
+                    app.bind_to_pull(number);
+                }
+                None
+            }
             Incoming::Spin => {
                 app.on_tick();
                 None
@@ -427,6 +479,24 @@ where
         }
         // What needs the conversation waits while a request has it, rather
         // than freeze the interface until its end.
+        // The agents' calls, read again on a thread when the state asks,
+        // as their files are large; the quotas kept as they come.
+        if !self.calls_reading && app.take_subscriptions_due() {
+            self.calls_reading = true;
+            let (delegate, tx) = (Arc::clone(&self.delegate), self.calls_tx.clone());
+            tokio::task::spawn_blocking(move || {
+                let since = crate::sessions::now().saturating_sub(crate::subscriptions::KEEP_SECS);
+                let _ = tx.send(delegate.subscription_calls(since));
+            });
+        }
+        if let Some(seen) = app.subscriptions_to_keep()
+            && let Some(path) = quotas_path()
+            && let Err(e) = serde_json::to_string(&seen)
+                .map_err(std::io::Error::other)
+                .and_then(|text| std::fs::write(&path, text))
+        {
+            app.report_error(format!("Could not keep the subscriptions' quotas: {e}"));
+        }
         // What the MCP servers have to say, such as a page to consent on.
         if let Some(external) = app.external_tools().cloned() {
             for notice in external.notices() {
@@ -483,6 +553,7 @@ where
             servers,
             rules,
             guides,
+            pulls_tx: self_pulls_tx,
             ..
         } = self;
         let store = store.as_ref();
@@ -496,6 +567,10 @@ where
             .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
+                if let Err(e) = work_in(conversation, app.chat_folder(), workspace).await {
+                    app.report_error(e);
+                    return;
+                }
                 let config = asking(config, app.root(), tx)
                     .with_outside_rules(rules.text())
                     .with_folder_guides(guides.get(workspace.root()));
@@ -708,6 +783,32 @@ where
                     }
                     Err(e) => app.report_error(e),
                 }
+            }
+            Effect::FetchPull { number } => {
+                let Some(reviews) = Defaults::path().map(|p| p.with_file_name("reviews")) else {
+                    app.report_error(
+                        "No folder to check pull requests out in: HOME is not set".to_owned(),
+                    );
+                    return;
+                };
+                let (root, tx) = (workspace.root().to_owned(), self_pulls_tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(universe_tools::check_out_pull(&root, &reviews, number));
+                });
+            }
+            Effect::SummarizePull {
+                copy,
+                pull,
+                areas,
+                model: chosen,
+                candidates,
+            } => {
+                let (model, tx) = (Arc::clone(model), tx.clone());
+                tokio::spawn(async move {
+                    let said =
+                        summarize(&*model, &copy, &pull, &areas, chosen, &candidates, &tx).await;
+                    let _ = tx.send(AgentMessage::Summaries(said));
+                });
             }
             Effect::ShowRules => {
                 rules.refresh_due();
@@ -1021,36 +1122,78 @@ async fn ask_one<M: ChatModel>(
     question: String,
     tx: &mpsc::UnboundedSender<AgentMessage>,
 ) -> Result<String, String> {
+    ask_at(
+        model,
+        chosen,
+        candidates,
+        system,
+        question,
+        universe_core::Effort::Low,
+        tx,
+    )
+    .await
+}
+
+/// As [`ask_one`], at `effort`.
+async fn ask_at<M: ChatModel>(
+    model: &M,
+    chosen: Option<universe_core::ModelId>,
+    candidates: &[universe_core::ModelId],
+    system: &str,
+    question: String,
+    effort: universe_core::Effort,
+    tx: &mpsc::UnboundedSender<AgentMessage>,
+) -> Result<String, String> {
     let observe = |e| {
         let _ = tx.send(AgentMessage::Event(e));
     };
     let answered = match chosen {
-        Some(to) => {
-            universe_agent::ask(
-                model,
-                &to,
-                system,
-                question,
-                universe_core::Effort::Low,
-                observe,
-            )
-            .await
-        }
+        Some(to) => universe_agent::ask(model, &to, system, question, effort, observe).await,
         None => {
-            universe_agent::ask_cheapest(
-                model,
-                candidates,
-                system,
-                question,
-                universe_core::Effort::Low,
-                observe,
-            )
-            .await
+            universe_agent::ask_cheapest(model, candidates, system, question, effort, observe).await
         }
     };
     answered.map(|a| a.text).ok_or_else(|| {
         "No model answered: mark one for fresh work with Ctrl-F, or price one".to_owned()
     })
+}
+
+/// What a model says of a pull request, kept beside its copy per head
+/// commit: asked of the model only when none is kept. Its diff goes to the
+/// model, so the environment's secrets are taken out first.
+async fn summarize<M: ChatModel>(
+    model: &M,
+    copy: &std::path::Path,
+    pull: &universe_tools::PullRequest,
+    areas: &[crate::pull_review::AreaDiff],
+    chosen: Option<universe_core::ModelId>,
+    candidates: &[universe_core::ModelId],
+    tx: &mpsc::UnboundedSender<AgentMessage>,
+) -> Result<crate::pull_review::Summaries, String> {
+    let kept = crate::pull_review::kept_at(copy, &pull.head);
+    if let Some(summaries) = std::fs::read_to_string(&kept)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    {
+        return Ok(summaries);
+    }
+    let (question, _) =
+        universe_tools::redact_secrets(&crate::pull_review::summary_question(pull, areas));
+    let answer = ask_at(
+        model,
+        chosen,
+        candidates,
+        crate::pull_review::SUMMARY_PROMPT,
+        question,
+        universe_core::Effort::High,
+        tx,
+    )
+    .await?;
+    let summaries = crate::pull_review::parse_summaries(&pull.head, &answer);
+    if let Ok(text) = serde_json::to_string(&summaries) {
+        let _ = std::fs::write(&kept, text);
+    }
+    Ok(summaries)
 }
 
 /// Reads a ticket and its comments through its tracker's MCP tools, and has
@@ -1165,6 +1308,28 @@ async fn check_progress<M: ChatModel>(
     .await?;
     let verdicts = crate::tickets::parse_verdicts(&answer)?;
     Ok(crate::tickets::progress(tickets, &marked, &verdicts))
+}
+
+/// Puts `conversation`'s tools in `folder`, the copy of a pull request it
+/// reviews, else back in the project's `workspace`, when they are not.
+async fn work_in(
+    conversation: &Arc<Mutex<Conversation>>,
+    folder: Option<std::path::PathBuf>,
+    workspace: &Workspace,
+) -> Result<(), String> {
+    let mut conversation = conversation.lock().await;
+    let wanted = folder.unwrap_or_else(|| workspace.root().to_owned());
+    if conversation.toolbox.workspace().root() != wanted {
+        let elsewhere = Workspace::new(&wanted)
+            .map_err(|e| format!("{} cannot be worked in: {e}", wanted.display()))?;
+        conversation.toolbox = Toolbox::new(elsewhere);
+    }
+    Ok(())
+}
+
+/// Where the quotas the agents reported are kept, beside the settings.
+fn quotas_path() -> Option<std::path::PathBuf> {
+    Defaults::path().map(|p| p.with_file_name("quotas.json"))
 }
 
 /// `config` with what a request reads again each time, an edit counting

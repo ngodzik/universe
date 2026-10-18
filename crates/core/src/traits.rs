@@ -49,4 +49,13 @@ pub trait Delegate: Send + Sync {
         request: &DelegateRequest,
         on_event: &mut (dyn FnMut(DelegateEvent) + Send),
     ) -> impl Future<Output = Result<DelegateReply, Self::Error>> + Send;
+
+    /// The calls the agents made under a subscription since `since`, in
+    /// seconds since 1970, oldest first, as their own files keep them:
+    /// those the person started outside universe too. Reads files, and may
+    /// take a moment; none by default.
+    fn subscription_calls(&self, since: u64) -> Vec<crate::subscription::SubscriptionCall> {
+        let _ = since;
+        Vec::new()
+    }
 }
