@@ -4,9 +4,12 @@
 //! the page; the host carries out the rest.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use universe_preview::{Answer, Call, Config, Event, Operation, State, Status};
+use universe_preview::{
+    Answer, Call, Config, Event, Held, Operation, Spec, State, Status, Written,
+};
 
 /// How many calls are kept, the latest.
 const KEPT_CALLS: usize = 400;
@@ -19,6 +22,30 @@ const KEPT_LINES: usize = 200;
 
 /// How many lines the log keeps, the latest.
 const KEPT_ACTIVITY: usize = 300;
+
+/// How many of what the written behaviour refused are kept, the latest.
+const KEPT_REFUSED: usize = 20;
+
+/// What the model that writes a simulated back end's behaviour is told it
+/// does, the program's API after it.
+pub const BACK_END_PROMPT: &str = "You write the behaviour of a back end simulated from an OpenAPI spec, for a person who tests a front end against it in universe. Without your program, the simulated back end already answers every operation with a body made from its schema, and keeps what the page does: POST /items/ adds to the list, PATCH and PUT change an item, DELETE removes it, an action answered with the item changes it, ids given become the objects they name, and each item reads the same wherever it shows. You write only what these defaults cannot know: what the person asks for, what a real server would also do (a checkout confirmed makes an order), answers bent to a case. Write the whole program, those of its handlers the request does not change kept as they are, in one ```js block. It is tried before it is kept: every handler asked once, its answers checked against the spec's schemas.";
+
+/// The behaviour a model wrote for the back end, as the preview last told
+/// it, and what is asked of a model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WrittenBehaviour {
+    /// The operations it handles, as it writes them.
+    pub handled: Vec<String>,
+    /// Those it names that the spec has not.
+    pub unknown: Vec<String>,
+    /// Why it does not run, when it does not.
+    pub broken: Option<String>,
+    /// What a model is asked to write, while it writes it.
+    pub asked: Option<String>,
+    /// What its handlers refused lately, the operation and why, the latest
+    /// last.
+    pub refused: VecDeque<(String, String)>,
+}
 
 /// What the App view asks the preview.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +66,10 @@ pub enum AppOrder {
     Change(Change),
     /// Keep what operation answered last as its fixture.
     Keep(usize),
+    /// Forget what the page created, changed and deleted.
+    Forget,
+    /// Remove the behaviour written for the back end: its file.
+    Unwrite(PathBuf),
 }
 
 /// A change to the state the simulated back end answers in.
@@ -147,6 +178,15 @@ pub struct AppPreview {
     errors: VecDeque<(u64, String)>,
     said: VecDeque<String>,
     state: State,
+    /// What the back end holds of what the page did, by collection.
+    held: Vec<Held>,
+    /// The spec the back end is simulated from, once read.
+    spec: Option<Arc<Spec>>,
+    /// The file of the behaviour written for the back end, and the folder
+    /// of its fixtures.
+    program: Option<PathBuf>,
+    fixtures: Option<PathBuf>,
+    written: WrittenBehaviour,
     hidden_pilot: bool,
     playing: Option<Playing>,
     kept: Option<PathBuf>,
@@ -248,6 +288,63 @@ impl AppPreview {
         &self.state
     }
 
+    /// What the back end holds of what the page created, changed and
+    /// deleted, by collection.
+    #[must_use]
+    pub fn held(&self) -> &[Held] {
+        &self.held
+    }
+
+    /// The behaviour written for the back end, as last told.
+    #[must_use]
+    pub fn written(&self) -> &WrittenBehaviour {
+        &self.written
+    }
+
+    /// The file of the behaviour written for the back end.
+    #[must_use]
+    pub fn program(&self) -> Option<&Path> {
+        self.program.as_deref()
+    }
+
+    /// The spec the back end is simulated from, once read.
+    #[must_use]
+    pub fn spec(&self) -> Option<&Arc<Spec>> {
+        self.spec.as_ref()
+    }
+
+    /// The folder of the operations' fixtures.
+    #[must_use]
+    pub fn fixtures(&self) -> Option<&Path> {
+        self.fixtures.as_deref()
+    }
+
+    /// Notes that a model is asked to write `asked`.
+    pub(crate) fn asking(&mut self, asked: &str) {
+        self.written.asked = Some(asked.to_owned());
+        self.log(
+            ActivityKind::Step,
+            format!("A model writes the back end's behaviour: {asked}"),
+        );
+    }
+
+    /// Notes what came of it: the operations the program kept handles, or
+    /// why it was not kept.
+    pub(crate) fn wrote(&mut self, result: &Result<Vec<String>, String>) {
+        self.written.asked = None;
+        let (kind, said) = match result {
+            Ok(handled) => (
+                ActivityKind::Done,
+                format!("The back end's behaviour is kept: {}", handled.join(", ")),
+            ),
+            Err(why) => (
+                ActivityKind::Failed,
+                format!("The back end's behaviour was not kept: {why}"),
+            ),
+        };
+        self.log(kind, said);
+    }
+
     /// Whether the pilot shows beside the page.
     #[must_use]
     pub fn pilot_shown(&self) -> bool {
@@ -297,6 +394,8 @@ impl AppPreview {
             status: Some(Status::Reading),
             target: Some(config.start.clone()),
             loading: Some(std::time::Instant::now()),
+            program: config.program.clone(),
+            fixtures: config.fixtures.clone(),
             ..Self::default()
         };
         AppOrder::Start(Box::new(config))
@@ -332,6 +431,14 @@ impl AppPreview {
         };
         self.log(ActivityKind::Step, said);
         AppOrder::Change(change)
+    }
+
+    pub(crate) fn forget(&mut self) -> AppOrder {
+        self.log(
+            ActivityKind::Step,
+            "Forgot what the page created, changed and deleted".to_owned(),
+        );
+        AppOrder::Forget
     }
 
     pub(crate) fn play(&mut self, playing: Playing, paths: Vec<String>) -> AppOrder {
@@ -397,6 +504,8 @@ impl AppPreview {
                     universe_preview::Source::Schema => "made",
                     universe_preview::Source::Fixture => "fixture",
                     universe_preview::Source::Changed => "changed",
+                    universe_preview::Source::Held => "held",
+                    universe_preview::Source::Written => "written",
                     universe_preview::Source::Missing => "not in the spec",
                 };
                 let kind = if call.status >= 400 {
@@ -467,6 +576,9 @@ impl AppPreview {
                 self.errors_seen += 1;
                 push(&mut self.errors, (self.errors_seen, error), KEPT_ERRORS);
             }
+            Event::Held(held) => self.held = held,
+            Event::Spec(spec) => self.spec = Some(spec),
+            Event::Written(written) => self.told_written(written),
             Event::Kept(path) => {
                 self.log(
                     ActivityKind::Done,
@@ -484,6 +596,66 @@ impl AppPreview {
         }
         None
     }
+}
+
+impl AppPreview {
+    fn told_written(&mut self, written: Written) {
+        match written {
+            Written::Loaded { handled, unknown } => {
+                let mut said = if handled.is_empty() {
+                    "The back end answers without a written behaviour".to_owned()
+                } else {
+                    format!("The written behaviour handles {}", handled.join(", "))
+                };
+                if !unknown.is_empty() {
+                    said.push_str(&format!("; the spec has no {}", unknown.join(", ")));
+                }
+                self.log(ActivityKind::Step, said);
+                self.written.handled = handled;
+                self.written.unknown = unknown;
+                self.written.broken = None;
+            }
+            Written::Broken(why) => {
+                self.log(
+                    ActivityKind::Failed,
+                    format!(
+                        "The written behaviour does not run: {}",
+                        why.lines().next().unwrap_or_default()
+                    ),
+                );
+                self.written.broken = Some(why);
+            }
+            Written::Refused { operation, why } => {
+                self.log(ActivityKind::Failed, format!("{operation}: {why}"));
+                push(&mut self.written.refused, (operation, why), KEPT_REFUSED);
+            }
+            Written::Said(line) => self.log(ActivityKind::Step, line),
+        }
+    }
+}
+
+/// The program in what a model answered: its last block of JavaScript,
+/// else all of it.
+#[must_use]
+pub fn program_in(answer: &str) -> String {
+    let mut found = None;
+    let mut rest = answer;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let Some(line_end) = after.find('\n') else {
+            break;
+        };
+        let language = after[..line_end].trim();
+        let body = &after[line_end + 1..];
+        let Some(close) = body.find("```") else {
+            break;
+        };
+        if matches!(language, "js" | "javascript" | "") {
+            found = Some(body[..close].trim().to_owned());
+        }
+        rest = &body[close + 3..];
+    }
+    found.unwrap_or_else(|| answer.trim().to_owned())
 }
 
 /// The path of an address, its query aside: `/dashboard/demo`.
@@ -669,5 +841,70 @@ mod tests {
         assert_eq!(preview.state().answers[&3], Answer::Status(403));
         preview.change(Change::Reset);
         assert_eq!(preview.state(), &State::default());
+    }
+
+    #[test]
+    fn what_the_written_behaviour_does_is_told() {
+        let mut preview = AppPreview::default();
+        preview.asking("make an order");
+        assert_eq!(preview.written().asked.as_deref(), Some("make an order"));
+        preview.told(Event::Written(Written::Loaded {
+            handled: vec!["POST /v1/checkouts/{id}/confirm".to_owned()],
+            unknown: vec!["GET /v1/nowhere".to_owned()],
+        }));
+        preview.told(Event::Written(Written::Refused {
+            operation: "POST /v1/checkouts/{id}/confirm".to_owned(),
+            why: "it threw".to_owned(),
+        }));
+        preview.wrote(&Ok(vec!["POST /v1/checkouts/{id}/confirm".to_owned()]));
+        let written = preview.written();
+        assert_eq!(written.asked, None);
+        assert_eq!(written.handled.len(), 1);
+        assert_eq!(written.unknown, ["GET /v1/nowhere"]);
+        assert_eq!(written.refused.len(), 1);
+        assert!(
+            preview
+                .activity()
+                .any(|a| a.text.starts_with("The back end's behaviour is kept"))
+        );
+        preview.told(Event::Written(Written::Broken(
+            "SyntaxError at back-end.js:3".to_owned(),
+        )));
+        assert!(preview.written().broken.is_some());
+    }
+
+    #[test]
+    fn a_program_is_the_last_block_of_javascript_answered() {
+        assert_eq!(
+            program_in(
+                "Here:\n```js\non('GET /a', () => 1);\n```\nand\n```javascript\non('GET /b', () => 2);\n```\n"
+            ),
+            "on('GET /b', () => 2);"
+        );
+        assert_eq!(
+            program_in("```json\n{}\n```\n```\non('GET /c', () => 3);\n```"),
+            "on('GET /c', () => 3);"
+        );
+        assert_eq!(
+            program_in("  on('GET /d', () => 4);  "),
+            "on('GET /d', () => 4);"
+        );
+    }
+
+    #[test]
+    fn what_the_back_end_holds_is_told_and_forgotten() {
+        let mut preview = AppPreview::default();
+        let held = Held {
+            path: "/v1/products".to_owned(),
+            created: 1,
+            changed: 0,
+            deleted: 0,
+        };
+        preview.told(Event::Held(vec![held.clone()]));
+        assert_eq!(preview.held(), [held]);
+        assert_eq!(preview.forget(), AppOrder::Forget);
+        assert!(preview.activity().any(|a| a.text.starts_with("Forgot")));
+        preview.told(Event::Held(Vec::new()));
+        assert!(preview.held().is_empty());
     }
 }

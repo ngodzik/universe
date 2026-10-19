@@ -62,6 +62,8 @@ pub(crate) struct AppView {
     /// Where the page shows, in points, and the points to a window's
     /// pixel: none while it does not.
     pub(crate) page_area: Option<(Rect, f32)>,
+    /// What the person asks a model to make the back end do, as typed.
+    asking: String,
 }
 
 impl AppView {
@@ -83,6 +85,7 @@ impl AppView {
             devtools: None,
             chrome: false,
             page_area: None,
+            asking: String::new(),
         }
     }
 
@@ -517,6 +520,7 @@ fn pilot(
             if app.app_preview().is_running() {
                 address(ui, app, effects);
                 states(ui, app, effects);
+                written(ui, view, app, effects);
             }
             workflows(ui, view, app, effects);
             screens(ui, view, app, effects);
@@ -857,6 +861,10 @@ fn config(
             .base
             .as_ref()
             .map(|b| cache_folder(b, root).join("app-fixtures")),
+        program: view
+            .base
+            .as_ref()
+            .map(|b| cache_folder(b, root).join("app-back-end.js")),
         cookies,
         start: example_url(&start_route(front)),
         leftovers: view
@@ -994,6 +1002,143 @@ fn states(ui: &mut Ui, app: &mut App, effects: &mut Vec<Effect>) {
             }
         }
     });
+    held(ui, app, effects);
+}
+
+/// What the back end holds of what the page created, changed and deleted,
+/// by collection, and the way to forget it.
+fn held(ui: &mut Ui, app: &mut App, effects: &mut Vec<Effect>) {
+    let held = app.app_preview().held().to_vec();
+    if held.is_empty() {
+        ui.label(
+            RichText::new("What the page creates, changes or deletes is kept here, as its API's paths say, until forgotten")
+                .size(11.0)
+                .color(DIM),
+        );
+        return;
+    }
+    for collection in &held {
+        let counts: Vec<String> = [
+            (collection.created, "created"),
+            (collection.changed, "changed"),
+            (collection.deleted, "deleted"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&collection.path)
+                        .monospace()
+                        .size(11.0)
+                        .color(TEXT),
+                )
+                .truncate(),
+            );
+            ui.label(RichText::new(counts.join(" · ")).size(11.0).color(GREEN));
+        });
+    }
+    if ui
+        .small_button("Forget")
+        .on_hover_text("Forget what the page created, changed and deleted: every answer as the spec makes it again")
+        .clicked()
+    {
+        if let Some(effect) = app.app_forget() {
+            effects.push(effect);
+        }
+        if let Some(effect) = app.app_reload() {
+            effects.push(effect);
+        }
+    }
+}
+
+/// The behaviour a model writes for the back end, beyond what the spec's
+/// paths say: what to ask, what it handles, what it refused, its file.
+fn written(ui: &mut Ui, view: &mut AppView, app: &mut App, effects: &mut Vec<Effect>) {
+    heading(ui, "BEHAVIOUR WRITTEN BY A MODEL");
+    let written = app.app_preview().written().clone();
+    if let Some(asked) = &written.asked {
+        ui.label(
+            RichText::new(format!("A model writes it, then it is tried: {asked}"))
+                .size(12.0)
+                .color(YELLOW),
+        );
+    } else {
+        ui.add(
+            egui::TextEdit::multiline(&mut view.asking)
+                .hint_text("What the back end should do: when a checkout is confirmed, make its order and the customer's subscription…")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let ready = !view.asking.trim().is_empty();
+        if ui
+            .add_enabled(ready, egui::Button::new(RichText::new("Write it").size(12.5)))
+            .on_hover_text("A model writes it in JavaScript, run with no access to the machine; it is kept once each of its answers holds to the spec's schemas")
+            .clicked()
+            && let Some(effect) = app.app_write(&view.asking)
+        {
+            effects.push(effect);
+            view.asking.clear();
+        }
+    }
+    if let Some(why) = &written.broken {
+        ui.label(
+            RichText::new(format!(
+                "It does not run: {}",
+                why.lines().next().unwrap_or_default()
+            ))
+            .size(11.5)
+            .color(RED),
+        );
+    }
+    for operation in &written.handled {
+        ui.label(
+            RichText::new(operation)
+                .monospace()
+                .size(11.0)
+                .color(ACCENT),
+        );
+    }
+    if !written.unknown.is_empty() {
+        ui.label(
+            RichText::new(format!("Not in the spec: {}", written.unknown.join(", ")))
+                .size(11.0)
+                .color(YELLOW),
+        );
+    }
+    for (operation, why) in written.refused.iter().rev().take(3) {
+        ui.label(
+            RichText::new(format!("{operation}: {why}"))
+                .size(11.0)
+                .color(RED),
+        )
+        .on_hover_text("The default answer was given instead");
+    }
+    let file = app.app_preview().program().map(Path::to_owned);
+    if let Some(file) = file.filter(|f| f.exists()) {
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Open")
+                .on_hover_text(format!(
+                    "{}: changed by hand, it is read again at the next call",
+                    file.display()
+                ))
+                .clicked()
+            {
+                app.open_from_app(file.clone(), 1);
+            }
+            if ui
+                .small_button("Remove")
+                .on_hover_text("The back end answers without it")
+                .clicked()
+                && let Some(effect) = app.app_unwrite()
+            {
+                effects.push(effect);
+            }
+        });
+    }
 }
 
 /// The workflows, by group: one clicked is shown screen after screen.
@@ -1147,6 +1292,8 @@ fn calls(
             Source::Schema => ("schema", DIM),
             Source::Fixture => ("fixture", CYAN),
             Source::Changed => ("changed", YELLOW),
+            Source::Held => ("held", GREEN),
+            Source::Written => ("written", ACCENT),
             Source::Missing => ("not in the spec", RED),
         };
         let path = call.path.split('?').next().unwrap_or(&call.path);

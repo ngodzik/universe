@@ -1,5 +1,5 @@
 //! A project's front end run as its developers run it, against a back end
-//! simulated from the API's spec, in the Chrome universe holds in its own
+//! simulated from the API's spec, in the Chrome universe holds in its
 //! window, driven over the DevTools protocol. The person uses the page
 //! there as in any browser; its address, its loads and its errors are
 //! told, and every call it makes with the operation it reached and where
@@ -8,31 +8,41 @@
 //! Nothing here asks a model. The answers are made from the spec's
 //! schemas, the same for the same place, bent to a state on demand (lists
 //! empty, rights withheld, flags on, slow, failing, a status of the spec's
-//! for one operation), or read from a fixture kept to be changed by hand.
+//! for one operation), or read from a fixture kept to be changed by hand;
+//! what a page creates, changes and deletes is held over them, as the
+//! spec's paths say, until forgotten. What the paths cannot say, a program
+//! a model wrote may: it runs in a sandbox, tried before it is kept, and
+//! its answers are given only when they hold to the spec's schemas.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod brief;
 mod browser;
 mod dev;
 mod error;
+mod held;
 mod leftovers;
 mod made;
 mod mock;
 mod spec;
+mod written;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+pub use brief::brief;
 pub use browser::browser_found;
 pub use dev::{Framework, Run, command_line, command_shown, free_port};
 pub use error::PreviewError;
+pub use held::Held;
 pub use leftovers::{leftovers_file, stop_leftovers};
 pub use made::Tone;
 pub use mock::{Answer, Call, SLOW, Source, State, fixture_name};
 pub use spec::{Operation, Spec};
+pub use written::{API as PROGRAM_API, Written};
 
 use browser::{Browser, Request};
 use dev::DevServer;
@@ -69,6 +79,9 @@ pub struct Config {
     /// Where what it starts is written down, to be stopped at the next
     /// start if it is left running.
     pub leftovers: Option<PathBuf>,
+    /// The file of the behaviour written for the back end, read whenever
+    /// it changes.
+    pub program: Option<PathBuf>,
     /// The port the DevTools of the browser universe holds listen on, its
     /// page the front end's; without one, the system's browser is started
     /// headless, as a test's is.
@@ -108,6 +121,8 @@ pub enum Event {
     Status(Status),
     /// The operations of the spec, once read.
     Operations(Vec<Operation>),
+    /// The spec, once read.
+    Spec(Arc<Spec>),
     /// A line the front end's server printed.
     Said(String),
     /// A call the back end answered.
@@ -128,6 +143,11 @@ pub enum Event {
     Console(String),
     /// An operation's answer kept as a fixture, in this file.
     Kept(PathBuf),
+    /// What the back end holds of what the page created, changed and
+    /// deleted, once a call or forgetting changed it.
+    Held(Vec<Held>),
+    /// What the behaviour written for the back end did.
+    Written(Written),
     /// The browser went away.
     Gone,
 }
@@ -140,6 +160,7 @@ enum Order {
     Browser(Request),
     Change(Box<dyn FnOnce(&mut State) + Send>),
     Keep(usize),
+    Forget,
 }
 
 /// A preview, starting or running, stopped when dropped.
@@ -198,6 +219,11 @@ impl Preview {
     pub fn keep(&self, index: usize) {
         self.order(Order::Keep(index));
     }
+
+    /// Forgets what the page created, changed and deleted.
+    pub fn forget(&self) {
+        self.order(Order::Forget);
+    }
 }
 
 impl Drop for Preview {
@@ -246,6 +272,7 @@ fn run(config: Config, sink: &Sink, taken: &Receiver<Order>) {
                 Ok(path) => sink(Event::Kept(path)),
                 Err(error) => sink(Event::Console(said(&error))),
             },
+            Order::Forget => mock.forget(),
         }
     }
     drop(browser);
@@ -274,11 +301,12 @@ fn start(
     };
     let spec = Spec::read(&text)?;
     sink(Event::Operations(spec.operations.clone()));
-    let calls = Arc::clone(sink);
+    sink(Event::Spec(Arc::new(spec.clone())));
     let mock = Mock::start(
         spec,
         config.fixtures.clone(),
-        Arc::new(move |call| calls(Event::Call(call))),
+        config.program.clone(),
+        Arc::clone(sink),
     )?;
     let port = free_port()?;
     let api = format!("http://127.0.0.1:{}", mock.port());
@@ -308,6 +336,23 @@ fn start(
     }
     sink(Event::Status(Status::Running { address }));
     Ok((mock, server, browser))
+}
+
+/// Tries `program` as the behaviour of a back end simulated from `spec`,
+/// fresh, before it is kept: run, each operation it handles asked once.
+/// The operations it handles, as it writes them.
+///
+/// # Errors
+///
+/// What is wrong with it, a line each: why it does not run, the
+/// operations it names that the spec has not, what a handler threw or
+/// answered that its schema refuses.
+pub fn try_program(
+    spec: &Spec,
+    fixtures: Option<PathBuf>,
+    program: &str,
+) -> Result<Vec<String>, Vec<String>> {
+    mock::tried(spec, fixtures, program)
 }
 
 /// The spec a command prints, run in `root`.
@@ -384,6 +429,7 @@ mod tests {
             cookies: Vec::new(),
             start: "/".to_owned(),
             leftovers: None,
+            program: None,
             devtools: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));
@@ -433,6 +479,7 @@ mod tests {
             cookies: vec![("session".to_owned(), "simulated".to_owned())],
             start: "/index.html".to_owned(),
             leftovers: None,
+            program: None,
             devtools: None,
         };
         let preview = Preview::start(config, Arc::new(move |e| kept.lock().unwrap().push(e)));

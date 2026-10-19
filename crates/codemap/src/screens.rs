@@ -1411,7 +1411,7 @@ fn route_score(route: &[&str], written: &[String]) -> Option<usize> {
 fn workflows(map: &CodeMap, front: &FrontEnd) -> Vec<Workflow> {
     let screens = &front.screens;
     // Each action at the screen whose route names most of what it acts on
-    // (`/products/benefits` for `/v1/benefits/{id}`), then the one that
+    // (`/products/perks` for `/v1/perks/{id}`), then the one that
     // calls it nearest, then the shortest route.
     let mut best: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
     let mut reached: HashMap<(String, String), usize> = HashMap::new();
