@@ -242,6 +242,7 @@ where
         bullets_moving: false,
         viewer: None,
         tickets: tickets_pane::TicketsPane::default(),
+        typing: false,
     };
 
     let mut window = bevy::app::App::new();
@@ -303,7 +304,10 @@ where
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, draw::<M, D>)
+        .add_systems(
+            EguiPrimaryContextPass,
+            (draw::<M, D>, note_typing::<M, D>.after(draw::<M, D>)),
+        )
         .add_systems(Last, close_or_reopen::<M, D>)
         .add_systems(
             PreUpdate,
@@ -369,6 +373,9 @@ struct Shell<M, D> {
     diffs: diff_view::DiffView,
     /// The file the tree last followed in it.
     followed: Option<String>,
+    /// Whether a field of egui's has the keys, as last drawn: what is typed
+    /// there is not universe's.
+    typing: bool,
     /// How many lines the conversation scrolls through, as last drawn.
     transcript_rows: usize,
     /// What the wheel or the touchpad moved short of a whole line, kept for
@@ -572,9 +579,10 @@ fn read_keys<M, D>(
             }
             continue;
         }
-        // The App view's page has the keys once clicked, but universe's own
-        // that move between views: theirs, not the page's.
-        if page.as_ref().is_some_and(|p| p.0.is_some())
+        // The App view's page has the keys once clicked, and a field of
+        // egui's once focused, but universe's own that move between views:
+        // theirs, not the page's.
+        if (shell.typing || page.as_ref().is_some_and(|p| p.0.is_some()))
             && !(held.control && matches!(event.key_code, PhysicalKey::KeyJ | PhysicalKey::KeyN))
         {
             continue;
@@ -2666,6 +2674,20 @@ fn app_page<M, D>(
         }
         (false, None) => {}
     }
+}
+
+/// Notes whether a field of egui's has the keys, for them not to reach
+/// universe's state too.
+fn note_typing<M, D>(mut contexts: EguiContexts, mut shell: NonSendMut<Shell<M, D>>) -> Result
+where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    let typing = contexts.ctx_mut()?.egui_wants_keyboard_input();
+    if shell.typing != typing {
+        shell.typing = typing;
+    }
+    Ok(())
 }
 
 /// A click elsewhere than on the App view's page gives the keys back to

@@ -6,6 +6,7 @@ use serde_json::Value;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::error::PreviewError;
+use crate::made::LISTS;
 
 /// A spec, read for simulating the back end it describes.
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +141,19 @@ impl Spec {
         })
     }
 
+    /// The parts of `path` that operation `index` reads, as asked, decoded:
+    /// those under the servers' own path, `["v1", "products", "42"]` for
+    /// `/api/v1/products/42?x=1`.
+    pub(crate) fn bound(&self, index: usize, path: &str) -> Vec<String> {
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        let asked: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let length = self.operations.get(index).map_or(0, |o| o.parts.len());
+        asked[asked.len().saturating_sub(length)..]
+            .iter()
+            .map(|part| decoded(part))
+            .collect()
+    }
+
     /// The schema operation `index` answers with, for `status`: of its JSON
     /// body, if it has one.
     pub(crate) fn schema(&self, index: usize, status: &str) -> Option<&Value> {
@@ -155,6 +169,119 @@ impl Spec {
             .or_else(|| content.iter().next())
             .map(|(_, media)| &media["schema"])
             .filter(|s| !s.is_null())
+    }
+
+    /// The schema of the JSON body operation `index` is sent, if it takes
+    /// one.
+    pub(crate) fn request_schema(&self, index: usize) -> Option<&Value> {
+        let operation = self.operations.get(index)?;
+        let body = self.resolve(
+            &self.doc["paths"][&operation.path][operation.method.to_lowercase()]["requestBody"],
+        );
+        let content = body["content"].as_object()?;
+        content
+            .iter()
+            .find(|(media, _)| media.contains("json"))
+            .map(|(_, media)| &media["schema"])
+            .filter(|s| !s.is_null())
+    }
+
+    /// What checks a body operation `index` answers with `status` against
+    /// its schema, the spec's components with it: for a spec of OpenAPI
+    /// 3.1 only, whose schemas are JSON Schema's; none without a schema.
+    pub(crate) fn validator(&self, index: usize, status: &str) -> Option<jsonschema::Validator> {
+        let version = self.doc["openapi"].as_str().unwrap_or_default();
+        if !version.starts_with("3.1") {
+            return None;
+        }
+        let schema = self.schema(index, status)?;
+        let whole = serde_json::json!({
+            "components": self.doc["components"],
+            "allOf": [schema],
+        });
+        jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&whole)
+            .ok()
+    }
+
+    /// The schema operation `index` answers with when it succeeds.
+    pub(crate) fn success_schema(&self, index: usize) -> Option<&Value> {
+        let operation = self.operations.get(index)?;
+        let status = operation
+            .statuses
+            .iter()
+            .find(|s| s.starts_with('2'))
+            .map_or("200", String::as_str);
+        self.schema(index, status)
+    }
+
+    /// The schema of the items a list operation answers with when it
+    /// succeeds: of the answer itself when it is a list, else of its field
+    /// that holds a page of them, else of its only list.
+    pub(crate) fn listed(&self, index: usize) -> Option<&Value> {
+        let answer = self.resolve(self.success_schema(index)?);
+        if answer["type"] == "array" {
+            return Some(&answer["items"]).filter(|items| !items.is_null());
+        }
+        let lists: Vec<(&String, &Value)> = answer["properties"]
+            .as_object()?
+            .iter()
+            .filter(|(_, p)| self.resolve(p)["type"] == "array")
+            .collect();
+        let (_, list) = lists
+            .iter()
+            .find(|(name, _)| LISTS.contains(&name.as_str()))
+            .or_else(|| (lists.len() == 1).then(|| &lists[0]))?;
+        Some(&self.resolve(list)["items"]).filter(|items| !items.is_null())
+    }
+
+    /// Whether a schema's objects have an id: theirs, or those of each of
+    /// its kinds.
+    pub(crate) fn names_items(&self, schema: &Value) -> bool {
+        self.within(schema, 0, &mut |schema| {
+            schema["properties"].get("id").is_some()
+        })
+    }
+
+    /// The values a field of a schema's objects takes, as its enumerations
+    /// say: `canceled` among a subscription's `status`.
+    pub(crate) fn enumerated(&self, schema: &Value, field: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        self.within(schema, 0, &mut |schema| {
+            if let Some(property) = schema["properties"].get(field) {
+                self.within(property, 0, &mut |kind| {
+                    let listed = kind["enum"].as_array().into_iter().flatten();
+                    let constant = kind.get("const").into_iter();
+                    values.extend(
+                        listed
+                            .chain(constant)
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                    false
+                });
+            }
+            false
+        });
+        values
+    }
+
+    /// Whether `found` says so of `schema` or of one of the kinds it is
+    /// made of, through `anyOf`, `oneOf` and `allOf`, a few levels down.
+    fn within(&self, schema: &Value, depth: usize, found: &mut dyn FnMut(&Value) -> bool) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        let schema = self.resolve(schema);
+        if found(schema) {
+            return true;
+        }
+        ["anyOf", "oneOf", "allOf"].iter().any(|kinds| {
+            schema[*kinds]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| self.within(kind, depth + 1, found)))
+        })
     }
 
     /// What `node` stands for: itself, or what its `$ref` names in the spec,
@@ -176,10 +303,45 @@ impl Spec {
         node
     }
 
+    /// The schema a `$ref` names: `#/components/schemas/Order`.
+    pub(crate) fn named(&self, reference: &str) -> Option<&Value> {
+        self.doc.pointer(reference.strip_prefix('#')?)
+    }
+
     /// The name a `$ref` gives its schema, for knowing a schema met again.
     pub(crate) fn reference(node: &Value) -> Option<&str> {
         node["$ref"].as_str()
     }
+}
+
+impl Operation {
+    /// Its path's parts, `None` for a parameter.
+    pub(crate) fn parts(&self) -> &[Option<String>] {
+        &self.parts
+    }
+}
+
+/// A part of an address as it reads, its escapes undone: `a b` for
+/// `a%20b`.
+pub(crate) fn decoded(part: &str) -> String {
+    let bytes = part.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let escaped = (byte == b'%')
+            .then(|| part.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(value) = escaped {
+            out.push(value);
+            i += 3;
+        } else {
+            out.push(byte);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A YAML document as JSON.
@@ -235,6 +397,12 @@ mod tests {
         assert_eq!(get.statuses, ["200", "404"]);
         assert_eq!(get.summary, "Get Product");
         assert!(Spec::read("{\"openapi\": \"3.1.0\"}").is_err());
+        let item = spec.find("GET", "/api/products/a%20b").unwrap();
+        assert_eq!(
+            spec.bound(item, "/api/products/a%20b?x=1"),
+            ["products", "a b"]
+        );
+        assert_eq!(decoded("x+y%2Fz%"), "x+y/z%");
     }
 
     #[test]

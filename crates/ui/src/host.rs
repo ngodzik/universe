@@ -332,6 +332,13 @@ where
                     AppOrder::Play(steps) => preview.play(steps),
                     AppOrder::Change(change) => preview.change(move |state| change.apply(state)),
                     AppOrder::Keep(index) => preview.keep(index),
+                    AppOrder::Forget => preview.forget(),
+                    // Its file gone, the back end answers without it from
+                    // its next call; the page shows it so.
+                    AppOrder::Unwrite(file) => {
+                        let _ = std::fs::remove_file(file);
+                        preview.reload();
+                    }
                     AppOrder::Start(_) | AppOrder::Stop => {}
                 }
             }
@@ -873,6 +880,43 @@ where
                     let _ = tx.send(universe_tools::check_out_pull(&root, &reviews, number));
                 });
             }
+            Effect::WriteBackEnd {
+                asked,
+                file,
+                spec,
+                fixtures,
+                called,
+                handled,
+                refused,
+                model: chosen,
+                candidates,
+            } => {
+                let (model, delegate, tx) = (Arc::clone(model), Arc::clone(delegate), tx.clone());
+                tokio::spawn(async move {
+                    let folder = file
+                        .parent()
+                        .map_or_else(std::env::temp_dir, std::path::Path::to_owned);
+                    let asker = Asker {
+                        model: &*model,
+                        delegate: Some(&*delegate),
+                        directory: &folder,
+                        chosen,
+                        candidates: &candidates,
+                        tx: &tx,
+                    };
+                    let asked = Asked {
+                        asked: &asked,
+                        file: &file,
+                        spec: &spec,
+                        fixtures: fixtures.as_deref(),
+                        called: &called,
+                        handled: &handled,
+                        refused: &refused,
+                    };
+                    let written = write_back_end(&asker, &asked).await;
+                    let _ = tx.send(AgentMessage::Written(written));
+                });
+            }
             Effect::SummarizePull {
                 copy,
                 pull,
@@ -1266,6 +1310,104 @@ impl<M: ChatModel, D: Delegate> Asker<'_, M, D> {
                 .to_owned()
         })
     }
+}
+
+/// How many times a model writes a back end's behaviour that is refused
+/// before it is told it could not.
+const WRITINGS: usize = 3;
+
+/// What a model is asked for a back end's behaviour.
+struct Asked<'a> {
+    asked: &'a str,
+    file: &'a std::path::Path,
+    spec: &'a universe_preview::Spec,
+    fixtures: Option<&'a std::path::Path>,
+    called: &'a [String],
+    handled: &'a [String],
+    refused: &'a [String],
+}
+
+/// The behaviour a model writes for a simulated back end, tried before it
+/// is kept in its file: the program refused is sent back with why, a few
+/// times. The operations the program kept handles.
+async fn write_back_end<M: ChatModel, D: Delegate>(
+    asker: &Asker<'_, M, D>,
+    asked: &Asked<'_>,
+) -> Result<Vec<String>, String> {
+    let now = std::fs::read_to_string(asked.file).unwrap_or_default();
+    let lines = |lines: &[String]| {
+        if lines.is_empty() {
+            "(none)".to_owned()
+        } else {
+            lines.join("\n")
+        }
+    };
+    let called: Vec<String> = asked
+        .called
+        .iter()
+        .map(|c| c.split(" → ").next().unwrap_or(c).to_owned())
+        .collect();
+    let question = format!(
+        "The person asks: {}\n\nThe program now, empty when there is none:\n```js\n{now}\n```\n\nThe page's latest calls, the latest last, with their status:\n{}\n\nWhat its handlers refused lately:\n{}\n\n{}\n\n{}",
+        asked.asked,
+        lines(asked.called),
+        lines(asked.refused),
+        universe_preview::PROGRAM_API,
+        universe_preview::brief(asked.spec, asked.asked, &called, asked.handled),
+    );
+    let mut refusal = String::new();
+    for _ in 0..WRITINGS {
+        let (sent, _) = universe_tools::redact_secrets(&format!("{question}{refusal}"));
+        let answer = asker
+            .ask(
+                crate::app_preview::BACK_END_PROMPT,
+                sent,
+                universe_core::Effort::High,
+            )
+            .await?;
+        let program = crate::app_preview::program_in(&answer);
+        let (spec, fixtures, tried) = (
+            asked.spec.clone(),
+            asked.fixtures.map(std::path::Path::to_owned),
+            program.clone(),
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            universe_preview::try_program(&spec, fixtures, &tried)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        match outcome {
+            Ok(handled) => {
+                keep_program(asked.file, &program)?;
+                return Ok(handled);
+            }
+            Err(errors) => {
+                refusal = format!(
+                    "\n\nYou wrote this program:\n```js\n{program}\n```\nIt was tried and refused:\n- {}\nWrite it again, whole, with this mended.",
+                    errors.join("\n- ")
+                );
+            }
+        }
+    }
+    Err(format!(
+        "what the model wrote was refused {WRITINGS} times: {}",
+        refusal
+            .lines()
+            .filter(|l| l.starts_with("- "))
+            .map(|l| l.trim_start_matches("- "))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+
+/// Writes a program to its file whole, or leaves the one before.
+fn keep_program(file: &std::path::Path, program: &str) -> Result<(), String> {
+    let written = file.with_extension("js.new");
+    file.parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&written, format!("{program}\n")))
+        .and_then(|()| std::fs::rename(&written, file))
+        .map_err(|e| format!("{} could not be written: {e}", file.display()))
 }
 
 /// What a model says of a pull request, kept beside its copy per head

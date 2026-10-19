@@ -31,12 +31,12 @@ pub struct Tone {
 }
 
 /// The fields that hold a page of a list.
-const LISTS: [&str; 8] = [
+pub(crate) const LISTS: [&str; 8] = [
     "items", "data", "results", "records", "entries", "nodes", "rows", "edges",
 ];
 
 /// The fields that count a list.
-const COUNTS: [&str; 7] = [
+pub(crate) const COUNTS: [&str; 7] = [
     "total_count",
     "total",
     "count",
@@ -70,6 +70,21 @@ pub(crate) fn body(spec: &Spec, schema: &Value, key: &str, tone: Tone) -> Value 
     let mut maker = Maker {
         spec,
         tone,
+        hint: None,
+        stack: Vec::new(),
+    };
+    maker.make(schema, key, "", 0)
+}
+
+/// A body made as [`body`] makes it, of the kind of a union that `given`
+/// names: a perk created of type `chat` is a chat perk, its
+/// fields those of its kind.
+#[must_use]
+pub(crate) fn body_as(spec: &Spec, schema: &Value, key: &str, tone: Tone, given: &Value) -> Value {
+    let mut maker = Maker {
+        spec,
+        tone,
+        hint: Some(given),
         stack: Vec::new(),
     };
     maker.make(schema, key, "", 0)
@@ -78,9 +93,11 @@ pub(crate) fn body(spec: &Spec, schema: &Value, key: &str, tone: Tone) -> Value 
 struct Maker<'a> {
     spec: &'a Spec,
     tone: Tone,
-    /// The schemas named on the way down, so that one that holds itself
-    /// stops.
-    stack: Vec<String>,
+    /// What was given for the body, its kind named in it.
+    hint: Option<&'a Value>,
+    /// The schemas named on the way down, each with the depth of what it
+    /// makes, so that one that holds itself stops.
+    stack: Vec<(String, usize)>,
 }
 
 impl Maker<'_> {
@@ -92,10 +109,10 @@ impl Maker<'_> {
         }
         let named = Spec::reference(schema).map(str::to_owned);
         if let Some(name) = &named {
-            if self.stack.iter().filter(|n| *n == name).count() >= 2 {
+            if self.stack.iter().filter(|(n, _)| n == name).count() >= 2 {
                 return Value::Null;
             }
-            self.stack.push(name.clone());
+            self.stack.push((name.clone(), depth));
         }
         let schema = self.spec.resolve(schema).clone();
         let made = self.made(&schema, key, field, depth);
@@ -128,6 +145,12 @@ impl Maker<'_> {
                 if nullable && lower.ends_with("_at") && !happened {
                     return Value::Null;
                 }
+                // The kind what was given names.
+                if depth == 0
+                    && let Some(option) = self.hinted(schema, options)
+                {
+                    return self.make(&option, key, field, depth);
+                }
                 // The kind a discriminator names, its property saying so.
                 if let Some((property, named, option)) = self.discriminated(schema, options) {
                     let mut made = self.make(&option, key, field, depth);
@@ -143,7 +166,7 @@ impl Maker<'_> {
                     .filter(|o| self.spec.resolve(o)["type"] != "null")
                     .collect();
                 let within = |o: &&Value| {
-                    Spec::reference(o).is_some_and(|r| self.stack.iter().any(|n| n == r))
+                    Spec::reference(o).is_some_and(|r| self.stack.iter().any(|(n, _)| n == r))
                 };
                 let Some(chosen) = candidates
                     .iter()
@@ -177,15 +200,16 @@ impl Maker<'_> {
             _ if schema.get("items").is_some() => "array".to_owned(),
             _ => String::new(),
         };
-        if let Some(example) = schema
-            .get("example")
-            .filter(|_| kind != "object" && kind != "array")
-        {
+        // An id is made, not the spec's example: each item its own, and the
+        // same as the `_id` fields that name it. One with a pattern keeps
+        // the example that holds to it.
+        let id = (lower == "id" || lower.ends_with("_id")) && schema.get("pattern").is_none();
+        let exampled = kind != "object" && kind != "array" && !id;
+        if let Some(example) = schema.get("example").filter(|_| exampled) {
             return example.clone();
         }
         if let Some(example) = schema["examples"].as_array().and_then(|e| e.first())
-            && kind != "object"
-            && kind != "array"
+            && exampled
         {
             return example.clone();
         }
@@ -205,9 +229,33 @@ impl Maker<'_> {
             "integer" => within_bounds(schema, self.integer(key, &lower)),
             "number" => within_bounds(schema, json!(f64::from(seed(key) % 10_000) / 100.0)),
             "boolean" => Value::Bool(self.boolean(&lower)),
-            "string" => fitted(schema, self.string(schema, key, &lower)),
+            "string" => fitted(schema, self.string(schema, key, &lower, depth)),
             _ => Value::Null,
         }
+    }
+
+    /// The option of a union that what was given names: the one its
+    /// discriminator maps the given value to, else the one whose field
+    /// holds that value alone (`type: "chat"`).
+    fn hinted(&self, schema: &Value, options: &[Value]) -> Option<Value> {
+        let given = self.hint?.as_object()?;
+        let discriminator = &schema["discriminator"];
+        if let Some(property) = discriminator["propertyName"].as_str()
+            && let Some(wanted) = given.get(property).and_then(Value::as_str)
+            && let Some(reference) = discriminator["mapping"][wanted].as_str()
+        {
+            return Some(json!({ "$ref": reference }));
+        }
+        options
+            .iter()
+            .find(|option| {
+                given.iter().any(|(name, value)| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| self.spec.enumerated(option, name) == [value])
+                })
+            })
+            .cloned()
     }
 
     /// The option a discriminator names first: its property, the name
@@ -327,19 +375,33 @@ impl Maker<'_> {
 
     /// An id the same wherever the same thing is: the first organization's
     /// in a list of them, in a session's and as an order's
-    /// `organization_id`. It names the entity of the schema it is in, or
-    /// the one its field names, and its place in a list.
-    fn id(&self, key: &str, field: &str) -> String {
-        let entity = if field == "id" {
-            self.stack.last().map(|name| entity(name))
+    /// `organization_id`, the first product's as an order's `product_id`
+    /// and its `product`. It names the entity the field holding the object
+    /// names, else that of the schema of the object (the first named
+    /// there: a perk's, not that of the kind of perk it is), or the
+    /// one its own field names, and its place in a list.
+    fn id(&self, key: &str, field: &str, depth: usize) -> String {
+        let schema = || {
+            let object = depth.saturating_sub(1);
+            self.stack
+                .iter()
+                .find(|(_, d)| *d == object)
+                .or_else(|| self.stack.last())
+                .map(|(name, _)| entity(name))
+        };
+        let (entity, place) = if field == "id" {
+            holder(key).map_or_else(
+                || (schema(), place(key)),
+                |(name, place)| (Some(name), place),
+            )
         } else {
-            field.strip_suffix("_id").map(|name| name.replace('_', ""))
+            (
+                field.strip_suffix("_id").map(|name| name.replace('_', "")),
+                0,
+            )
         };
         match entity {
-            Some(entity) if !entity.is_empty() => {
-                let place = if field == "id" { place(key) } else { 0 };
-                uuid(&format!("{entity}#{place}"))
-            }
+            Some(entity) if !entity.is_empty() => uuid(&format!("{entity}#{place}")),
             _ => uuid(key),
         }
     }
@@ -358,11 +420,11 @@ impl Maker<'_> {
         false
     }
 
-    fn string(&self, schema: &Value, key: &str, field: &str) -> Value {
+    fn string(&self, schema: &Value, key: &str, field: &str, depth: usize) -> Value {
         let format = schema["format"].as_str().unwrap_or_default();
         let id = format == "uuid" || field == "id" || field.ends_with("_id");
         if id {
-            return Value::String(self.id(key, field));
+            return Value::String(self.id(key, field, depth));
         }
         if format == "date-time" || field.ends_with("_at") {
             return Value::String(format!(
@@ -580,7 +642,7 @@ fn days_later(date: &str, days: usize) -> Option<String> {
 
 /// The entity a schema stands for, as a field names it: `organization` for
 /// `#/components/schemas/OrganizationWithRole` or `OrganizationRead`.
-fn entity(reference: &str) -> String {
+pub(crate) fn entity(reference: &str) -> String {
     let name = reference.rsplit('/').next().unwrap_or(reference);
     let name = name.split("With").next().unwrap_or(name);
     let mut name = name.to_owned();
@@ -594,6 +656,62 @@ fn entity(reference: &str) -> String {
         }
     }
     name.to_lowercase()
+}
+
+/// The entity the field that holds an object names, from where its id is
+/// made, and its place: `product` and 0 for `….product.id`, `perk` and
+/// 2 for `….perks[2].id`. None for an answer itself, or the items of a
+/// page of a list, which their schema names.
+fn holder(key: &str) -> Option<(String, usize)> {
+    let (_, last) = key.strip_suffix(".id")?.rsplit_once('.')?;
+    // A dot within the answer's own place, `GET /v1.0/me 200`.
+    if last.contains([' ', '/']) {
+        return None;
+    }
+    let (name, place) = match last.split_once('[') {
+        Some((name, rest)) => (
+            singular(name),
+            rest.trim_end_matches(']').parse().unwrap_or(0),
+        ),
+        None => (name_of(last), 0),
+    };
+    let generic = LISTS.contains(&name.as_str())
+        || [
+            "item", "result", "record", "entry", "node", "row", "object", "value",
+        ]
+        .contains(&name.as_str());
+    (!name.is_empty() && !generic).then_some((name, place))
+}
+
+/// A field's name as an entity's: `billingcustomer` for `billing_customer`.
+fn name_of(field: &str) -> String {
+    field.replace('_', "").to_lowercase()
+}
+
+/// The entity of what a list's field names: `perk` for `perks`,
+/// `category` for `categories`.
+fn singular(field: &str) -> String {
+    if LISTS.contains(&field) {
+        return field.to_owned();
+    }
+    name_of(&one_of(field))
+}
+
+/// One of what a plural names, as it is written: `support_case` for
+/// `support_cases`, `category` for `categories`.
+pub(crate) fn one_of(plural: &str) -> String {
+    if let Some(stem) = plural.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if ["sses", "xes", "ches", "shes"]
+        .iter()
+        .any(|s| plural.ends_with(s))
+    {
+        plural[..plural.len() - 2].to_owned()
+    } else if let Some(stem) = plural.strip_suffix('s').filter(|_| !plural.ends_with("ss")) {
+        stem.to_owned()
+    } else {
+        plural.to_owned()
+    }
 }
 
 /// A thing's place in the list it is in, from where it is made: the last
@@ -617,7 +735,7 @@ fn seed(key: &str) -> u32 {
 }
 
 /// An id that looks like one, from a place.
-fn uuid(key: &str) -> String {
+pub(crate) fn uuid(key: &str) -> String {
     let a = seed(key);
     let b = seed(&format!("{key}#"));
     let c = seed(&format!("{key}##"));
@@ -700,11 +818,17 @@ mod tests {
             r##"{"paths": {
                 "/orgs": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Organization"}}}}}}}},
                 "/me": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "object", "properties": {"organizations": {"type": "array", "items": {"$ref": "#/components/schemas/OrganizationWithRole"}}}}}}}}}},
-                "/orders/1": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrderRead"}}}}}}}},
+                "/orders/1": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrderRead"}}}}}}},
+                "/products": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/Product"}}}}}}}}}},
+                "/perks": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Perk"}}}}}}}}},
               "components": {"schemas": {
                 "Organization": {"type": "object", "properties": {"id": {"type": "string"}}},
                 "OrganizationWithRole": {"type": "object", "properties": {"id": {"type": "string"}, "role": {"type": "string"}}},
-                "OrderRead": {"type": "object", "properties": {"id": {"type": "string"}, "organization_id": {"type": "string"}}}}}}"##,
+                "OrderRead": {"type": "object", "properties": {"id": {"type": "string"}, "organization_id": {"type": "string"}, "product_id": {"type": "string"}, "product": {"$ref": "#/components/schemas/OrderProduct"}}},
+                "OrderProduct": {"type": "object", "properties": {"id": {"type": "string"}}},
+                "Product": {"type": "object", "properties": {"id": {"type": "string"}, "perks": {"type": "array", "items": {"$ref": "#/components/schemas/Perk"}}}},
+                "Perk": {"oneOf": [{"$ref": "#/components/schemas/PerkText"}]},
+                "PerkText": {"type": "object", "properties": {"id": {"type": "string"}}}}}}"##,
         )
         .unwrap();
         let answer = |path: &str| {
@@ -722,6 +846,36 @@ mod tests {
         assert_ne!(orgs[0]["id"], orgs[1]["id"]);
         assert_eq!(order["organization_id"], orgs[0]["id"]);
         assert_ne!(order["id"], orgs[0]["id"]);
+        // An object a field holds is the one its name and its `_id` say.
+        let (products, perks) = (answer("/products"), answer("/perks"));
+        assert_eq!(order["product"]["id"], order["product_id"]);
+        assert_eq!(order["product_id"], products["items"][0]["id"]);
+        assert_eq!(products["items"][1]["perks"][2]["id"], perks[2]["id"]);
+        assert_eq!(singular("categories"), "category");
+        assert_eq!(singular("addresses"), "address");
+        assert_eq!(singular("shipping_addresses"), "shippingaddress");
+    }
+
+    #[test]
+    fn a_body_is_of_the_kind_given() {
+        let spec = Spec::read(
+            r##"{"paths": {"/perks": {"post": {"responses": {"201": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Perk"}}}}}}}},
+              "components": {"schemas": {
+                "Perk": {"oneOf": [{"$ref": "#/components/schemas/Text"}, {"$ref": "#/components/schemas/Chat"}]},
+                "Mapped": {"oneOf": [{"$ref": "#/components/schemas/Text"}, {"$ref": "#/components/schemas/Chat"}],
+                    "discriminator": {"propertyName": "type", "mapping": {"text": "#/components/schemas/Text", "chat": "#/components/schemas/Chat"}}},
+                "Text": {"type": "object", "properties": {"type": {"const": "text"}, "note": {"type": "string"}}},
+                "Chat": {"type": "object", "properties": {"type": {"type": "string", "enum": ["chat"]}, "room_id": {"type": "string"}}}}}}"##,
+        )
+        .unwrap();
+        let given = json!({"type": "chat"});
+        for name in ["Perk", "Mapped"] {
+            let schema = json!({ "$ref": format!("#/components/schemas/{name}") });
+            assert_eq!(body(&spec, &schema, "k", Tone::default())["type"], "text");
+            let made = body_as(&spec, &schema, "k", Tone::default(), &given);
+            assert_eq!(made["type"], "chat", "{name}");
+            assert!(made["room_id"].is_string(), "{name}");
+        }
     }
 
     #[test]

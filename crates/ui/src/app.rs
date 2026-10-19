@@ -314,6 +314,29 @@ pub enum Effect {
     /// Ask the App view's preview something: start it, stop it, or pass on
     /// what the person does on its page.
     App(crate::app_preview::AppOrder),
+    /// Have a model write the behaviour of the App view's back end as the
+    /// person asked, tried before it is kept in `file`.
+    WriteBackEnd {
+        /// What the person asked.
+        asked: String,
+        /// The program's file.
+        file: std::path::PathBuf,
+        /// The spec the back end is simulated from.
+        spec: std::sync::Arc<universe_preview::Spec>,
+        /// The folder of its fixtures.
+        fixtures: Option<std::path::PathBuf>,
+        /// The page's latest calls, the latest last: `GET /v1/orders/`.
+        called: Vec<String>,
+        /// What the program handles now.
+        handled: Vec<String>,
+        /// What its handlers refused lately.
+        refused: Vec<String>,
+        /// The model that writes it; the cheapest of `candidates` without
+        /// one.
+        model: Option<ModelId>,
+        /// The models to pick the cheapest from.
+        candidates: Vec<ModelId>,
+    },
     /// Show what a commit did, as a reply cited it.
     ShowCommit(String),
     /// Say which rules kept outside the repository the project's models
@@ -543,6 +566,9 @@ pub enum AgentMessage {
     Progress(Result<crate::tickets::Progress, String>),
     /// What a model said of the pull request reviewed, or why it did not.
     Summaries(Result<crate::pull_review::Summaries, String>),
+    /// The behaviour a model wrote for the App view's back end, kept: the
+    /// operations it handles; or why it was not kept.
+    Written(Result<Vec<String>, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -3641,6 +3667,19 @@ impl App {
                 self.progress_checked(checked);
                 false
             }
+            AgentMessage::Written(result) => {
+                self.preview.wrote(&result);
+                match &result {
+                    // The page as the program answers it now.
+                    Ok(_) => {
+                        if self.chat.queued.is_none() {
+                            self.chat.queued = self.app_reload();
+                        }
+                    }
+                    Err(why) => self.error(format!("The back end's behaviour was not kept: {why}")),
+                }
+                false
+            }
             AgentMessage::Summaries(said) => {
                 match said {
                     Ok(summaries) => self.summaries = Some(summaries),
@@ -5221,6 +5260,66 @@ impl App {
     /// Changes the state the simulated back end answers in.
     pub fn app_change(&mut self, change: crate::app_preview::Change) -> Option<Effect> {
         let order = self.preview.change(change);
+        self.app_order(order)
+    }
+
+    /// Has a model write the behaviour of the simulated back end as
+    /// `asked` says, from what the spec and the page's calls tell.
+    pub fn app_write(&mut self, asked: &str) -> Option<Effect> {
+        let asked = asked.trim();
+        if asked.is_empty() || !self.preview.is_running() || self.preview.written().asked.is_some()
+        {
+            return None;
+        }
+        let (Some(spec), Some(file)) = (
+            self.preview.spec().cloned(),
+            self.preview.program().map(std::path::Path::to_owned),
+        ) else {
+            self.error(
+                "The back end's behaviour has nowhere to be kept: no home folder for universe"
+                    .to_owned(),
+            );
+            return None;
+        };
+        let calls: Vec<String> = self
+            .preview
+            .calls()
+            .map(|c| format!("{} {} → {}", c.method, c.path, c.status))
+            .collect();
+        let called = calls[calls.len().saturating_sub(40)..].to_vec();
+        let written = self.preview.written();
+        let handled = written.handled.clone();
+        let refused = written
+            .refused
+            .iter()
+            .map(|(operation, why)| format!("{operation}: {why}"))
+            .collect();
+        let fixtures = self.preview.fixtures().map(std::path::Path::to_owned);
+        let (model, candidates) = self.fresh_or_cheapest();
+        self.preview.asking(asked);
+        Some(Effect::WriteBackEnd {
+            asked: asked.to_owned(),
+            file,
+            spec,
+            fixtures,
+            called,
+            handled,
+            refused,
+            model,
+            candidates,
+        })
+    }
+
+    /// Removes the behaviour written for the simulated back end.
+    pub fn app_unwrite(&mut self) -> Option<Effect> {
+        let file = self.preview.program()?.to_owned();
+        self.app_order(crate::app_preview::AppOrder::Unwrite(file))
+    }
+
+    /// Forgets what the page created, changed and deleted in the simulated
+    /// back end.
+    pub fn app_forget(&mut self) -> Option<Effect> {
+        let order = self.preview.forget();
         self.app_order(order)
     }
 
