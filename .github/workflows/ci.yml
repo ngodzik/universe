@@ -18,6 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   # A warning that nobody reads is a warning that does not exist.
   RUSTFLAGS: -D warnings
+  # Where the Chrome the App view holds (CEF) is downloaded once, and kept
+  # from a run to the next.
+  CEF_PATH: ${{ github.workspace }}/../cef
 
 jobs:
   lint:
@@ -29,9 +32,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config.
-      - name: Wayland headers
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
+      - name: CEF, kept between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -60,10 +70,20 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config.
-      - name: Wayland headers
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
+      - name: Ninja
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: CEF, kept between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
       # Without them the rendering test returns early, and a regression such
       # as macOS' `/var` symlink would not show. Linux images ship both.
       - name: Kustomize and Helm
@@ -84,9 +104,16 @@ jobs:
       # is told to leave it alone in dependabot.yml.
       - uses: dtolnay/rust-toolchain@1.99
       - uses: Swatinem/rust-cache@v2
-      # The window links Wayland's client library, found with pkg-config.
-      - name: Wayland headers
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      # The window links Wayland's client library, found with pkg-config, and
+      # ALSA's, which Bevy's remote tools bring with CEF's integration; CEF's
+      # wrapper is built with Ninja.
+      - name: Wayland and ALSA headers, and Ninja
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
+      - name: CEF, kept between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
 
       # The ref above and rust-version state the same fact in two places, and two
       # places drift. This makes them disagree loudly instead of leaving the job

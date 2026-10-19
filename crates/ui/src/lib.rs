@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+pub mod app_preview;
 mod awake;
 pub mod backdrop;
 mod blocks;

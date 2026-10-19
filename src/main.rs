@@ -136,8 +136,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The App view's Chrome starts this program again for each of its
+    // processes: those leave here, before anything of universe starts.
+    universe_gui::early_exit_if_subprocess();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
@@ -454,6 +464,7 @@ async fn interface(
         opacity: defaults.opacity,
         text_size: defaults.text_size,
         chat_width: defaults.chat_width,
+        pilot_width: defaults.pilot_width,
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
         backdrop: universe_ui::backdrop::Backdrop {

@@ -55,6 +55,9 @@ confidence-threshold = 0.9
 # ship inside a program; only that crate may use them.
 exceptions = [
     { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+    # The bzip2 library's own licence, permissive as BSD's: only the build
+    # unpacks with it, the archive of the App view's Chrome.
+    { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
 ]
 
 [bans]

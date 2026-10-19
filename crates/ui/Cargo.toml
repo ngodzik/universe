@@ -10,6 +10,7 @@ description = "The universe interface's state: modes, keys, commands and the edi
 universe-core.workspace  = true
 universe-tools.workspace = true
 universe-agent.workspace = true
+universe-preview.workspace = true
 syntect.workspace         = true
 regex.workspace           = true
 serde.workspace           = true

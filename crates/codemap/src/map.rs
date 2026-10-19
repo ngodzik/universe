@@ -8,9 +8,12 @@ use ignore::WalkBuilder;
 use crate::imports;
 
 /// Beyond this a file is not read: its lines are not counted and its
-/// imports not looked for. A generated file that big says nothing useful;
-/// an API's spec can come close (a large one's is half a megabyte).
+/// imports not looked for. A generated file that big says nothing useful.
 const MAX_READ: u64 = 2 * 1024 * 1024;
+
+/// Beyond this a settings file is not read. An API's spec is one, and a
+/// large API's is a few megabytes.
+const MAX_SETTINGS: u64 = 8 * 1024 * 1024;
 
 /// What a source file is written in, as far as the drawing cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,6 +148,9 @@ pub struct CodeMap {
     pub operations: Vec<crate::api::Operation>,
     /// The services it runs, what each serves, and who reaches whom.
     pub services: crate::services::Services,
+    /// Its front ends: their screens, how they link and what they call,
+    /// and what a person does on them.
+    pub front_ends: Vec<crate::screens::FrontEnd>,
 }
 
 impl CodeMap {
@@ -315,6 +321,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         left_out,
         operations: Vec::new(),
         services: crate::services::Services::default(),
+        front_ends: Vec::new(),
     };
     let mut index: HashMap<String, usize> = HashMap::from([(String::new(), 0)]);
     let mut sources: Vec<(usize, String)> = Vec::new();
@@ -343,9 +350,14 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         let path = parts.join("/");
         let language = Language::of(file);
         let full = root.join(file);
+        let largest = if language == Language::Config {
+            MAX_SETTINGS
+        } else {
+            MAX_READ
+        };
         let text = std::fs::metadata(&full)
             .ok()
-            .filter(|m| m.len() <= MAX_READ)
+            .filter(|m| m.len() <= largest)
             .and_then(|_| std::fs::read_to_string(&full).ok());
         let lines = text.as_deref().map_or(0, |t| t.lines().count());
         map.nodes.push(Node {
@@ -396,6 +408,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         }
     }
     map.services = crate::services::read(root, &map, &sources);
+    map.front_ends = crate::screens::read(&map, &sources);
     map
 }
 

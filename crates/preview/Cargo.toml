@@ -1,0 +1,18 @@
+[package]
+name    = "universe-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A project's front end run against a back end simulated from its spec, in a browser driven over the DevTools protocol."
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+regex.workspace      = true
+thiserror.workspace  = true
+tungstenite.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

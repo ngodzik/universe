@@ -72,6 +72,8 @@ pub(crate) struct Plan {
     design: Option<Architecture>,
     /// The project being read again, on a thread of its own.
     reading: Option<Receiver<CodeMap>>,
+    /// How many times it was read: what follows the map sees a new one.
+    reads: u64,
     /// The folder whose parts show: opened by a double click.
     scope: String,
     /// Whether it showed last frame: opening it reads the project again.
@@ -98,6 +100,7 @@ impl Plan {
             map: None,
             design: None,
             reading: None,
+            reads: 0,
             scope: String::new(),
             shown: false,
             opened_at: 0.0,
@@ -138,6 +141,7 @@ impl Plan {
         match reading.try_recv() {
             Ok(map) => {
                 self.reading = None;
+                self.reads += 1;
                 self.map = Some(map);
                 self.redesign(now);
             }
@@ -149,6 +153,11 @@ impl Plan {
     /// The project as last read.
     pub(crate) fn map(&self) -> Option<&CodeMap> {
         self.map.as_ref()
+    }
+
+    /// How many times the project was read.
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads
     }
 
     /// The project's root.
@@ -1147,13 +1156,16 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
             // Right to left: the review, while there is one, comes first.
-            let mut views = vec![
-                ("Universe", MapView::Universe),
+            let mut views = vec![("Universe", MapView::Universe)];
+            if app.has_front_end() {
+                views.push(("App", MapView::App));
+            }
+            views.extend([
                 ("Database", MapView::Database),
                 ("API", MapView::Api),
                 ("Services", MapView::Services),
                 ("Plan", MapView::Plan),
-            ];
+            ]);
             if app.change_set().is_some() {
                 views.push(("Review", MapView::Review));
             }

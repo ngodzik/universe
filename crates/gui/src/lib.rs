@@ -14,6 +14,7 @@
 
 mod activity;
 mod api_view;
+mod app_view;
 mod arch_view;
 mod backdrop;
 mod branch_pane;
@@ -52,6 +53,10 @@ use bevy::prelude::*;
 use bevy::render::render_resource::BlendState;
 use bevy::window::{CompositeAlphaMode, PrimaryWindow};
 use bevy::winit::{UpdateMode, WinitSettings};
+use bevy_cef::prelude::{
+    CefKeyboardFilter, CefPlugin, CommandLineConfig, FocusedWebview, KeyboardDeliverSet,
+    ModifiersState, WebviewSource, WebviewUiMaterial,
+};
 use bevy_egui::egui::{
     self, Align, Color32, Frame, Id, LayerId, Layout, Margin, RichText, ScrollArea, Stroke, Ui,
     UiBuilder,
@@ -101,12 +106,60 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// wakes at this pace to blink it, and no faster.
 const BLINK: Duration = Duration::from_millis(530);
 
+/// How long it may sleep while the App view's wait moves: thirty frames a
+/// second.
+const FRAME_WAIT: Duration = Duration::from_millis(33);
+
+/// How long it may sleep while the App view's page shows: Chrome paints it
+/// at the screen's pace, and runs only as often as the window does.
+const PAGE_WAIT: Duration = Duration::from_millis(16);
+
 /// How long it may sleep while a background moves: about twelve frames a
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 
 /// The width of the usage pane, in points.
 const USAGE_WIDTH: f32 = 460.0;
+
+/// Leaves at once when this process is one of Chrome's own, started again
+/// by the App view's browser to draw its pages: to be called first thing
+/// in `main`, before anything of the program starts. On macOS, Chrome has
+/// processes of its own.
+pub fn early_exit_if_subprocess() {
+    #[cfg(not(target_os = "macos"))]
+    bevy_cef::prelude::early_exit_if_subprocess();
+}
+
+/// Whether the Chrome the App view shows its page with can be loaded: on
+/// macOS, run from its folder, it is found where `scripts/setup-chrome.sh`
+/// installs it, and loading it from nowhere would stop the program. Off
+/// macOS, its library comes with the program.
+fn chrome_found() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME") else {
+            return false;
+        };
+        let framework = std::path::Path::new(&home)
+            .join(".local/share/cef/Chromium Embedded Framework.framework");
+        framework
+            .join("Libraries/bevy_cef_debug_render_process")
+            .exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// A free port on this machine, for the DevTools of the Chrome universe
+/// holds: none, and the App view runs without them.
+fn devtools_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    Some(listener.local_addr().ok()?.port())
+}
+
+/// The App view's page: Chrome's, drawn under the view.
+#[derive(Component)]
+struct AppPage;
 
 /// Opens the window and runs until the person quits or closes it.
 ///
@@ -142,11 +195,33 @@ where
     let relaunch: Arc<std::sync::Mutex<Option<Relaunch>>> = Arc::default();
     let universe = Universe::new(app.root().to_owned());
     let plan = Plan::new(app.root().to_owned());
+    // The front ends kept from the last session: the App view is among
+    // the views at once.
+    let mut app_view = app_view::AppView::new(app.root().to_owned());
+    app.front_end_found(app_view.found());
+    // Chrome's DevTools, reached by the App view's preview; the port is
+    // given once, for as long as the program runs.
+    let chrome_found = chrome_found();
+    let devtools = devtools_port().filter(|_| chrome_found);
+    app_view.devtools = devtools;
+    app_view.chrome = chrome_found;
+    let mut chrome = CommandLineConfig::default();
+    if let Some(port) = devtools {
+        let port: &'static str = Box::leak(port.to_string().into_boxed_str());
+        chrome = chrome.with_switch_value("remote-debugging-port", port);
+    }
+    let chrome = chrome_found.then(|| CefPlugin {
+        command_line_config: chrome,
+        // In universe's own folder, which only its owner may read.
+        root_cache_path: crate::infra::base().map(|base| base.join("cef").display().to_string()),
+        ..default()
+    });
     let shell = Shell {
         plan,
         api: api_view::ApiView::default(),
         review: review_view::ReviewView::default(),
         database: database_view::DatabaseView::default(),
+        app_view,
         services: services_view::ServicesView::default(),
         infra: infra::Infra::new(app.root().to_owned()),
         app,
@@ -169,7 +244,8 @@ where
         tickets: tickets_pane::TicketsPane::default(),
     };
 
-    let exit = bevy::app::App::new()
+    let mut window = bevy::app::App::new();
+    window
         // Behind the panels, nothing: what shows through a see-through
         // window is the desktop, through the panels' own alpha.
         .insert_resource(ClearColor(Color::NONE))
@@ -236,8 +312,23 @@ where
         .add_systems(
             PostUpdate,
             copy_selection::<M, D>.after(EguiPostUpdateSet::ProcessOutput),
-        )
-        .run();
+        );
+    if let Some(chrome) = chrome {
+        window
+            .add_plugins(chrome)
+            .add_systems(
+                Update,
+                (
+                    app_page::<M, D>.after(drive::<M, D>),
+                    keep_universe_keys.before(KeyboardDeliverSet),
+                ),
+            )
+            .add_systems(
+                EguiPrimaryContextPass,
+                give_keys_back::<M, D>.after(draw::<M, D>),
+            );
+    }
+    let exit = window.run();
     match exit {
         AppExit::Success => Ok(relaunch.lock().ok().and_then(|mut r| r.take())),
         AppExit::Error(code) => Err(GuiError::Exited(code.get())),
@@ -263,6 +354,8 @@ struct Shell<M, D> {
     review: review_view::ReviewView,
     /// The tables the project's models define.
     database: database_view::DatabaseView,
+    /// The front end running, as the App view draws it.
+    app_view: app_view::AppView,
     /// The services the project runs, and who reaches whom.
     services: services_view::ServicesView,
     /// Where the project runs, read on threads of their own.
@@ -447,6 +540,7 @@ fn read_keys<M, D>(
     mut pressed: MessageReader<KeyboardInput>,
     mut held: Local<Held>,
     mut shell: NonSendMut<Shell<M, D>>,
+    page: Option<Res<FocusedWebview>>,
 ) where
     M: ChatModel + 'static,
     D: Delegate + 'static,
@@ -476,6 +570,13 @@ fn read_keys<M, D>(
                 },
                 _ => {}
             }
+            continue;
+        }
+        // The App view's page has the keys once clicked, but universe's own
+        // that move between views: theirs, not the page's.
+        if page.as_ref().is_some_and(|p| p.0.is_some())
+            && !(held.control && matches!(event.key_code, PhysicalKey::KeyJ | PhysicalKey::KeyN))
+        {
             continue;
         }
         match keys::translate(&event.logical_key, *held) {
@@ -521,7 +622,18 @@ fn drive<M, D>(
     if window.title != title {
         window.title = title;
     }
-    let wait = if shell.app.is_running() || shell.app.docker().is_some() {
+    // The App view's wait moves until its first page has loaded; then
+    // Chrome draws the page, and the pilot only follows what it tells.
+    let app_view = shell.app.map_view() == Some(MapView::App);
+    let preview = shell.app.app_preview();
+    let wait = if app_view && preview.page_shown() {
+        PAGE_WAIT
+    } else if app_view && preview.is_on() {
+        FRAME_WAIT
+    } else if (app_view && preview.is_on())
+        || shell.app.is_running()
+        || shell.app.docker().is_some()
+    {
         BUSY_WAIT
     } else if shell.app.mode() != Mode::Normal {
         BLINK
@@ -793,6 +905,7 @@ where
                     | MapView::Api
                     | MapView::Review
                     | MapView::Database
+                    | MapView::App
             ) // The deployments need the services to render environments; the
               // branch's pane, what serves and calls its routes.
         ) || (view == Some(MapView::Universe) && fleet.active)
@@ -801,6 +914,7 @@ where
         shell.app.transcript(),
     );
     shell.plan.take_read(now);
+    shell.app_view.update(&shell.plan, &mut shell.app);
     if view == Some(MapView::Database) {
         shell.database.update(&shell.plan);
     }
@@ -820,6 +934,9 @@ where
                 | MapView::Api
                 | MapView::Review
                 | MapView::Database => Frame::NONE.fill(background),
+                // Painted by the view around its page, which Chrome draws
+                // underneath.
+                MapView::App => Frame::NONE,
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe if fleet.active => {
@@ -858,6 +975,14 @@ where
                 MapView::Database => {
                     database_view::show(ui, &mut shell.database, &shell.review, &mut shell.app);
                 }
+                MapView::App => app_view::show(
+                    ui,
+                    &mut shell.app_view,
+                    &shell.plan,
+                    &mut shell.app,
+                    &mut shell.effects,
+                    background,
+                ),
                 MapView::Review => review_view::show(
                     ui,
                     &mut shell.review,
@@ -2454,6 +2579,134 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     if let Some((row, column)) = definition {
         app.definition_at(row, column);
+    }
+}
+
+/// Keeps the App view's page under the view: made once its front end
+/// starts, so that its DevTools have it to drive; placed in the room the
+/// view leaves for it, shown once its first page has loaded, gone when it
+/// stops. A page hidden lets go of the keys.
+fn app_page<M, D>(
+    mut commands: Commands,
+    shell: NonSend<Shell<M, D>>,
+    mut pages: Query<(Entity, &mut Node, &mut Visibility), With<AppPage>>,
+    mut materials: ResMut<Assets<WebviewUiMaterial>>,
+    camera: Query<Entity, With<PrimaryEguiContext>>,
+    mut focused: ResMut<FocusedWebview>,
+) where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    let preview = shell.app.app_preview();
+    let wanted = preview.is_on()
+        && !matches!(
+            preview.status(),
+            Some(universe_preview::Status::Reading) | None
+        );
+    let area = shell
+        .app_view
+        .page_area
+        .filter(|_| shell.app.map_view() == Some(MapView::App) && preview.page_shown());
+    let page = pages.iter_mut().next();
+    match (wanted, page) {
+        (true, None) => {
+            let Ok(camera) = camera.single() else {
+                return;
+            };
+            commands.spawn((
+                AppPage,
+                WebviewSource::new("about:blank"),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Px(1280.0),
+                    height: Val::Px(800.0),
+                    ..default()
+                },
+                MaterialNode(materials.add(WebviewUiMaterial::default())),
+                Visibility::Hidden,
+                UiTargetCamera(camera),
+            ));
+        }
+        (false, Some((entity, _, _))) => {
+            commands.entity(entity).despawn();
+            focused.0 = None;
+        }
+        (true, Some((entity, mut node, mut visibility))) => {
+            let shown = if area.is_some() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            if *visibility != shown {
+                *visibility = shown;
+            }
+            match area {
+                Some((rect, zoom)) => {
+                    // From egui's points to the window's logical pixels.
+                    let px = |points: f32| Val::Px((points * zoom).round());
+                    let (left, top) = (px(rect.min.x), px(rect.min.y));
+                    let (width, height) = (px(rect.width()), px(rect.height()));
+                    if node.left != left
+                        || node.top != top
+                        || node.width != width
+                        || node.height != height
+                    {
+                        node.left = left;
+                        node.top = top;
+                        node.width = width;
+                        node.height = height;
+                    }
+                }
+                None => {
+                    if focused.0 == Some(entity) {
+                        focused.0 = None;
+                    }
+                }
+            }
+        }
+        (false, None) => {}
+    }
+}
+
+/// A click elsewhere than on the App view's page gives the keys back to
+/// universe.
+fn give_keys_back<M, D>(
+    mut contexts: EguiContexts,
+    shell: NonSend<Shell<M, D>>,
+    mut page: ResMut<FocusedWebview>,
+) -> Result
+where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    if page.0.is_none() {
+        return Ok(());
+    }
+    let ctx = contexts.ctx_mut()?;
+    if ctx.input(|i| i.pointer.any_pressed()) {
+        let on_page = ctx
+            .input(|i| i.pointer.interact_pos())
+            .zip(shell.app_view.page_area)
+            .is_some_and(|(at, (area, _))| area.contains(at));
+        if !on_page {
+            page.0 = None;
+        }
+    }
+    Ok(())
+}
+
+/// Keeps Ctrl-J and Ctrl-N from the App view's page: they move between
+/// universe's views wherever the keys are.
+fn keep_universe_keys(mut filter: ResMut<CefKeyboardFilter>, pages: Query<Entity, Added<AppPage>>) {
+    let ctrl = ModifiersState {
+        ctrl: true,
+        ..default()
+    };
+    if let Some(page) = pages.iter().next() {
+        filter.set([
+            (page, bevy::input::keyboard::KeyCode::KeyJ, ctrl),
+            (page, bevy::input::keyboard::KeyCode::KeyN, ctrl),
+        ]);
     }
 }
 

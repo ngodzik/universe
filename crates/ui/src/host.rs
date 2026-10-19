@@ -124,6 +124,8 @@ pub enum Incoming {
     SubscriptionCalls(Vec<universe_core::SubscriptionCall>),
     /// A pull request checked out for review, or why it could not be.
     PullCheckedOut(Result<universe_tools::CheckedOut, String>),
+    /// What the App view's preview told.
+    App(universe_preview::Event),
 }
 
 /// Carries out the effects the state returns, holds the conversation the
@@ -165,6 +167,10 @@ pub struct Host<M, D> {
     /// Pull requests checked out, on a thread each as they need the network.
     pulls_tx: mpsc::UnboundedSender<Result<universe_tools::CheckedOut, String>>,
     pulls_rx: mpsc::UnboundedReceiver<Result<universe_tools::CheckedOut, String>>,
+    /// The App view's preview, while one runs, and what it tells.
+    preview: Option<universe_preview::Preview>,
+    preview_tx: mpsc::UnboundedSender<universe_preview::Event>,
+    preview_rx: mpsc::UnboundedReceiver<universe_preview::Event>,
 }
 
 impl<M, D> Host<M, D>
@@ -180,6 +186,7 @@ where
         let (docker_tx, docker_rx) = mpsc::unbounded_channel();
         let (calls_tx, calls_rx) = mpsc::unbounded_channel();
         let (pulls_tx, pulls_rx) = mpsc::unbounded_channel();
+        let (preview_tx, preview_rx) = mpsc::unbounded_channel();
         let store = Store::for_project(workspace.root());
         let workspace_root = &workspace.root().to_owned();
         Self {
@@ -205,6 +212,9 @@ where
             calls_reading: false,
             pulls_tx,
             pulls_rx,
+            preview: None,
+            preview_tx,
+            preview_rx,
         }
     }
 
@@ -212,6 +222,12 @@ where
     /// window last closed, hidden: a new one, the latest, one picked or
     /// one by id is shown, and `Continue` shows the one shown last.
     pub async fn start(&mut self, app: &mut App, start: Start) {
+        // What a preview of the last session left running, as when it was
+        // stopped without leaving: its front end, its browser.
+        if let Some(base) = Defaults::home() {
+            let file = universe_preview::leftovers_file(&base, self.workspace.root());
+            tokio::task::spawn_blocking(move || universe_preview::stop_leftovers(&file));
+        }
         let shown = app.chat_id();
         self.slot(shown);
         // The copies from the last session serve at once; their sources are
@@ -287,6 +303,49 @@ where
         }
     }
 
+    /// Carries out what the App view asks of its preview.
+    fn app_order(&mut self, order: crate::app_preview::AppOrder) {
+        use crate::app_preview::AppOrder;
+        match order {
+            AppOrder::Start(config) => {
+                self.stop_preview();
+                if let universe_preview::SpecSource::Command(command) = &config.spec {
+                    audit(self.workspace.root(), command);
+                }
+                let tx = self.preview_tx.clone();
+                self.preview = Some(universe_preview::Preview::start(
+                    *config,
+                    Arc::new(move |event| {
+                        let _ = tx.send(event);
+                    }),
+                ));
+            }
+            AppOrder::Stop => self.stop_preview(),
+            order => {
+                let Some(preview) = &self.preview else {
+                    return;
+                };
+                match order {
+                    AppOrder::Go(path) => preview.go(&path),
+                    AppOrder::Reload => preview.reload(),
+                    AppOrder::History(back) => preview.history(back),
+                    AppOrder::Play(steps) => preview.play(steps),
+                    AppOrder::Change(change) => preview.change(move |state| change.apply(state)),
+                    AppOrder::Keep(index) => preview.keep(index),
+                    AppOrder::Start(_) | AppOrder::Stop => {}
+                }
+            }
+        }
+    }
+
+    /// Stops the preview, and all it started, on a thread of its own: the
+    /// front end's server may take a few seconds to stop.
+    fn stop_preview(&mut self) {
+        if let Some(preview) = self.preview.take() {
+            std::thread::spawn(move || drop(preview));
+        }
+    }
+
     /// Ticks the warm sessions of the hidden conversation `chat`.
     fn keep_warm(&mut self, chat: ChatId, api: bool) {
         let (model, delegate) = (Arc::clone(&self.model), Arc::clone(&self.delegate));
@@ -347,6 +406,7 @@ where
             _ = self.warm_tick.tick() => Incoming::WarmDue,
             Some(calls) = self.calls_rx.recv() => Incoming::SubscriptionCalls(calls),
             Some(checked) = self.pulls_rx.recv() => Incoming::PullCheckedOut(checked),
+            Some(event) = self.preview_rx.recv() => Incoming::App(event),
         }
     }
 
@@ -381,6 +441,19 @@ where
                 None
             }
             Incoming::DockerDue => Some(Effect::RefreshDocker),
+            Incoming::App(event) => {
+                // What runs the front end is written down, as every
+                // command is.
+                if let universe_preview::Event::Status(universe_preview::Status::Starting {
+                    line,
+                    ..
+                }) = &event
+                {
+                    audit(self.workspace.root(), line);
+                }
+                app.app_told(event);
+                None
+            }
             Incoming::SubscriptionCalls(calls) => {
                 self.calls_reading = false;
                 app.subscription_calls_read(calls);
@@ -529,6 +602,10 @@ where
         let Some(effect) = effect else {
             return;
         };
+        if let Effect::App(order) = effect {
+            self.app_order(order);
+            return;
+        }
         if let Effect::OpenSaved(saved) = &effect {
             // A task can name a conversation that was never saved, one
             // closed before its first request: say so where the person is
@@ -918,6 +995,8 @@ where
                 });
                 save(store, app, conversation).await;
             }
+            // Carried out before the conversation is needed.
+            Effect::App(_) => {}
             Effect::RefreshDocker => {
                 if !*docker_asking {
                     *docker_asking = true;
@@ -1361,6 +1440,33 @@ async fn work_in(
 }
 
 /// Where the quotas the agents reported are kept, beside the settings.
+/// Writes down a command the person had universe run, one JSON line in
+/// the audit log, as the agent's are. A failure to write is not theirs.
+fn audit(project: &std::path::Path, command: &str) {
+    let Some(path) = Defaults::audit_log_path() else {
+        return;
+    };
+    let line = serde_json::json!({
+        "at": crate::sessions::now(),
+        "project": project,
+        "model": "person",
+        "command": command,
+        "decision": "run from the App view",
+    });
+    let write = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{line}")
+    };
+    let _ = write();
+}
+
 fn quotas_path() -> Option<std::path::PathBuf> {
     Defaults::path().map(|p| p.with_file_name("quotas.json"))
 }

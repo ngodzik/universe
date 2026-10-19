@@ -66,7 +66,7 @@ struct Touched {
 }
 
 /// A method's colour, as REST tools tend to give them.
-fn method_colour(method: &str) -> Color32 {
+pub(crate) fn method_colour(method: &str) -> Color32 {
     match method {
         "GET" => GREEN,
         "POST" => LINK,

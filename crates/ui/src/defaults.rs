@@ -103,6 +103,9 @@ pub struct Defaults {
     /// codebase, in points, as last dragged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_width: Option<f32>,
+    /// How wide the App view's pilot is, in points, as last dragged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_width: Option<f32>,
     /// The command that draws a Mermaid diagram as a PNG image, `{input}`
     /// and `{output}` standing for the files; `[]` draws none. Unsaid, the
     /// first installed of mermaid-cli (`mmdc`) and `mmdr`.
@@ -390,6 +393,7 @@ mod tests {
             opacity: Some(0.7),
             text_size: Some(1.25),
             chat_width: Some(420.0),
+            pilot_width: Some(380.0),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
             cache_ttl: Some(CacheTtl::OneHour),
             background: Some(Pattern::Rain),

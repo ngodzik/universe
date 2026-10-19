@@ -69,6 +69,9 @@ pub enum MapView {
     /// Its database: the tables its models define, their columns, and the
     /// foreign keys between them.
     Database,
+    /// Its front end, running against a back end simulated from its spec:
+    /// the page, and beside it the pilot of its workflows and states.
+    App,
     /// What a branch changed, read as a reviewer reads it: its routes, its
     /// database, its files by area. Only while a review or a piece of work
     /// is looked at.
@@ -161,6 +164,9 @@ pub struct Settings {
     /// How wide the window's conversation is beside a file or the
     /// codebase, as last dragged; `None` leaves it to the window.
     pub chat_width: Option<f32>,
+    /// How wide the App view's pilot is, as last dragged; `None` leaves it
+    /// to the window.
+    pub pilot_width: Option<f32>,
     /// The command that draws Mermaid diagrams, as configured; `None` finds
     /// one.
     pub mermaid: Option<Vec<String>>,
@@ -305,6 +311,9 @@ pub struct ModelRow {
 pub enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Ask the App view's preview something: start it, stop it, or pass on
+    /// what the person does on its page.
+    App(crate::app_preview::AppOrder),
     /// Show what a commit did, as a reply cited it.
     ShowCommit(String),
     /// Say which rules kept outside the repository the project's models
@@ -1162,6 +1171,12 @@ pub struct App {
     known_references: RefCell<HashMap<Reference, bool>>,
     /// How the window shows the codebase, if it does.
     map: Option<MapView>,
+    /// The App view: the front end running, as the preview tells it.
+    preview: crate::app_preview::AppPreview,
+    /// Whether the project has a front end the App view can run.
+    front_end: bool,
+    /// The App view, left for a file it opened: Ctrl-N comes back to it.
+    back_to_app: bool,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -1307,6 +1322,9 @@ impl App {
             reveal: Cell::new(false),
             known_references: RefCell::new(HashMap::new()),
             map: None,
+            preview: crate::app_preview::AppPreview::default(),
+            front_end: false,
+            back_to_app: false,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -2397,6 +2415,13 @@ impl App {
                     }
                 }
             }
+            Action::TogglePilot => {
+                if self.map == Some(MapView::App) {
+                    self.preview.toggle_pilot();
+                } else {
+                    self.notice = Some("Ctrl-J shows or hides the App view's pilot".to_owned());
+                }
+            }
             Action::ToggleTickets => {
                 self.tickets_open = !self.tickets_open;
                 if self.tickets_open {
@@ -2408,13 +2433,16 @@ impl App {
             Action::NextMap => {
                 // Looking at a branch, its review comes first.
                 let reviewing = self.changes.is_some();
+                let back = std::mem::take(&mut self.back_to_app);
                 let next = match self.map {
+                    None if back => Some(MapView::App),
                     None if reviewing => Some(MapView::Review),
                     None | Some(MapView::Review) => Some(MapView::Plan),
                     Some(MapView::Plan) => Some(MapView::Services),
                     Some(MapView::Services) => Some(MapView::Api),
                     Some(MapView::Api) => Some(MapView::Database),
-                    Some(MapView::Database) => Some(MapView::Universe),
+                    Some(MapView::Database) if self.front_end => Some(MapView::App),
+                    Some(MapView::Database | MapView::App) => Some(MapView::Universe),
                     Some(MapView::Universe) => None,
                 };
                 self.show_map(next);
@@ -4896,6 +4924,7 @@ impl App {
             opacity: self.settings.opacity,
             text_size: self.settings.text_size,
             chat_width: self.settings.chat_width,
+            pilot_width: self.settings.pilot_width,
             mermaid: self.settings.mermaid.clone(),
             // Set in the file only: kept as written there.
             cache_ttl: (self.settings.cache_ttl != CacheTtl::default())
@@ -5131,6 +5160,133 @@ impl App {
         self.map
     }
 
+    /// Whether the project has a front end the App view can run.
+    pub fn has_front_end(&self) -> bool {
+        self.front_end
+    }
+
+    /// Says whether the project has a front end the App view can run: the
+    /// view is among those Ctrl-N steps through only when it has.
+    pub fn front_end_found(&mut self, found: bool) {
+        self.front_end = found;
+    }
+
+    /// The App view's state.
+    pub fn app_preview(&self) -> &crate::app_preview::AppPreview {
+        &self.preview
+    }
+
+    /// Shows or hides the App view's pilot, as Ctrl-J does.
+    pub fn toggle_pilot(&mut self) {
+        self.preview.toggle_pilot();
+    }
+
+    /// Starts the front end as `config` says: what the person asked by
+    /// pressing the button that shows its command.
+    pub fn start_app(&mut self, config: universe_preview::Config) -> Effect {
+        Effect::App(self.preview.start(config))
+    }
+
+    /// Stops the front end, and all it started.
+    pub fn stop_app(&mut self) -> Effect {
+        Effect::App(self.preview.stop())
+    }
+
+    /// Asks the running front end something, when it runs.
+    fn app_order(&mut self, order: crate::app_preview::AppOrder) -> Option<Effect> {
+        if !self.preview.is_running() {
+            return None;
+        }
+        Some(Effect::App(order))
+    }
+
+    /// Shows the front end's page at `path`.
+    pub fn app_go(&mut self, path: &str) -> Option<Effect> {
+        if self.preview.is_running() {
+            self.preview.going(path);
+        }
+        self.app_order(crate::app_preview::AppOrder::Go(path.to_owned()))
+    }
+
+    /// Loads the page again.
+    pub fn app_reload(&mut self) -> Option<Effect> {
+        self.app_order(crate::app_preview::AppOrder::Reload)
+    }
+
+    /// Back in the page's history, or forward.
+    pub fn app_history(&mut self, back: bool) -> Option<Effect> {
+        self.app_order(crate::app_preview::AppOrder::History(back))
+    }
+
+    /// Changes the state the simulated back end answers in.
+    pub fn app_change(&mut self, change: crate::app_preview::Change) -> Option<Effect> {
+        let order = self.preview.change(change);
+        self.app_order(order)
+    }
+
+    /// Keeps what operation `index` answered last as its fixture, then
+    /// opens it to be changed.
+    pub fn app_keep(&mut self, index: usize) -> Option<Effect> {
+        self.app_order(crate::app_preview::AppOrder::Keep(index))
+    }
+
+    /// Shows a workflow step by step: each of `steps` a label and a path,
+    /// the last where its action is, which the person then does.
+    pub fn app_play(
+        &mut self,
+        name: &str,
+        (method, path): (&str, &str),
+        steps: Vec<(String, String)>,
+    ) -> Option<Effect> {
+        if !self.preview.is_running() {
+            return None;
+        }
+        let (labels, paths) = steps.into_iter().unzip();
+        let playing = crate::app_preview::Playing {
+            name: name.to_owned(),
+            steps: labels,
+            method: method.to_owned(),
+            path: path.to_owned(),
+            acted: false,
+            shown: 0,
+        };
+        self.notice = Some(format!(
+            "{name}: its screens one after the other; on the last, do it on the page \
+             ({method} {path} is looked for)"
+        ));
+        Some(Effect::App(self.preview.play(playing, paths)))
+    }
+
+    /// Applies what the preview told: a fixture kept is opened to be
+    /// changed by hand.
+    pub fn app_told(&mut self, event: universe_preview::Event) {
+        if let Some(path) = self.preview.told(event) {
+            self.open_from_app(path.clone(), 1);
+            self.notice = Some(format!(
+                "Kept as a fixture: {}. It answers from now on as changed here; Ctrl-N goes back to the page",
+                path.display()
+            ));
+        }
+    }
+
+    /// Opens a file from the App view, at `line`, the view left for it:
+    /// Ctrl-N comes back to the page.
+    pub fn open_from_app(&mut self, path: std::path::PathBuf, line: usize) {
+        self.show_map(None);
+        self.open_path_at(path, line);
+        self.back_to_app = true;
+    }
+
+    /// The width of the App view's pilot, as last dragged.
+    pub fn pilot_width(&self) -> Option<f32> {
+        self.settings.pilot_width
+    }
+
+    /// Keeps the width the pilot was dragged to, in whole points.
+    pub fn set_pilot_width(&mut self, width: f32) {
+        self.settings.pilot_width = Some(width.round());
+    }
+
     /// Shows the codebase as `view`, or the panes again with `None`: what
     /// Ctrl-N steps through, and what the window's own buttons pick.
     pub fn show_map(&mut self, view: Option<MapView>) {
@@ -5166,6 +5322,11 @@ impl App {
             Some(MapView::Review) => {
                 "The review: the routes, the database and the files the branch changed. Click \
                  one to open it; Ctrl-N again for the plan"
+            }
+            Some(MapView::App) => {
+                "The app: its front end against a back end simulated from its spec, in Chrome \
+                 within this view. Start it and use the page as in any browser; Ctrl-J hides \
+                 the pilot, Ctrl-N again for the universe"
             }
             None => return,
         };
@@ -5957,6 +6118,43 @@ mod tests {
         assert_eq!(app.map_view(), None);
         app.show_map(Some(MapView::Universe));
         assert_eq!(app.map_view(), Some(MapView::Universe));
+    }
+
+    #[test]
+    fn the_app_view_and_its_pilot() {
+        use crate::app_preview::AppOrder;
+        let mut app = ready();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        // Among the views only with a front end.
+        app.front_end_found(true);
+        app.show_map(Some(MapView::Database));
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_view(), Some(MapView::App));
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_view(), Some(MapView::Universe));
+        app.show_map(Some(MapView::App));
+        assert!(app.app_preview().pilot_shown());
+        app.on_key(ctrl('j'));
+        assert!(!app.app_preview().pilot_shown());
+        app.on_key(ctrl('j'));
+        assert!(app.app_preview().pilot_shown());
+
+        // Nothing goes to a page that is not running.
+        assert!(app.app_reload().is_none());
+        app.app_told(universe_preview::Event::Status(
+            universe_preview::Status::Running {
+                address: "http://127.0.0.1:3000".to_owned(),
+            },
+        ));
+        assert!(matches!(
+            app.app_reload(),
+            Some(Effect::App(AppOrder::Reload))
+        ));
+        // Left for a file, Ctrl-N comes back to it.
+        app.open_from_app(PathBuf::from("/p/fixture.json"), 1);
+        assert_eq!(app.map_view(), None);
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_view(), Some(MapView::App));
     }
 
     #[test]
@@ -7451,6 +7649,7 @@ mod tests {
                 opacity: None,
                 text_size: None,
                 chat_width: None,
+                pilot_width: None,
                 mermaid: None,
                 cache_ttl: None,
                 background: None,

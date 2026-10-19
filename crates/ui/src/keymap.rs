@@ -127,6 +127,8 @@ pub enum Action {
     ToggleBranch,
     /// Show or hide the tickets linked to the branch.
     ToggleTickets,
+    /// Show or hide the App view's pilot, beside its page.
+    TogglePilot,
     /// The usage pane's next window: an hour, six, a day.
     NextUsageWindow,
     /// Let what is behind the window show through, or make it opaque again.
@@ -169,6 +171,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "Ctrl-L",
                 "show or hide the branch's tickets and how far the work is (/ticket)",
+            ),
+            (
+                "Ctrl-J",
+                "in the App view, show or hide the pilot beside the page; drag its edge to size it",
             ),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
             ("Ctrl-M", "the window see-through, 80%, 60%, 40%, or opaque"),
@@ -311,6 +317,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('r') if ctrl => return Some(Action::ToggleBranch),
         // L for the tickets the branch is linked to.
         KeyCode::Char('l') if ctrl => return Some(Action::ToggleTickets),
+        // J, free on both keyboards, beside the others of the window.
+        KeyCode::Char('j') if ctrl => return Some(Action::TogglePilot),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
         KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
         KeyCode::Char('n') if ctrl => return Some(Action::NextMap),
@@ -492,6 +500,14 @@ mod tests {
                 key(KeyCode::Left)
             ),
             Some(Action::FocusLeft)
+        );
+    }
+
+    #[test]
+    fn ctrl_j_hides_or_shows_the_pilot() {
+        assert_eq!(
+            action(Mode::Normal, Focus::Chat, None, ctrl('j')),
+            Some(Action::TogglePilot)
         );
     }
 }

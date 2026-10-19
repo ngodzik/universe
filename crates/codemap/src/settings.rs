@@ -46,6 +46,32 @@ pub struct NamedEnvironment {
     pub path: String,
 }
 
+/// How the project's front end is run against a simulated back end, where
+/// what is read of it is not enough: the `[app]` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSettings {
+    /// The front end's folder, from the project's root, when it has
+    /// several: `clients/apps/web`.
+    pub folder: Option<String>,
+    /// What runs it, in its folder, instead of its `dev` script.
+    pub command: Option<String>,
+    /// The variable of the environment it reads its API's address from.
+    pub api_env: Option<String>,
+    /// The spec the back end is simulated from, from the project's root or
+    /// absolute, when the project's own lacks what the front end calls.
+    pub spec: Option<String>,
+    /// A command, run in the project's root, that prints the spec: an app
+    /// that makes its own, as FastAPI's does.
+    pub spec_command: Option<String>,
+    /// Cookies set before the first page, a session's among them.
+    #[serde(default)]
+    pub cookies: std::collections::BTreeMap<String, String>,
+    /// More of the environment it runs in.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 /// A project's own settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -55,6 +81,8 @@ pub struct Settings {
     pub centre: Option<String>,
     /// The environments listed first, in this order.
     pub environments: Vec<NamedEnvironment>,
+    /// How its front end runs in the App view.
+    pub app: AppSettings,
     /// What the settings say that could not be used, such as a linked
     /// folder that is not there.
     pub notes: Vec<String>,
@@ -68,6 +96,8 @@ struct File {
     centre: Option<String>,
     #[serde(default)]
     environments: Vec<NamedEnvironment>,
+    #[serde(default)]
+    app: AppSettings,
 }
 
 /// Why the settings could not be read.
@@ -139,6 +169,7 @@ pub fn read_settings(file: &Path, home: &Path) -> Result<Settings, SettingsError
         linked,
         centre: parsed.centre,
         environments: parsed.environments,
+        app: parsed.app,
         notes,
     })
 }
@@ -159,10 +190,22 @@ mod tests {
         )
         .unwrap();
         let settings = read_settings(&file, home).unwrap();
+        assert_eq!(settings.app, AppSettings::default());
         assert_eq!(settings.linked, [home.join("code/deploy")]);
         assert_eq!(settings.centre.as_deref(), Some("api"));
         assert_eq!(settings.environments[0].path, "clusters/prod/app");
         assert_eq!(settings.notes.len(), 1);
+
+        std::fs::write(
+            &file,
+            "[app]\nfolder = \"web\"\nspec_command = \"make spec\"\ncookies = { session = \"simulated\" }\nenv = { PORT_OFFSET = \"1\" }\n",
+        )
+        .unwrap();
+        let app = read_settings(&file, home).unwrap().app;
+        assert_eq!(app.folder.as_deref(), Some("web"));
+        assert_eq!(app.spec_command.as_deref(), Some("make spec"));
+        assert_eq!(app.cookies["session"], "simulated");
+        assert_eq!(app.env["PORT_OFFSET"], "1");
 
         std::fs::write(&file, "centr = \"api\"\n").unwrap();
         let error = read_settings(&file, home).unwrap_err();
