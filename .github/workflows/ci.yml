@@ -38,7 +38,7 @@ jobs:
       - name: Wayland and ALSA headers, and Ninja
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
       - name: CEF, kept between runs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CEF_PATH }}
           key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
       - name: CEF, kept between runs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CEF_PATH }}
           key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
@@ -110,7 +110,7 @@ jobs:
       - name: Wayland and ALSA headers, and Ninja
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libasound2-dev ninja-build
       - name: CEF, kept between runs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CEF_PATH }}
           key: cef-154.5.0-${{ runner.os }}-${{ runner.arch }}
