@@ -667,9 +667,9 @@ dependencies = [
 
 [[package]]
 name = "bevy_cef"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db7f83a1b9709b13c7098e13211590906ce8f61c03a817de1cbbb5cd5ff926b5"
+checksum = "78ff3a54d23e4a45f7717be78282930820f64d043adea84c9098f265a6e775d5"
 dependencies = [
  "async-channel",
  "bevy",
@@ -684,9 +684,9 @@ dependencies = [
 
 [[package]]
 name = "bevy_cef_core"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4269821761111686557aa09a552fcbe8f245090f5b27c22209504005a829e12"
+checksum = "c9f2284b3cbafcac416fcda6aa302124d459700e11f0cc13de32e5949051677d"
 dependencies = [
  "async-channel",
  "bevy",
@@ -701,6 +701,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "wgpu",
 ]
 
