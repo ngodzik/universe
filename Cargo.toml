@@ -54,7 +54,7 @@ regex      = "1.13.1"
 rquickjs   = "0.14.0"
 # What that JavaScript answers, checked against the spec's schemas. Without
 # its defaults, which fetch schemas over the network.
-jsonschema = { version = "0.59.0", default-features = false }
+jsonschema = { version = "0.60.2", default-features = false }
 similar    = "3.2.0"
 toml       = "1.1.8"
 # Local time for when a subscription's window starts again, the system's
