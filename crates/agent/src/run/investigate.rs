@@ -207,6 +207,7 @@ impl Session {
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             allowed_programs: config.allowed_programs.clone(),
+            readers: self.readers.clone(),
             context_warned: false,
             last_call: None,
             last_context: None,
@@ -277,6 +278,7 @@ impl Session {
         });
         (ctx.observe)(Event::Investigated { text: report });
         self.windows = std::mem::take(&mut ctx.windows);
+        self.readers = std::mem::take(&mut ctx.readers);
         Ok(ctx.ledger.outcome(Verdict::Answered, ctx.toolbox))
     }
 

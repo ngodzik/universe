@@ -129,6 +129,15 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                 ('n', "Stop".to_owned()),
             ],
         ),
+        Question::ExternalTool { reads: true, .. } => (
+            YELLOW,
+            "Run this tool?",
+            vec![
+                ('y', "Run it".to_owned()),
+                ('a', "Its server's reads, for this conversation".to_owned()),
+                ('n', "Refuse".to_owned()),
+            ],
+        ),
         Question::ExternalTool { .. } => (
             RED,
             "Run this tool?",
@@ -216,15 +225,20 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                      little; letting them cool, the next request writes them to the cache again."
                 ));
             }
-            Question::ExternalTool { name, arguments } => {
+            Question::ExternalTool {
+                name,
+                arguments,
+                reads,
+            } => {
+                let (what, colour) = if *reads {
+                    ("a tool its server says only reads; these go to it", YELLOW)
+                } else {
+                    ("a tool that may change something", RED)
+                };
                 ui.label(
-                    RichText::new(format!(
-                        "{} wants {name}, a tool that may change something, with:",
-                        approval.model
-                    ))
-                    .color(DIM),
+                    RichText::new(format!("{} wants {name}, {what}:", approval.model)).color(DIM),
                 );
-                ui.label(RichText::new(arguments).monospace().color(RED));
+                ui.label(RichText::new(arguments).monospace().color(colour));
             }
             Question::AddFolder { path, folder } => {
                 ui.label(format!(

@@ -2,7 +2,7 @@
 //! protocol's authorization spec describes: the authorization server found
 //! from the resource's metadata, a client registered for universe, the
 //! person's consent in the browser with PKCE, and the grant kept on disk
-//! and renewed before it expires.
+//! for the address it was given for, renewed before it expires.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,10 @@ pub(crate) struct Endpoints {
 /// What a request carries to the server, and what renews it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Grant {
+    /// The server's address it was given for: never sent elsewhere. Empty
+    /// in a grant kept before it was written down, which is asked again.
+    #[serde(default)]
+    url: String,
     client_id: String,
     token_endpoint: String,
     resource: String,
@@ -49,6 +53,7 @@ pub(crate) struct Grant {
 impl fmt::Debug for Grant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Grant")
+            .field("url", &self.url)
             .field("client_id", &self.client_id)
             .field("token_endpoint", &self.token_endpoint)
             .field("resource", &self.resource)
@@ -67,6 +72,7 @@ impl Grant {
     #[cfg(test)]
     pub(crate) fn for_test(base: &str, access: &str, refresh: &str, expires_at: u64) -> Self {
         Self {
+            url: format!("{base}/mcp"),
             client_id: "c-1".into(),
             token_endpoint: format!("{base}/token"),
             resource: format!("{base}/mcp"),
@@ -105,9 +111,13 @@ impl Grants {
         self.dir.join(format!("{server}.json"))
     }
 
-    pub(crate) fn load(&self, server: &str) -> Option<Grant> {
+    /// The grant kept for `server` at `url`: one given for another address,
+    /// as when the settings moved the server under the same name, is not,
+    /// so that its token never goes where it was not given for.
+    pub(crate) fn load(&self, server: &str, url: &str) -> Option<Grant> {
         let text = std::fs::read_to_string(self.path(server)).ok()?;
-        serde_json::from_str(&text).ok()
+        let grant: Grant = serde_json::from_str(&text).ok()?;
+        (grant.url == url).then_some(grant)
     }
 
     pub(crate) fn save(&self, server: &str, grant: &Grant) -> Result<(), String> {
@@ -324,6 +334,7 @@ pub(crate) async fn consent(
         .map_err(|e| format!("asking for a token: {e}"))?;
     granted(
         response,
+        url,
         client_id,
         endpoints.token,
         endpoints.resource,
@@ -352,6 +363,7 @@ pub(crate) async fn renew(client: &reqwest::Client, grant: &Grant) -> Result<Gra
         .map_err(|e| format!("renewing the grant: {e}"))?;
     granted(
         response,
+        &grant.url,
         grant.client_id.clone(),
         grant.token_endpoint.clone(),
         grant.resource.clone(),
@@ -379,10 +391,11 @@ fn form(pairs: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-/// The grant a token endpoint answered; a renewal that gives no new refresh
-/// token keeps `refresh`.
+/// The grant a token endpoint answered, for the server at `url`; a renewal
+/// that gives no new refresh token keeps `refresh`.
 async fn granted(
     response: reqwest::Response,
+    url: &str,
     client_id: String,
     token_endpoint: String,
     resource: String,
@@ -399,6 +412,7 @@ async fn granted(
         .ok_or("the answer holds no token")?
         .to_owned();
     Ok(Grant {
+        url: url.to_owned(),
         client_id,
         token_endpoint,
         resource,
@@ -569,6 +583,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let grants = Grants::new(dir.path().join("mcp-auth"));
         let grant = Grant {
+            url: "https://mcp.example.com/mcp".into(),
             client_id: "c-1".into(),
             token_endpoint: "https://auth.example.com/token".into(),
             resource: "https://mcp.example.com/mcp".into(),
@@ -577,7 +592,13 @@ mod tests {
             expires_at: Some(1_000),
         };
         grants.save("docs", &grant).unwrap();
-        assert_eq!(grants.load("docs"), Some(grant.clone()));
+        assert_eq!(
+            grants.load("docs", "https://mcp.example.com/mcp"),
+            Some(grant.clone())
+        );
+        // The server moved under the same name: its grant is not sent to
+        // the new address.
+        assert_eq!(grants.load("docs", "https://elsewhere.example/mcp"), None);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -591,6 +612,6 @@ mod tests {
         assert!(!grant.is_ending(900));
         assert!(grant.is_ending(941));
         grants.forget("docs");
-        assert_eq!(grants.load("docs"), None);
+        assert_eq!(grants.load("docs", "https://mcp.example.com/mcp"), None);
     }
 }

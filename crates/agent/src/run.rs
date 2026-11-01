@@ -283,6 +283,9 @@ struct Ctx<'a, M, D, O> {
     allowed_hosts: Vec<String>,
     /// The programs the person allowed besides the known ones.
     allowed_programs: Vec<String>,
+    /// The servers whose tools that only read the person let run for the
+    /// conversation.
+    readers: Vec<String>,
     /// Whether the person was told this request that the context fills.
     context_warned: bool,
     /// The settings of the last call to an agent, and its context's size:
@@ -344,6 +347,10 @@ pub struct Session {
     /// shows as they work.
     #[serde(default)]
     windows: BTreeMap<String, u64>,
+    /// The servers whose tools that only read the person let run for the
+    /// rest of the conversation.
+    #[serde(default)]
+    readers: Vec<String>,
     /// When the conversation was last sent, in seconds since 1970.
     #[serde(default)]
     last_used: u64,
@@ -411,6 +418,7 @@ impl Session {
             coders: BTreeMap::new(),
             summary: None,
             windows: BTreeMap::new(),
+            readers: Vec::new(),
             last_used: 0,
             asked: BTreeMap::new(),
             api_warm: None,
@@ -465,6 +473,7 @@ impl Session {
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             allowed_programs: config.allowed_programs.clone(),
+            readers: self.readers.clone(),
             context_warned: false,
             last_call: None,
             last_context: None,
@@ -515,6 +524,7 @@ impl Session {
             verdict => verdict?,
         };
         self.windows = std::mem::take(&mut ctx.windows);
+        self.readers = std::mem::take(&mut ctx.readers);
         self.last_used = now_secs();
         // A request answered by an agent leaves no provider's cache to keep.
         self.api_warm = ctx.last_request.take().map(|r| (r, self.last_used));
@@ -1583,6 +1593,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         allowed_secrets: config.allowed_secrets.clone(),
         allowed_hosts: config.allowed_hosts.clone(),
         allowed_programs: config.allowed_programs.clone(),
+        readers: Vec::new(),
         context_warned: false,
         last_call: None,
         last_context: None,
@@ -3504,8 +3515,10 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     }
 }
 
-/// Calls a tool served by another: at once when it only reads, else once the
-/// person said yes. What it returns is redacted of the environment's
+/// Calls a tool served by another once the person said yes: every time for
+/// one that may change something; once per server for one that only reads,
+/// as its server says, when they say always, its arguments going to the
+/// server all the same. What it returns is redacted of the environment's
 /// secrets, as a command's output is.
 async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
     ctx: &mut Ctx<'_, M, D, O>,
@@ -3515,7 +3528,14 @@ async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
     reads_only: bool,
 ) -> String {
     let line = format!("{} {}", call.name, call.arguments);
-    if !reads_only {
+    let server = call
+        .name
+        .split_once("__")
+        .map_or(call.name.as_str(), |(server, _)| server)
+        .to_owned();
+    let decision = if reads_only && ctx.readers.contains(&server) {
+        "ran, it only reads, its server let read for the conversation"
+    } else {
         let answer = match &ctx.config.approver {
             Some(approver) => {
                 approver
@@ -3524,6 +3544,7 @@ async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
                         question: Question::ExternalTool {
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
+                            reads: reads_only,
                         },
                     })
                     .await
@@ -3532,17 +3553,24 @@ async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
         };
         if !answer.yes() {
             audit(ctx, model, &line, "held, refused", None);
-            return "refused: this tool may change something, and the person did not allow it. \
-                    Do not reach the same result another way: say what you wanted to do."
-                .to_owned();
+            let what = if reads_only {
+                "this tool sends its arguments to its server"
+            } else {
+                "this tool may change something"
+            };
+            return format!(
+                "refused: {what}, and the person did not allow it. Do not reach the same result \
+                 another way: say what you wanted to do."
+            );
         }
-    }
-    let outcome = external.call(&call.name, &call.arguments).await;
-    let decision = if reads_only {
-        "ran, it only reads"
-    } else {
-        "ran, approved by the person"
+        if reads_only && answer == Answer::Always {
+            ctx.readers.push(server);
+            "ran, it only reads, its server let read for the conversation"
+        } else {
+            "ran, approved by the person"
+        }
     };
+    let outcome = external.call(&call.name, &call.arguments).await;
     let (status, text) = match outcome {
         Ok(text) => ("done", text),
         Err(why) => ("failed", format!("error: {why}")),
@@ -5474,13 +5502,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_external_tool_that_reads_runs_and_one_that_writes_asks() {
+    async fn an_external_tool_that_reads_asks_once_per_server_and_one_that_writes_each_time() {
         let (_dir, mut toolbox) = setup();
         let tracker = Arc::new(Tracker::default());
         let model = Scripted::new(vec![
             calls("tracker__get_issue", json!({"id": "ENG-1"})),
+            calls("tracker__get_issue", json!({"id": "ENG-2"})),
             calls("tracker__close_issue", json!({"id": "ENG-1"})),
-            says("Read it; closing was refused."),
+            says("Read them; closing was refused."),
+            // The next request reads again, its server still let read.
+            calls("tracker__get_issue", json!({"id": "ENG-3"})),
+            says("Read it."),
         ]);
         let asked = Arc::new(Mutex::new(Vec::new()));
         let config = AgentConfig::builder()
@@ -5493,27 +5525,54 @@ mod tests {
             .with_approver({
                 let asked = Arc::clone(&asked);
                 Approver::new(move |approval: Approval| {
+                    // Always for what only reads, no for the rest.
+                    let answer = match &approval.question {
+                        Question::ExternalTool { reads: true, .. } => Answer::Always,
+                        _ => Answer::No,
+                    };
                     asked.lock().unwrap().push(approval);
-                    async { Answer::No }
+                    async move { answer }
                 })
             });
-        Session::new()
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &config,
-                "close it",
-                "",
-                |_| {},
-            )
-            .await
-            .unwrap();
-        assert_eq!(*tracker.called.lock().unwrap(), ["tracker__get_issue"]);
-        assert!(matches!(
-            &asked.lock().unwrap()[0].question,
-            Question::ExternalTool { name, .. } if name == "tracker__close_issue"
-        ));
+        let mut session = Session::new();
+        for request in ["close them", "read the next"] {
+            session
+                .send(
+                    &model,
+                    &NoDelegate,
+                    &mut toolbox,
+                    &config,
+                    request,
+                    "",
+                    |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *tracker.called.lock().unwrap(),
+            [
+                "tracker__get_issue",
+                "tracker__get_issue",
+                "tracker__get_issue"
+            ]
+        );
+        let asked: Vec<(String, bool)> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|approval| match &approval.question {
+                Question::ExternalTool { name, reads, .. } => Some((name.clone(), *reads)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("tracker__get_issue".to_owned(), true),
+                ("tracker__close_issue".to_owned(), false),
+            ]
+        );
         let seen = model.seen.lock().unwrap();
         assert!(
             seen[0]
@@ -5521,6 +5580,42 @@ mod tests {
                 .iter()
                 .any(|t| t.name == "tracker__close_issue")
         );
+    }
+
+    #[tokio::test]
+    async fn an_external_tool_that_reads_is_refused_when_nobody_answers() {
+        let (_dir, mut toolbox) = setup();
+        let tracker = Arc::new(Tracker::default());
+        let model = Scripted::new(vec![
+            calls("tracker__get_issue", json!({"id": "ENG-1"})),
+            says("Could not read it."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_external_tools(Some(
+                Arc::clone(&tracker) as Arc<dyn universe_core::ExternalTools>
+            ));
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(tracker.called.lock().unwrap().is_empty());
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(
+            seen[1].messages.last(),
+            Some(Message::Tool { content, .. })
+                if content.starts_with("refused: this tool sends its arguments to its server")
+        ));
     }
 
     #[tokio::test]

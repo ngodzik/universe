@@ -394,7 +394,7 @@ impl Server {
             .ok_or("no folder to keep its grant in")?;
         let url = self.config.url.as_deref().ok_or("OAuth needs a url")?;
         let client = reqwest::Client::new();
-        if !again && let Some(grant) = grants.load(&self.name) {
+        if !again && let Some(grant) = grants.load(&self.name, url) {
             if !grant.is_ending(oauth::now()) {
                 return Ok(grant.access_token);
             }
@@ -427,7 +427,7 @@ impl Server {
     /// The token renewed, when the grant kept is about to end.
     async fn renewed(&self) -> Option<String> {
         let grants = self.grants.as_ref()?;
-        let grant = grants.load(&self.name)?;
+        let grant = grants.load(&self.name, self.config.url.as_deref()?)?;
         if !grant.is_ending(oauth::now()) {
             return None;
         }
@@ -993,7 +993,9 @@ mod tests {
         assert!(notices[0].starts_with("The MCP server docs waits for your consent"));
         assert!(mcp.notices().is_empty());
         assert_eq!(mcp.call("docs__fetch", "{}").await, Ok("a page".to_owned()));
-        let kept = oauth::Grants::new(grants.clone()).load("docs").unwrap();
+        let kept = oauth::Grants::new(grants.clone())
+            .load("docs", &format!("{base}/mcp"))
+            .unwrap();
         assert_eq!(kept.access_token, "t-1");
 
         // A grant about to end is renewed, without asking.
@@ -1009,7 +1011,9 @@ mod tests {
         );
         assert_eq!(ready(&mcp).await, "1 tool, 0 only reading");
         assert_eq!(CONSENTS.load(Ordering::SeqCst), before);
-        let kept = oauth::Grants::new(grants.clone()).load("docs").unwrap();
+        let kept = oauth::Grants::new(grants.clone())
+            .load("docs", &format!("{base}/mcp"))
+            .unwrap();
         assert_eq!(kept.access_token, "t-2");
 
         // A grant the server no longer takes is forgotten, and the person
@@ -1026,7 +1030,9 @@ mod tests {
         );
         assert_eq!(ready(&mcp).await, "1 tool, 0 only reading");
         assert_eq!(CONSENTS.load(Ordering::SeqCst), before + 1);
-        let kept = oauth::Grants::new(grants).load("docs").unwrap();
+        let kept = oauth::Grants::new(grants)
+            .load("docs", &format!("{base}/mcp"))
+            .unwrap();
         assert_eq!(kept.access_token, "t-1");
     }
 

@@ -4584,6 +4584,16 @@ impl App {
                 self.approval_scroll += 10;
                 return Some(None);
             }
+            // A server's tools that only read, for the rest of the
+            // conversation: the agent keeps it.
+            KeyCode::Char('a' | 'A')
+                if matches!(
+                    approval.question,
+                    Question::ExternalTool { reads: true, .. }
+                ) =>
+            {
+                Answer::Always
+            }
             KeyCode::Char('a' | 'A')
                 if !secrets.is_empty() || !hosts.is_empty() || !programs.is_empty() =>
             {

@@ -84,13 +84,17 @@ pub enum Question {
         /// How long the conversation has waited.
         minutes: u64,
     },
-    /// Whether a tool served by another, one that may change something,
-    /// may run.
+    /// Whether a tool served by another may run.
     ExternalTool {
         /// Its name, `<server>__<tool>`.
         name: String,
         /// Its arguments, as JSON.
         arguments: String,
+        /// Whether its server says it only reads: a hint of the server's,
+        /// so it is asked too, and always (`Answer::Always`) lets that
+        /// server's tools that only read run for the rest of the
+        /// conversation.
+        reads: bool,
     },
     /// A file tool reached outside the workspace: whether to add a folder
     /// for the rest of the conversation.
@@ -322,8 +326,9 @@ impl AgentConfig {
     }
 
     /// Tools served by others, MCP servers' for one: offered to models
-    /// besides universe's own. Those that only read run at once; any other
-    /// waits for the person, as a held command does.
+    /// besides universe's own. Each call waits for the person, as a held
+    /// command does: one its server says only reads once per server, when
+    /// they say always.
     pub fn with_external_tools(mut self, tools: Option<Arc<dyn ExternalTools>>) -> Self {
         self.external = tools;
         self
