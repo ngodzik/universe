@@ -647,11 +647,6 @@ fn strip_call<'a>(part: &'a str, name: &str) -> Option<&'a str> {
     (callee == name || callee.ends_with(&format!(".{name}"))).then(|| &part[open..])
 }
 
-/// The text of the call that opens at `open` in `text`.
-fn call_at(text: &str, open: usize) -> &str {
-    crate::review::call_at(text, open)
-}
-
 /// The arguments of a call, split at its commas, nested brackets and
 /// strings minded.
 fn split_args(text: &str) -> Vec<&str> {
@@ -687,6 +682,29 @@ fn line_of(text: &str, at: usize) -> usize {
 /// Spaces evened out.
 fn even(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The text of the call that opens at `open` in `text`, up to its closing
+/// parenthesis, strings minded.
+fn call_at(text: &str, open: usize) -> &str {
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    for (i, c) in text[open..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[open..=open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    &text[open..]
 }
 
 #[cfg(test)]

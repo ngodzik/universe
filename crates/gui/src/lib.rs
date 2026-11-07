@@ -4,244 +4,121 @@
 //! effects are carried out by its `Host`. This crate only:
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
-//! - draws the state with egui on Bevy (`transcript`, `windows`, `usage`).
+//! - draws the state with egui on Bevy: the project's views (`universe`,
+//!   `plan`, `services_view`, `api_view`, `database_view`, `fleet_view`),
+//!   its files and the file open.
 //!
-//! Bevy owns the window and the frame loop, so that the codebase views to
-//! come can draw in 2D and 3D under the same panels.
+//! Bevy owns the window and the frame loop, so that the views draw in 2D
+//! and 3D under the same panels.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-mod activity;
 mod api_view;
-mod app_view;
 mod arch_view;
 mod backdrop;
-mod branch_pane;
-mod bullets;
 mod database_view;
-mod diagrams;
-mod diff_view;
-mod docker_pane;
 mod error;
 mod fleet_view;
 mod infra;
 mod keys;
-mod orbits;
 mod plan;
-mod review_view;
 mod service_board;
 mod services_view;
-mod sub_agent_pane;
-mod subscriptions_page;
 mod theme;
-mod tickets_pane;
-mod transcript;
 mod universe;
-mod usage;
-mod viewer;
+mod universe_view;
 mod windows;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bevy::app::AppExit;
 use bevy::camera::CameraOutputMode;
 use bevy::input::ButtonState;
-use bevy::input::keyboard::{Key, KeyCode as PhysicalKey, KeyboardInput};
+use bevy::input::keyboard::{KeyCode as PhysicalKey, KeyboardInput};
 use bevy::prelude::*;
 use bevy::render::render_resource::BlendState;
 use bevy::window::{CompositeAlphaMode, PrimaryWindow};
 use bevy::winit::{UpdateMode, WinitSettings};
-use bevy_cef::prelude::{
-    CefKeyboardFilter, CefPlugin, CommandLineConfig, FocusedWebview, KeyboardDeliverSet,
-    ModifiersState, WebviewSource, WebviewUiMaterial,
-};
 use bevy_egui::egui::{
-    self, Align, Color32, Frame, Id, LayerId, Layout, Margin, RichText, ScrollArea, Stroke, Ui,
-    UiBuilder,
+    self, Align, Color32, Frame, Id, LayerId, Layout, Margin, RichText, Ui, UiBuilder,
 };
 use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiOutput, EguiPlugin,
     EguiPostUpdateSet, EguiPreUpdateSet, EguiPrimaryContextPass, PrimaryEguiContext,
 };
-use tokio::runtime::Handle;
-use universe_codemap::NodeKind;
-use universe_core::{ChatModel, Delegate};
-use universe_tools::Workspace;
 use universe_ui::backdrop::Motion;
-use universe_ui::editor::{EditorMode, ScreenRow};
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
-use universe_ui::keymap::{Focus, Mode, Pending};
-use universe_ui::references::Reference;
-use universe_ui::workspaces::Relaunch;
-use universe_ui::{App, Effect, Host, MapView, Settings, Start, UsagePage, Waiting, clipboard};
+use universe_ui::keymap::{Focus, Mode};
+use universe_ui::reader::ReaderMode;
+use universe_ui::{App, Effect, Host, MapView, clipboard};
 
 pub use error::GuiError;
 
 use crate::keys::{Held, Pressed};
 use crate::plan::Plan;
-use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
-use crate::universe::{Assets3d, Universe};
-use crate::usage::UsageView;
-use universe_ui::flight::Leg;
+use crate::theme::{ACCENT, DIM, PANEL, RAISED, SELECTED, TEXT, YELLOW};
+use crate::universe::Universe;
 
-/// How the window's pixels blend with what is behind it. Metal offers only
-/// `Opaque` and `PostMultiplied`: asked for another, the surface cannot be
-/// made and the window stops at its first frame.
-#[cfg(target_os = "macos")]
-const COMPOSITE_ALPHA: CompositeAlphaMode = CompositeAlphaMode::PostMultiplied;
-#[cfg(not(target_os = "macos"))]
-const COMPOSITE_ALPHA: CompositeAlphaMode = CompositeAlphaMode::PreMultiplied;
+/// How the window's pixels blend with what is behind it, or why they cannot.
+/// Metal offers only `Opaque` and `PostMultiplied`; a Wayland compositor
+/// takes premultiplied pixels. Under X11 transparency hangs on the driver
+/// and a compositor, and some (NVIDIA's Vulkan) offer only `Opaque`: asked
+/// for another, the surface cannot be made and the window stops at its first
+/// frame. Bevy does not fall back, so the window is opaque there.
+fn composite_alpha() -> Result<CompositeAlphaMode, &'static str> {
+    if cfg!(target_os = "macos") {
+        Ok(CompositeAlphaMode::PostMultiplied)
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty()) {
+        Ok(CompositeAlphaMode::PreMultiplied)
+    } else {
+        Err(
+            "under X11, a window's transparency depends on the driver and is not asked for; it can be under Wayland or macOS",
+        )
+    }
+}
 
-/// How long the window may sleep while a request runs: the spinner turns
-/// and the agent's messages show within it.
+/// How long the window may sleep while a lookup runs: its places show
+/// within it.
 const BUSY_WAIT: Duration = Duration::from_millis(100);
 
 /// How long it may sleep otherwise. Nothing changes then but a key, which
-/// wakes it at once, and the timers that keep sessions warm.
+/// wakes it at once.
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 
-/// How long the text cursor stays lit, then dark, while typing: the window
-/// wakes at this pace to blink it, and no faster.
+/// How long the text cursor stays lit, then dark, while a command is typed:
+/// the window wakes at this pace to blink it, and no faster.
 const BLINK: Duration = Duration::from_millis(530);
-
-/// How long it may sleep while the App view's wait moves: thirty frames a
-/// second.
-const FRAME_WAIT: Duration = Duration::from_millis(33);
-
-/// How long it may sleep while the App view's page shows: Chrome paints it
-/// at the screen's pace, and runs only as often as the window does.
-const PAGE_WAIT: Duration = Duration::from_millis(16);
 
 /// How long it may sleep while a background moves: about twelve frames a
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 
-/// The width of the usage pane, in points.
-const USAGE_WIDTH: f32 = 460.0;
+/// The height of macOS's title bar, in points.
+const TITLE_BAR: f32 = 28.0;
 
-/// Leaves at once when this process is one of Chrome's own, started again
-/// by the App view's browser to draw its pages: to be called first thing
-/// in `main`, before anything of the program starts. On macOS, Chrome has
-/// processes of its own.
-pub fn early_exit_if_subprocess() {
-    #[cfg(not(target_os = "macos"))]
-    bevy_cef::prelude::early_exit_if_subprocess();
-}
-
-/// Whether the Chrome the App view shows its page with can be loaded: on
-/// macOS, run from its folder, it is found where `scripts/setup-chrome.sh`
-/// installs it, and loading it from nowhere would stop the program. Off
-/// macOS, its library comes with the program.
-fn chrome_found() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let Some(home) = std::env::var_os("HOME") else {
-            return false;
-        };
-        let framework = std::path::Path::new(&home)
-            .join(".local/share/cef/Chromium Embedded Framework.framework");
-        framework
-            .join("Libraries/bevy_cef_debug_render_process")
-            .exists()
-    }
-    #[cfg(not(target_os = "macos"))]
-    true
-}
-
-/// A free port on this machine, for the DevTools of the Chrome universe
-/// holds: none, and the App view runs without them.
-fn devtools_port() -> Option<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    Some(listener.local_addr().ok()?.port())
-}
-
-/// The App view's page: Chrome's, drawn under the view.
-#[derive(Component)]
-struct AppPage;
-
-/// Opens the window and runs until the person quits or closes it.
-///
-/// `runtime` is the Tokio runtime the agent works on. The window must run
-/// on the main thread, outside any task of that runtime: from inside one,
-/// call it within `tokio::task::block_in_place`.
+/// Opens the window on `app`'s project, and runs it until it is closed.
 ///
 /// # Errors
 ///
-/// [`GuiError::Exited`] when Bevy stops with an error.
-pub fn run<M, D>(
-    runtime: Handle,
-    model: Arc<M>,
-    delegate: Arc<D>,
-    workspace: Workspace,
-    settings: Settings,
-    start: Start,
-) -> Result<Option<Relaunch>, GuiError>
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    // The host's timers belong to the runtime.
-    let _context = runtime.enter();
-    let settings_mermaid = settings.mermaid.clone();
-    let mut app = App::new(settings, workspace.root().to_owned());
-    let mut host = Host::new(model, delegate, workspace);
-    runtime.block_on(host.start(&mut app, start));
-    let diagrams = diagrams::Diagrams::new(settings_mermaid.as_deref());
-    let title = format!("{} · universe", app.name());
-    // Where the program starts again, as the state said when it quit: read
-    // once the window is gone.
-    let relaunch: Arc<std::sync::Mutex<Option<Relaunch>>> = Arc::default();
-    let universe = Universe::new(app.root().to_owned());
-    let plan = Plan::new(app.root().to_owned());
-    // The front ends kept from the last session: the App view is among
-    // the views at once.
-    let mut app_view = app_view::AppView::new(app.root().to_owned());
-    app.front_end_found(app_view.found());
-    // Chrome's DevTools, reached by the App view's preview; the port is
-    // given once, for as long as the program runs.
-    let chrome_found = chrome_found();
-    let devtools = devtools_port().filter(|_| chrome_found);
-    app_view.devtools = devtools;
-    app_view.chrome = chrome_found;
-    let mut chrome = CommandLineConfig::default();
-    if let Some(port) = devtools {
-        let port: &'static str = Box::leak(port.to_string().into_boxed_str());
-        chrome = chrome.with_switch_value("remote-debugging-port", port);
+/// When Bevy stops with an error: the window could not be opened, or a
+/// system failed.
+pub fn run(mut app: App) -> Result<(), GuiError> {
+    if let Err(why) = composite_alpha() {
+        app.opaque_only(why);
     }
-    let chrome = chrome_found.then(|| CefPlugin {
-        command_line_config: chrome,
-        // In universe's own folder, which only its owner may read.
-        root_cache_path: crate::infra::base().map(|base| base.join("cef").display().to_string()),
-        ..default()
-    });
+    let title = format!("{} · universe", app.project());
+    let universe = Universe::new(app.root().to_owned());
     let shell = Shell {
-        plan,
+        host: Host::new(app.root()),
+        plan: Plan::new(app.root().to_owned()),
         api: api_view::ApiView::default(),
-        review: review_view::ReviewView::default(),
         database: database_view::DatabaseView::default(),
-        app_view,
         services: services_view::ServicesView::default(),
         infra: infra::Infra::new(app.root().to_owned()),
         app,
-        host,
-        runtime,
-        effects: Vec::new(),
         keys: Vec::new(),
-        usage: UsageView::default(),
-        scroll_seen: 0,
-        sub_seen: 0,
-        diffs: diff_view::DiffView::default(),
-        followed: None,
         wheel_rest: 0.0,
-        transcript_rows: 0,
-        relaunch: Arc::clone(&relaunch),
-        diagrams,
-        branch: branch_pane::BranchPane::default(),
-        bullets_moving: false,
-        viewer: None,
-        tickets: tickets_pane::TicketsPane::default(),
         typing: false,
     };
 
@@ -270,8 +147,8 @@ where
                     ..default()
                 })
                 // Pipelined, a frame reaches the screen only when the next
-                // one runs; the window sleeps between keys, so a character
-                // typed showed only at the next wake.
+                // one runs; the window sleeps between keys, so a key
+                // pressed showed only at the next wake.
                 .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )
         .add_plugins(EguiPlugin::default())
@@ -294,146 +171,66 @@ where
         .add_systems(
             Update,
             (
-                read_keys::<M, D>,
-                drive::<M, D>,
+                read_keys,
+                drive,
                 universe::show_or_hide,
                 fleet_view::spawn,
-                universe_activity::<M, D>,
                 universe::animate,
                 fleet_view::animate,
             )
                 .chain(),
         )
-        .add_systems(
-            EguiPrimaryContextPass,
-            (draw::<M, D>, note_typing::<M, D>.after(draw::<M, D>)),
-        )
-        .add_systems(Last, close_or_reopen::<M, D>)
+        .add_systems(EguiPrimaryContextPass, (draw, note_typing.after(draw)))
+        .add_systems(Last, close_or_reopen)
         .add_systems(
             PreUpdate,
             follow_new_window.before(EguiPreUpdateSet::InitContexts),
         )
         .add_systems(
             PostUpdate,
-            copy_selection::<M, D>.after(EguiPostUpdateSet::ProcessOutput),
+            copy_selection.after(EguiPostUpdateSet::ProcessOutput),
         );
-    if let Some(chrome) = chrome {
-        window
-            .add_plugins(chrome)
-            .add_systems(
-                Update,
-                (
-                    app_page::<M, D>.after(drive::<M, D>),
-                    keep_universe_keys.before(KeyboardDeliverSet),
-                ),
-            )
-            .add_systems(
-                EguiPrimaryContextPass,
-                give_keys_back::<M, D>.after(draw::<M, D>),
-            );
-    }
-    let exit = window.run();
-    match exit {
-        AppExit::Success => Ok(relaunch.lock().ok().and_then(|mut r| r.take())),
+    match window.run() {
+        AppExit::Success => Ok(()),
         AppExit::Error(code) => Err(GuiError::Exited(code.get())),
     }
 }
 
 /// The state, the host that carries out its effects, and what the window
 /// remembers between frames. Not `Send`: the state is the main thread's.
-struct Shell<M, D> {
+struct Shell {
     app: App,
-    host: Host<M, D>,
-    runtime: Handle,
-    /// Effects asked for by a click, carried out on the next frame.
-    effects: Vec<Effect>,
+    host: Host,
     /// Keys typed by a button, for the state on the next frame.
     keys: Vec<KeyEvent>,
-    usage: UsageView,
-    /// The codebase's plan, drawn by egui alone.
+    /// The codebase's plan, drawn by egui alone; the other views read its
+    /// map.
     plan: Plan,
     /// The codebase's API, from the plan's map.
     api: api_view::ApiView,
-    /// What the branch looked at changed, read.
-    review: review_view::ReviewView,
     /// The tables the project's models define.
     database: database_view::DatabaseView,
-    /// The front end running, as the App view draws it.
-    app_view: app_view::AppView,
     /// The services the project runs, and who reaches whom.
     services: services_view::ServicesView,
     /// Where the project runs, read on threads of their own.
     infra: infra::Infra,
-    /// The conversation's scroll as the state last had it, in lines: a key
-    /// that scrolls changes it, and the view follows by the difference.
-    scroll_seen: usize,
-    /// The same for the sub-agent pane.
-    sub_seen: usize,
-    /// A pull request's diff, while one is reviewed.
-    diffs: diff_view::DiffView,
-    /// The file the tree last followed in it.
-    followed: Option<String>,
-    /// Whether a field of egui's has the keys, as last drawn: what is typed
-    /// there is not universe's.
-    typing: bool,
-    /// How many lines the conversation scrolls through, as last drawn.
-    transcript_rows: usize,
     /// What the wheel or the touchpad moved short of a whole line, kept for
     /// the next move: a touchpad sends many small ones.
     wheel_rest: f32,
-    /// Where the program starts again once the window is gone.
-    relaunch: Arc<std::sync::Mutex<Option<Relaunch>>>,
-    /// The Mermaid diagrams of the conversation, drawn on threads.
-    diagrams: diagrams::Diagrams,
-    /// What the branch changed, as its pane shows it.
-    branch: branch_pane::BranchPane,
-    /// Whether a moving bullet was in view when the window last drew: it
-    /// wakes then as a moving background does.
-    bullets_moving: bool,
-    /// An image shown whole over the window, while it is.
-    viewer: Option<viewer::Viewer>,
-    /// The branch's tickets, as their pane shows them.
-    tickets: tickets_pane::TicketsPane,
+    /// Whether a field of egui's has the keys, as last drawn: what is typed
+    /// there is not universe's.
+    typing: bool,
 }
 
-impl<M, D> Shell<M, D>
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    /// Carries out `effect`, and what is due on every turn, on the runtime.
-    /// Quick: what needs the conversation while a request runs waits.
-    fn carry_out(&mut self, effect: Option<Effect>) {
-        let Self {
-            app, host, runtime, ..
-        } = self;
-        runtime.block_on(host.carry_out(app, effect));
+impl Shell {
+    /// Carries out `effect`, without waiting.
+    fn carry_out(&mut self, effect: Effect) {
+        let Self { app, host, .. } = self;
+        host.carry_out(app, effect);
     }
 
     fn key(&mut self, key: KeyEvent) {
-        let effect = self.app.on_key(key);
-        self.carry_out(effect);
-    }
-
-    /// Applies whatever the agent and the timers said since the last frame,
-    /// without waiting for more.
-    fn drain(&mut self) {
-        loop {
-            let waiting = Waiting::of(&self.app);
-            let Self {
-                app, host, runtime, ..
-            } = self;
-            let incoming = runtime.block_on(async {
-                tokio::select! {
-                    biased;
-                    incoming = host.next(waiting) => Some(incoming),
-                    () = std::future::ready(()) => None,
-                }
-            });
-            let Some(incoming) = incoming else {
-                return;
-            };
-            let effect = runtime.block_on(host.receive(app, incoming));
+        if let Some(effect) = self.app.on_key(key) {
             self.carry_out(effect);
         }
     }
@@ -486,24 +283,6 @@ fn keep_panels_over(universe: &Universe, opaque: bool, camera: &mut Mut<Camera>)
     }
 }
 
-/// Lights the files the agent works on in the universe.
-fn universe_activity<M, D>(
-    shell: NonSend<Shell<M, D>>,
-    mut universe: ResMut<Universe>,
-    mut commands: Commands,
-    assets: Option<Res<Assets3d>>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    universe::light_up(
-        &mut universe,
-        shell.app.transcript(),
-        &mut commands,
-        assets.as_deref(),
-    );
-}
-
 /// Drops the modifiers bevy_egui reports every frame when they did not
 /// change. egui takes any event as a reason to draw again at once, so that
 /// one, sent each frame, kept the window from ever sleeping: two cores busy
@@ -542,16 +321,12 @@ fn quiet_modifiers(mut inputs: Query<&mut EguiInput>, mut last: Local<Option<egu
 ///
 /// The modifiers are followed through the events in their order rather
 /// than read once a frame: Ctrl pressed and released within one frame, as
-/// a quick Ctrl-O is, would otherwise be missed.
-fn read_keys<M, D>(
+/// a quick Ctrl-N is, would otherwise be missed.
+fn read_keys(
     mut pressed: MessageReader<KeyboardInput>,
     mut held: Local<Held>,
-    mut shell: NonSendMut<Shell<M, D>>,
-    page: Option<Res<FocusedWebview>>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
+    mut shell: NonSendMut<Shell>,
+) {
     for event in pressed.read() {
         let down = event.state == ButtonState::Pressed;
         match event.key_code {
@@ -561,30 +336,9 @@ fn read_keys<M, D>(
             PhysicalKey::SuperLeft | PhysicalKey::SuperRight => held.command = down,
             _ => {}
         }
-        if !down {
-            continue;
-        }
-        // An image shown whole takes the keys: none reaches the state
-        // behind it.
-        if let Some(shown) = &mut shell.viewer {
-            match &event.logical_key {
-                Key::Escape => shell.viewer = None,
-                Key::Character(c) => match c.as_str() {
-                    "f" | "F" | "0" => shown.fit(),
-                    "+" | "=" => shown.zoom(viewer::STEP),
-                    "-" | "_" => shown.zoom(1.0 / viewer::STEP),
-                    _ => {}
-                },
-                _ => {}
-            }
-            continue;
-        }
-        // The App view's page has the keys once clicked, and a field of
-        // egui's once focused, but universe's own that move between views:
-        // theirs, not the page's.
-        if (shell.typing || page.as_ref().is_some_and(|p| p.0.is_some()))
-            && !(held.control && matches!(event.key_code, PhysicalKey::KeyJ | PhysicalKey::KeyN))
-        {
+        // A field of egui's has the keys once focused, but universe's own
+        // that move between views.
+        if !down || (shell.typing && !(held.control && event.key_code == PhysicalKey::KeyN)) {
             continue;
         }
         match keys::translate(&event.logical_key, *held) {
@@ -599,49 +353,29 @@ fn read_keys<M, D>(
     }
 }
 
-/// Once a frame: what the buttons asked for, what the agent said, what the
-/// state queued; then the window's title, how long it may sleep, and
+/// Once a frame: what the buttons asked for, what the lookups found, what
+/// the state queued; then the window's title, how long it may sleep, and
 /// whether to quit.
-fn drive<M, D>(
-    mut shell: NonSendMut<Shell<M, D>>,
+fn drive(
+    mut shell: NonSendMut<Shell>,
     mut exit: MessageWriter<AppExit>,
     mut winit: ResMut<WinitSettings>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut universe: ResMut<Universe>,
     fleet: Res<fleet_view::FleetView>,
     mut panels: Query<&mut Camera, With<Camera2d>>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
+) {
     for key in std::mem::take(&mut shell.keys) {
         shell.key(key);
     }
-    for effect in std::mem::take(&mut shell.effects) {
-        shell.carry_out(Some(effect));
-    }
-    shell.drain();
-    while let Some(effect) = shell.app.take_queued() {
-        shell.carry_out(Some(effect));
-    }
-    shell.carry_out(None);
-
-    let title = format!("{} · universe", shell.app.name());
-    if window.title != title {
-        window.title = title;
-    }
-    // The App view's wait moves until its first page has loaded; then
-    // Chrome draws the page, and the pilot only follows what it tells.
-    let app_view = shell.app.map_view() == Some(MapView::App);
-    let preview = shell.app.app_preview();
-    let wait = if app_view && preview.page_shown() {
-        PAGE_WAIT
-    } else if app_view && preview.is_on() {
-        FRAME_WAIT
-    } else if (app_view && preview.is_on())
-        || shell.app.is_running()
-        || shell.app.docker().is_some()
     {
+        let Shell { app, host, .. } = &mut *shell;
+        host.receive(app);
+    }
+    while let Some(effect) = shell.app.take_queued() {
+        shell.carry_out(effect);
+    }
+
+    let wait = if shell.app.is_looking() {
         BUSY_WAIT
     } else if shell.app.mode() != Mode::Normal {
         BLINK
@@ -657,14 +391,13 @@ fn drive<M, D>(
     }
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
-    // the time, and only it draws without rest.
-    // A service's board is flat: the space behind it rests.
+    // the time, and only it draws without rest; a service's board is flat,
+    // and the space behind it rests.
     let continuous = shown && (!fleet.active || fleet.moving());
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
-    let moving =
-        backdrop.pattern.is_some() && backdrop.motion == Motion::Slow || shell.bullets_moving;
+    let moving = backdrop.pattern.is_some() && backdrop.motion == Motion::Slow;
     let focused = if continuous {
         UpdateMode::Continuous
     } else if moving {
@@ -681,30 +414,21 @@ fn drive<M, D>(
         };
     }
     if shell.app.should_quit() {
-        if let Some(relaunch) = shell.app.take_relaunch()
-            && let Ok(mut kept) = shell.relaunch.lock()
-        {
-            *kept = Some(relaunch);
-        }
         exit.write(AppExit::Success);
     }
 }
 
 /// Draws the state. Changes nothing in it but what only the drawing knows:
-/// how far the conversation and the panes scroll.
-fn draw<M, D>(
+/// what was clicked, and how far the panes scroll.
+fn draw(
     mut contexts: EguiContexts,
-    mut shell: NonSendMut<Shell<M, D>>,
+    mut shell: NonSendMut<Shell>,
     mut universe: ResMut<Universe>,
     mut fleet: ResMut<fleet_view::FleetView>,
     mut styled: Local<bool>,
     mut followed: Local<f32>,
     window: Query<Entity, With<PrimaryWindow>>,
-) -> Result
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
+) -> Result {
     let ctx = contexts.ctx_mut()?.clone();
     if !*styled {
         ctx.set_theme(egui::Theme::Dark);
@@ -723,13 +447,6 @@ where
         ctx.set_zoom_factor(size);
     }
     let shell = &mut *shell;
-    // Left by the last frame's bullets, and taken: only those drawn again
-    // keep the window awake.
-    shell.bullets_moving = ctx
-        .data_mut(|d| d.remove_temp::<bool>(Id::new(bullets::MOVING)))
-        .unwrap_or(false);
-    // The conversation's diagrams, for the Markdown that draws them.
-    ctx.data_mut(|d| d.insert_temp(Id::new("diagrams"), shell.diagrams.clone()));
     let mut root = Ui::new(
         ctx.clone(),
         Id::new("universe"),
@@ -775,161 +492,23 @@ where
         )
         .show_separator_line(false)
         .show(&mut root, |ui| status(ui, &shell.app));
-    egui::Panel::bottom("input")
-        .frame(
-            Frame::new()
-                .fill(panel)
-                .inner_margin(Margin::symmetric(14, 10)),
-        )
-        .show(&mut root, |ui| {
-            activity(ui, &shell.app);
-            input(ui, &shell.app);
-        });
-    // The containers (Ctrl-K) along the bottom, above the message box; not
-    // over the codebase's views, nor while the conversation has the window
-    // to itself (Ctrl-Z).
-    let zoomed = shell.app.is_zoomed();
-    let containers = shell.app.docker().map(|d| d.containers.len());
-    if let Some(containers) = containers
-        && shell.app.map_view().is_none()
-        && !zoomed
-    {
-        let height = docker_pane::height(&root, containers, root.available_height());
-        let Shell { app, keys, .. } = &mut *shell;
-        let clicked = egui::Panel::bottom("docker")
-            .resizable(true)
-            .default_size(height)
-            .frame(
-                pane.fill(background)
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .stroke(Stroke::new(1.0, EDGE)),
-            )
-            .show(&mut root, |ui| docker_pane::show(ui, app, keys))
-            .inner;
-        match clicked {
-            Some(docker_pane::Clicked::Container(i)) => shell.app.click_container(i),
-            Some(docker_pane::Clicked::Pane) => shell.app.click_pane(Focus::Docker),
-            None => {}
-        }
-    }
 
-    match shell.app.usage_pane() {
-        Some((log, window)) => {
-            // Slides in from the right as it opens.
-            let open = ctx.animate_bool_with_time(Id::new("usage-open"), true, 0.25);
-            egui::Panel::right("usage")
-                .resizable(false)
-                .exact_size(USAGE_WIDTH * open)
-                .frame(
-                    pane.fill(if shell.app.map_view() == Some(MapView::Universe) {
-                        // Over the universe, it lets the stars show through.
-                        theme::see(PANEL, 0.62 * opacity)
-                    } else {
-                        background
-                    })
-                    .stroke(Stroke::new(1.0, EDGE)),
-                )
-                .show(&mut root, |ui| {
-                    ScrollArea::vertical().show(ui, |ui| match shell.app.usage_page() {
-                        UsagePage::Costs => usage::show(ui, &mut shell.usage, log, window),
-                        UsagePage::Subscriptions => subscriptions_page::show(ui, &shell.app),
-                    });
-                });
-        }
-        None => {
-            ctx.animate_bool_with_time(Id::new("usage-open"), false, 0.0);
-            shell.usage.closed();
-        }
-    }
-    // What the branch changed (Ctrl-R), on the right, read on a thread.
-    let project = shell.app.root().to_owned();
-    shell
-        .branch
-        .review
-        .update(&project, shell.app.branch_pane());
-    if shell.app.branch_pane().is_some() {
-        let fill = if shell.app.map_view() == Some(MapView::Universe) {
-            theme::see(PANEL, 0.62 * opacity)
-        } else {
-            background
-        };
-        let Shell {
-            branch,
-            plan,
-            database,
-            app,
-            effects,
-            ..
-        } = &mut *shell;
-        egui::Panel::right("branch")
-            .resizable(true)
-            .default_size(USAGE_WIDTH)
-            .frame(pane.fill(fill).stroke(Stroke::new(1.0, EDGE)))
-            .show(&mut root, |ui| {
-                ScrollArea::vertical().show(ui, |ui| {
-                    branch_pane::show(ui, branch, plan.map(), database, app, effects);
-                });
-            });
-    }
-
-    // The branch's tickets (Ctrl-L) on the right; an item's or a file's
-    // pieces of the diff in the conversation's place, further down.
-    if shell.app.tickets_open() {
-        let fill = if shell.app.map_view() == Some(MapView::Universe) {
-            theme::see(PANEL, 0.62 * opacity)
-        } else {
-            background
-        };
-        let Shell {
-            tickets,
-            app,
-            effects,
-            ..
-        } = &mut *shell;
-        egui::Panel::right("tickets")
-            .resizable(true)
-            .default_size(USAGE_WIDTH)
-            .frame(pane.fill(fill).stroke(Stroke::new(1.0, EDGE)))
-            .show(&mut root, |ui| {
-                ScrollArea::vertical().show(ui, |ui| {
-                    tickets_pane::show(ui, tickets, app, effects);
-                });
-            });
-    }
-    let pieces = shell.app.tickets_open() && shell.app.ticket_view().is_some();
-    if !pieces {
-        // Shown again, they start at the top.
-        shell.tickets.hidden();
-    }
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
-    shell.review.update(&project, shell.app.change_set());
+    // The plan's map is read while a view needs it: the deployments need
+    // the services to render environments.
     shell.plan.showing(
         matches!(
             view,
-            Some(
-                MapView::Plan
-                    | MapView::Services
-                    | MapView::Api
-                    | MapView::Review
-                    | MapView::Database
-                    | MapView::App
-            ) // The deployments need the services to render environments; the
-              // branch's pane, what serves and calls its routes.
-        ) || (view == Some(MapView::Universe) && fleet.active)
-            || shell.app.branch_pane().is_some(),
+            Some(MapView::Plan | MapView::Services | MapView::Api | MapView::Database)
+        ) || (view == Some(MapView::Universe) && fleet.active),
         now,
-        shell.app.transcript(),
     );
     shell.plan.take_read(now);
-    shell.app_view.update(&shell.plan, &mut shell.app);
     if view == Some(MapView::Database) {
         shell.database.update(&shell.plan);
     }
-    shell.plan.light_up(shell.app.transcript(), now);
     if let Some(view) = view {
-        // The codebase takes the whole window, which a small screen needs;
-        // ✕ Chat in the views' switch, or a message sent, comes back.
         let window = ctx.content_rect().width().max(1.0);
         let free = root.available_rect_before_wrap();
         universe.covered = (ctx.content_rect().right() - free.right()).max(0.0) / window;
@@ -937,14 +516,7 @@ where
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
-                MapView::Plan
-                | MapView::Services
-                | MapView::Api
-                | MapView::Review
-                | MapView::Database => Frame::NONE.fill(background),
-                // Painted by the view around its page, which Chrome draws
-                // underneath.
-                MapView::App => Frame::NONE,
+                _ => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe if fleet.active => {
@@ -959,19 +531,12 @@ where
                     }
                 }
                 MapView::Universe => {
-                    if universe_view(ui, &mut universe, &mut shell.app) {
+                    if universe_view::show(ui, &mut universe, &mut shell.app) {
                         fleet.active = true;
                     }
                 }
                 MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
-                MapView::Api => api_view::show(
-                    ui,
-                    &mut shell.api,
-                    &shell.plan,
-                    &shell.review,
-                    &mut shell.app,
-                    &mut shell.effects,
-                ),
+                MapView::Api => api_view::show(ui, &mut shell.api, &shell.plan, &mut shell.app),
                 MapView::Services => services_view::show(
                     ui,
                     &mut shell.services,
@@ -981,154 +546,42 @@ where
                     &mut shell.app,
                 ),
                 MapView::Database => {
-                    database_view::show(ui, &mut shell.database, &shell.review, &mut shell.app);
-                }
-                MapView::App => app_view::show(
-                    ui,
-                    &mut shell.app_view,
-                    &shell.plan,
-                    &mut shell.app,
-                    &mut shell.effects,
-                    background,
-                ),
-                MapView::Review => review_view::show(
-                    ui,
-                    &mut shell.review,
-                    &mut shell.api,
-                    &shell.plan,
-                    &mut shell.app,
-                ),
-            });
-    } else if shell.app.tree().is_some() && !zoomed {
-        egui::Panel::left("tree")
-            .default_size(280.0)
-            .frame(pane)
-            .show(&mut root, |ui| {
-                // While a pull request's diff shows, a file of the tree is a
-                // place in it rather than a file to open.
-                let pulled = shell.app.change_set().is_some_and(|c| c.pull.is_some())
-                    && shell.app.file().is_none();
-                let diffs = pulled.then_some(&mut shell.diffs);
-                tree(
-                    ui,
-                    &mut shell.app,
-                    &mut shell.wheel_rest,
-                    &mut shell.keys,
-                    diffs,
-                );
-            });
-    }
-    // A pull request reviewed: its diff, the tree following the file read.
-    let pulled = shell.app.change_set().filter(|c| c.pull.is_some()).cloned();
-    shell.diffs.update(pulled.as_ref());
-    if let Some(current) = shell.diffs.current().map(str::to_owned)
-        && shell.followed.as_deref() != Some(current.as_str())
-    {
-        shell.app.follow_in_tree(&current);
-        shell.followed = Some(current);
-    }
-    if view.is_some() {
-    } else if pulled.is_some() && shell.app.file().is_none() && !zoomed {
-        // The conversation under the diff, resizable.
-        let height = ctx.content_rect().height() * 0.35;
-        egui::Panel::bottom("pull-chat")
-            .resizable(true)
-            .default_size(height)
-            .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
-            .show(&mut root, |ui| conversation(ui, shell));
-        egui::CentralPanel::default()
-            .frame(pane.fill(background))
-            .show(&mut root, |ui| {
-                let Shell {
-                    diffs,
-                    review,
-                    app,
-                    effects,
-                    ..
-                } = &mut *shell;
-                // Summarized once the diff and its areas are read.
-                if !app.summaries_asked()
-                    && diffs.is_read()
-                    && let Some(read) = review.review()
-                    && let Some(effect) = app.ask_summaries(diffs.area_diffs(read))
-                {
-                    effects.push(effect);
-                }
-                let picked = app
-                    .picked_lines()
-                    .map(|(path, first, last)| (path.to_owned(), first, last));
-                let picked = picked
-                    .as_ref()
-                    .map(|(path, first, last)| (path.as_str(), *first, *last));
-                let summaries = app.summaries().cloned();
-                let shown: &App = app;
-                let mut drawn = Vec::new();
-                let mut markdown =
-                    |ui: &mut Ui, text: &str| transcript::markdown(ui, shown, text, &mut drawn);
-                let pick = ScrollArea::vertical()
-                    .id_salt("diff-stream")
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        diffs.show(
-                            ui,
-                            review.review(),
-                            summaries.as_ref(),
-                            &mut markdown,
-                            picked,
-                        )
-                    })
-                    .inner;
-                effects.extend(drawn);
-                if let Some(diff_view::Picked::Line(path, line, extend)) = pick {
-                    app.pick_line(&path, line, extend);
+                    database_view::show(ui, &mut shell.database, &mut shell.app);
                 }
             });
-    } else if shell.app.file().is_some() && !zoomed {
-        chat_beside(&mut root, &ctx, shell, pane);
-        egui::CentralPanel::default()
-            .frame(pane.fill(background))
-            .show(&mut root, |ui| {
-                file(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
-            });
-    } else if pieces {
-        // A ticket's pieces take the conversation's room: beside it, both
-        // were too narrow to read.
-        let Shell { tickets, app, .. } = &mut *shell;
-        egui::CentralPanel::default()
-            .frame(pane.fill(background))
-            .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
     } else {
+        if shell.app.tree().is_some() {
+            egui::Panel::left("tree")
+                .default_size(280.0)
+                .frame(pane)
+                .show(&mut root, |ui| {
+                    tree(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
+                });
+        }
         egui::CentralPanel::default()
             .frame(pane.fill(background))
-            .show(&mut root, |ui| conversation(ui, shell));
+            .show(&mut root, |ui| {
+                if shell.app.file().is_some() {
+                    file(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
+                } else {
+                    backdrop::paint(ui, &shell.app);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "Choose a file in the tree. Ctrl-N goes back to the views",
+                            )
+                            .color(DIM),
+                        );
+                    });
+                }
+            });
     }
 
     if universe.deployments != fleet.active {
         universe.deployments = fleet.active;
     }
-    // A file or commit a reply cites, clicked while drawing.
-    let cited = ctx.data_mut(|d| d.remove_temp::<Option<Reference>>(Id::new(transcript::CITED)));
-    if let Some(reference) = cited.flatten() {
-        if let Some(effect) = shell.app.open_cited(reference) {
-            shell.effects.push(effect);
-        }
-        ctx.request_repaint();
-    }
     windows::show(&ctx, &shell.app, &mut shell.keys);
-    // An image clicked while drawing, shown whole over everything.
-    if let Some(texture) = ctx
-        .data_mut(|d| d.remove_temp::<Option<egui::TextureHandle>>(Id::new(viewer::OPEN)))
-        .flatten()
-    {
-        shell.viewer = Some(viewer::Viewer::new(texture));
-    }
-    if let Some(shown) = &mut shell.viewer
-        && !shown.show(&ctx)
-    {
-        shell.viewer = None;
-        ctx.request_repaint();
-    }
-    if !shell.effects.is_empty() || !shell.keys.is_empty() {
+    if !shell.keys.is_empty() {
         ctx.request_repaint();
     }
     Ok(())
@@ -1139,10 +592,10 @@ fn main_window(title: String) -> Window {
     Window {
         title,
         resolution: (1400, 900).into(),
-        // Made see-through from the start: a window cannot become so
-        // later. Opaque, its panels hide it all.
-        transparent: true,
-        composite_alpha_mode: COMPOSITE_ALPHA,
+        // Made see-through from the start where it can be: a window cannot
+        // become so later. Opaque, its panels hide it all.
+        transparent: composite_alpha().is_ok(),
+        composite_alpha_mode: composite_alpha().unwrap_or(CompositeAlphaMode::Opaque),
         // A see-through window leaves its title bar see-through too: on
         // macOS the content goes under it, and a band of the bar's height
         // is drawn opaque there.
@@ -1155,17 +608,14 @@ fn main_window(title: String) -> Window {
 /// Quits when the window's close button asks; opens the window again when
 /// the system took it away unasked, as unplugging a screen does. Each step
 /// is logged.
-fn close_or_reopen<M, D>(
+fn close_or_reopen(
     mut commands: Commands,
     mut requested: MessageReader<bevy::window::WindowCloseRequested>,
     mut closed: MessageReader<bevy::window::WindowClosed>,
     mut destroyed: MessageReader<bevy::window::WindowDestroyed>,
     windows: Query<(), With<PrimaryWindow>>,
-    mut shell: NonSendMut<Shell<M, D>>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
+    mut shell: NonSendMut<Shell>,
+) {
     if requested.read().next().is_some() {
         warn!("the window's close button was pressed: quitting");
         shell.app.quit();
@@ -1173,7 +623,7 @@ fn close_or_reopen<M, D>(
     let gone = closed.read().count() + destroyed.read().count() > 0;
     if gone && !shell.app.should_quit() && windows.is_empty() {
         warn!("the system took the window away unasked: opening it again");
-        let title = format!("{} · universe", shell.app.name());
+        let title = format!("{} · universe", shell.app.project());
         commands.spawn((main_window(title), PrimaryWindow));
     }
 }
@@ -1215,13 +665,7 @@ fn follow_new_window(
 /// copy button, to the system's clipboard: bevy_egui is built without its
 /// own. egui copies a label's selection only at the end of its pass, so it
 /// is read once the output is processed, never while drawing.
-fn copy_selection<M, D>(
-    outputs: Query<&EguiOutput, Changed<EguiOutput>>,
-    mut shell: NonSendMut<Shell<M, D>>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
+fn copy_selection(outputs: Query<&EguiOutput, Changed<EguiOutput>>, mut shell: NonSendMut<Shell>) {
     for output in &outputs {
         for command in &output.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = command
@@ -1233,709 +677,21 @@ fn copy_selection<M, D>(
     }
 }
 
-/// The height of macOS's title bar, in points.
-const TITLE_BAR: f32 = 28.0;
-
-/// The conversation's width beside a file or the codebase, until dragged.
-const CHAT_WIDTH: f32 = 440.0;
-
-/// The conversation on the right, beside a file or the codebase, as wide
-/// as it was last dragged, in this session or the last.
-fn chat_beside<M, D>(
-    root: &mut Ui,
-    ctx: &egui::Context,
-    shell: &mut Shell<M, D>,
-    frame: Frame,
-) -> egui::InnerResponse<()>
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    let window = ctx.content_rect().width();
-    let wanted = shell.app.chat_width().unwrap_or(CHAT_WIDTH);
-    let chat = egui::Panel::right("chat-beside")
-        .default_size(wanted)
-        .size_range(260.0..=(window * 0.75).max(260.0))
-        .frame(frame)
-        .show(root, |ui| conversation(ui, shell));
-    // Kept once let go: while dragged, it changes every frame.
-    let width = chat.response.rect.width();
-    let held = ctx.input(|i| i.pointer.any_down());
-    if !held && (width - wanted).abs() >= 1.0 {
-        shell.app.set_chat_width(width);
+/// Notes whether a field of egui's has the keys, for the next frame's keys.
+fn note_typing(mut contexts: EguiContexts, mut shell: NonSendMut<Shell>) -> Result {
+    let typing = contexts.ctx_mut()?.egui_wants_keyboard_input();
+    if shell.typing != typing {
+        shell.typing = typing;
     }
-    chat
+    Ok(())
 }
 
-/// The most files a narrowed universe names all of.
-const FEW_NAMED: usize = 40;
-
-/// The universe's own controls: dragging turns it, the wheel comes closer,
-/// a click centres a star, a double click opens its file, a click on a
-/// galaxy's name enters it. Names show for each galaxy, for the star under
-/// the pointer, the one chosen, and those the agent just touched. Returns
-/// whether the deployments were asked for.
-fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) -> bool {
-    universe.search(app.map_search());
-    let changed: Vec<String> = app
-        .change_set()
-        .map(|c| c.files.iter().map(|f| f.path.clone()).collect())
-        .unwrap_or_default();
-    universe.show_changes(&changed);
-    let rect = ui.max_rect();
-    let response = ui.allocate_rect(
-        rect.with_max_x(rect.max.x - plan::EDGE_GRIP),
-        egui::Sense::click_and_drag(),
-    );
-    if response.dragged() {
-        let delta = response.drag_delta();
-        universe.drag += Vec2::new(delta.x, delta.y);
-    }
-    if response.hovered() {
-        universe.zoom += ui.input(|i| i.smooth_scroll_delta.y);
-    }
-    let pointer = response.hover_pos();
-    // Only the stars of the galaxy entered can be picked: the others are
-    // background.
-    universe.hovered = pointer.and_then(|at| {
-        universe
-            .on_screen
-            .iter()
-            .enumerate()
-            .filter(|(node, _)| universe.lit(*node))
-            .filter_map(|(node, p)| p.map(|p| (node, egui::pos2(p.x, p.y).distance(at))))
-            .filter(|(_, d)| *d < 18.0)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(node, _)| node)
-    });
-    if response.double_clicked()
-        && let Some(node) = universe.hovered
-        && let Some(map) = universe.map()
-        && matches!(map.nodes[node].kind, NodeKind::File { .. })
-    {
-        let path = universe.root().join(&map.nodes[node].path);
-        app.open_path(path);
-        app.show_map(None);
-    } else if response.clicked() {
-        // A click frames again: the star chosen, or the whole.
-        universe.chosen = universe.hovered;
-        universe.zoomed = false;
-    }
-
-    let painter = ui.painter_at(rect);
-    let Some(map) = universe.map() else {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Mapping the codebase…",
-            egui::FontId::proportional(18.0),
-            DIM,
-        );
-        return false;
-    };
-    // The names worth reading: under the pointer, chosen, or just touched;
-    // and every file's, faint, once few enough are looked at to read them
-    // all and no galaxy names them.
-    let lit_files = (0..map.nodes.len())
-        .filter(|n| universe.lit(*n))
-        .filter(|n| matches!(map.nodes[*n].kind, NodeKind::File { .. }))
-        .count();
-    let few =
-        (universe.grouping().groups.is_empty() || universe.searching() || universe.shows_changes())
-            && lit_files <= FEW_NAMED;
-    for (node, at) in universe.on_screen.iter().enumerate() {
-        let Some(at) = at else {
-            continue;
-        };
-        let glow = universe.glow(node);
-        let picked = universe.hovered == Some(node) || universe.chosen == Some(node);
-        let named =
-            few && universe.lit(node) && matches!(map.nodes[node].kind, NodeKind::File { .. });
-        if !picked && glow < 1.0 && !named {
-            continue;
-        }
-        let entry = &map.nodes[node];
-        let [r, g, b] = universe.tint(node);
-        let fade = if picked {
-            1.0
-        } else {
-            (glow / 8.0).clamp(0.25, 1.0)
-        };
-        let colour = Color32::from_rgb(r, g, b).gamma_multiply(0.4 + 0.6 * fade);
-        let text = if picked {
-            match entry.kind {
-                NodeKind::File { lines, .. } => format!("{}  ·  {lines} lines", entry.path),
-                NodeKind::Folder => format!(
-                    "{}/",
-                    if entry.path.is_empty() {
-                        "."
-                    } else {
-                        &entry.path
-                    }
-                ),
-            }
-        } else {
-            entry.name().to_owned()
-        };
-        let at = egui::pos2(at.x + 12.0, at.y - 10.0);
-        let font = egui::FontId::proportional(if picked { 15.0 } else { 13.0 });
-        shadowed(&painter, at, egui::Align2::LEFT_BOTTOM, &text, font, colour);
-    }
-
-    // Each galaxy's name above it, to click to enter it.
-    let mut enter = None;
-    let groups = universe.grouping().groups.clone();
-    for (galaxy, group) in groups.iter().enumerate() {
-        let Some(at) = universe.galaxies_on_screen.get(galaxy).copied().flatten() else {
-            continue;
-        };
-        let at = egui::pos2(at.x, at.y);
-        if !rect.contains(at) {
-            continue;
-        }
-        // Searched, how many of its files are found: a galaxy with none
-        // fades, its name too.
-        let found = (universe.searching() || universe.shows_changes()).then(|| {
-            (0..map.nodes.len())
-                .filter(|&n| {
-                    universe.lit(n) && universe.grouping().of(n).map(|g| g.0) == Some(galaxy)
-                })
-                .filter(|&n| matches!(map.nodes[n].kind, NodeKind::File { .. }))
-                .count()
-        });
-        // A galaxy with nothing found or changed is background: unnamed.
-        if found == Some(0) {
-            continue;
-        }
-        let [r, g, b] = universe.galaxy_colour(galaxy);
-        let colour = Color32::from_rgb(r, g, b);
-        let name = egui::FontId::proportional(16.0);
-        let galley = painter.layout_no_wrap(group.label.clone(), name.clone(), colour);
-        let area = egui::Rect::from_center_size(
-            at + egui::vec2(0.0, -galley.size().y / 2.0),
-            galley.size() + egui::vec2(12.0, 6.0),
-        );
-        let openable = group.key.is_some();
-        let label = ui.interact(
-            area,
-            Id::new(("galaxy", galaxy)),
-            if openable {
-                egui::Sense::click()
-            } else {
-                egui::Sense::hover()
-            },
-        );
-        let lit = openable && label.hovered();
-        if lit {
-            painter.rect_filled(area, 6.0, Color32::from_black_alpha(160));
-            painter.rect_stroke(
-                area,
-                6.0,
-                Stroke::new(1.0, colour.gamma_multiply(0.7)),
-                egui::StrokeKind::Inside,
-            );
-        }
-        shadowed(
-            &painter,
-            at,
-            egui::Align2::CENTER_BOTTOM,
-            &group.label,
-            name,
-            if lit {
-                colour
-            } else {
-                colour.gamma_multiply(0.85)
-            },
-        );
-        let files = if let Some(found) = found {
-            let word = if universe.searching() {
-                "found"
-            } else {
-                "changed"
-            };
-            format!("{found} of {} {word}", group.files)
-        } else if group.files == 1 {
-            "1 file".to_owned()
-        } else {
-            format!("{} files", group.files)
-        };
-        shadowed(
-            &painter,
-            at + egui::vec2(0.0, 2.0),
-            egui::Align2::CENTER_TOP,
-            &files,
-            egui::FontId::proportional(11.0),
-            DIM,
-        );
-        let label = label.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if label.clicked() {
-            enter = Some(galaxy);
-        }
-    }
-
-    // What the universe is, in the corner: the way in, what it holds, what
-    // it is grouped by, and what the colours mean.
-    let inside = |node: &usize| universe.grouping().inside(*node);
-    let files = (0..map.nodes.len())
-        .filter(inside)
-        .filter(|n| matches!(map.nodes[*n].kind, NodeKind::File { .. }))
-        .count();
-    let imports = map
-        .edges
-        .iter()
-        .filter(|e| e.kind == universe_codemap::EdgeKind::Imports)
-        .filter(|e| inside(&e.from) && inside(&e.to))
-        .count();
-    let left_out = map.left_out;
-    let corner = rect.left_top() + egui::vec2(24.0, 22.0);
-    let path: Vec<String> = universe.path().map(str::to_owned).collect();
-    let mut leave = None;
-    ui.scope_builder(
-        UiBuilder::new()
-            .max_rect(egui::Rect::from_min_size(corner, egui::vec2(560.0, 34.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            // Inside a galaxy, the way back out is a button, not only the
-            // path: one level up.
-            if !path.is_empty() {
-                let back = egui::Button::new(RichText::new("‹ Back").size(14.0).color(TEXT))
-                    .fill(theme::see(RAISED, 0.9))
-                    .stroke(Stroke::new(1.0, EDGE))
-                    .corner_radius(6.0);
-                if ui
-                    .add(back)
-                    .on_hover_text("Back out one level")
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    leave = Some(path.len() - 1);
-                }
-                ui.add_space(6.0);
-            }
-            let crumb = |ui: &mut Ui, name: &str, size: f32, last: bool| {
-                if last {
-                    ui.label(RichText::new(name).size(size).color(TEXT));
-                    return false;
-                }
-                // Lit and underlined under the pointer, to read as a link.
-                let id = ui.next_auto_id();
-                let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
-                let mut text =
-                    RichText::new(name)
-                        .size(size)
-                        .color(if hovered { TEXT } else { DIM });
-                if hovered {
-                    text = text.underline();
-                }
-                ui.add(egui::Label::new(text).sense(egui::Sense::click()))
-                    .on_hover_text(format!("Back to {name}"))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-            };
-            if crumb(ui, "Universe", 26.0, path.is_empty()) {
-                leave = Some(0);
-            }
-            for (depth, name) in path.iter().enumerate() {
-                ui.label(RichText::new("›").size(20.0).color(DIM));
-                if crumb(ui, name, 20.0, depth + 1 == path.len()) {
-                    leave = Some(depth + 1);
-                }
-            }
-        },
-    );
-    let mut summary = format!("{} · {files} files · {imports} imports", app.project());
-    if universe.searching() {
-        summary.push_str(&format!(" · {lit_files} found"));
-    } else if universe.shows_changes() {
-        summary.push_str(&format!(" · {lit_files} changed by the branch"));
-    }
-    if left_out > 0 && path.is_empty() {
-        summary.push_str(&format!(" · {left_out} more not shown"));
-    }
-    painter.text(
-        corner + egui::vec2(0.0, 38.0),
-        egui::Align2::LEFT_TOP,
-        summary,
-        egui::FontId::proportional(13.0),
-        DIM,
-    );
-
-    // The criteria, to pick in order: the first makes the galaxies, the
-    // second the clusters within them.
-    let mut toggle = None;
-    let mut deployments = false;
-    let chosen = universe.criteria().to_vec();
-    let applied = universe.grouping().criteria.clone();
-    ui.scope_builder(
-        UiBuilder::new()
-            .max_rect(egui::Rect::from_min_size(
-                corner + egui::vec2(0.0, 60.0),
-                egui::vec2(560.0, 26.0),
-            ))
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new("Group by").size(12.0).color(DIM));
-            for criterion in universe_codemap::Criterion::ALL {
-                let place = chosen.iter().position(|c| *c == criterion);
-                let text = match place {
-                    Some(at) => format!("{} {}", at + 1, criterion.name()),
-                    None => criterion.name().to_owned(),
-                };
-                // Chosen but saying nothing here (one language inside a
-                // language): shown, but dim.
-                let colour = match place {
-                    Some(_) if applied.contains(&criterion) => TEXT,
-                    Some(_) => DIM,
-                    None => DIM,
-                };
-                let button = egui::Button::selectable(
-                    place.is_some(),
-                    RichText::new(text).size(13.0).color(colour),
-                );
-                let hint = match place {
-                    Some(0) => "Makes the galaxies: click to stop grouping by it",
-                    Some(_) => "Makes the clusters within each galaxy, and the colours: click to stop grouping by it",
-                    None if chosen.is_empty() => "Group the stars into galaxies by it",
-                    None => "Group each galaxy's stars into clusters by it",
-                };
-                if ui.add(button).on_hover_text(hint).clicked() {
-                    toggle = Some(criterion);
-                }
-            }
-            ui.add_space(10.0);
-            let button = egui::Button::new(RichText::new("Deployments").size(13.0).color(TEXT))
-                .fill(theme::see(RAISED, 0.9))
-                .stroke(Stroke::new(1.0, EDGE));
-            if ui
-                .add(button)
-                .on_hover_text("Every environment as a galaxy, each service a star")
-                .clicked()
-            {
-                deployments = true;
-            }
-        },
-    );
-
-    // The legend: what the colours mean, each a click away from narrowing
-    // to it, unlike the galaxies' names, which turn with the sky.
-    let mut at = corner + egui::vec2(0.0, 96.0);
-    let legend: Vec<(String, [u8; 3], usize, bool)> = universe
-        .legend()
-        .map(|(name, colour, files, openable)| (name.to_owned(), colour, files, openable))
-        .collect();
-    const SHOWN: usize = 12;
-    let mut narrow = None;
-    for (place, (name, [r, g, b], files, openable)) in legend.iter().enumerate().take(SHOWN) {
-        let colour = Color32::from_rgb(*r, *g, *b);
-        let galley = painter.layout_no_wrap(
-            format!("{name}  {files}"),
-            egui::FontId::proportional(12.0),
-            DIM,
-        );
-        let area = egui::Rect::from_min_size(at, galley.size() + egui::vec2(16.0, 2.0));
-        let lit = *openable
-            && ui
-                .interact(area, Id::new(("legend", place)), egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("Only {name}"))
-                .clicked();
-        if lit {
-            narrow = Some(place);
-        }
-        let hovered = *openable && ui.rect_contains_pointer(area);
-        painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, colour);
-        painter.text(
-            at + egui::vec2(16.0, 0.0),
-            egui::Align2::LEFT_TOP,
-            format!("{name}  {files}"),
-            egui::FontId::proportional(12.0),
-            if hovered { TEXT } else { DIM },
-        );
-        at.y += 18.0;
-    }
-    if legend.len() > SHOWN {
-        painter.text(
-            at + egui::vec2(16.0, 0.0),
-            egui::Align2::LEFT_TOP,
-            format!("and {} more", legend.len() - SHOWN),
-            egui::FontId::proportional(12.0),
-            DIM,
-        );
-        at.y += 18.0;
-    }
-    painter.circle_filled(
-        at + egui::vec2(5.0, 7.0),
-        4.0,
-        Color32::from_rgb(140, 90, 255),
-    );
-    painter.text(
-        at + egui::vec2(16.0, 0.0),
-        egui::Align2::LEFT_TOP,
-        "folders",
-        egui::FontId::proportional(12.0),
-        DIM,
-    );
-    let mut hint = vec!["drag to turn", "scroll to come closer"];
-    if !groups.is_empty() {
-        hint.push("click a galaxy's name to enter it");
-    }
-    if !path.is_empty() {
-        hint.push("‹ Back to come back out");
-    }
-    hint.extend([
-        "click a star to centre it",
-        "double-click to open it",
-        "Ctrl-N to leave",
-    ]);
-    let hint = hint.join(" · ");
-    painter.text(
-        rect.left_bottom() + egui::vec2(24.0, -18.0),
-        egui::Align2::LEFT_BOTTOM,
-        hint,
-        egui::FontId::proportional(12.0),
-        DIM,
-    );
-    plan::switch(ui, rect, app);
-
-    if let Some(criterion) = toggle {
-        universe.toggle(criterion);
-    } else if let Some(depth) = leave {
-        universe.leave(depth);
-    } else if let Some(galaxy) = enter {
-        universe.enter(galaxy);
-    } else if let Some(place) = narrow {
-        universe.enter_legend(place);
-    }
-    deployments
-}
-
-/// `text` with a dark shadow under it, to read over the stars.
-pub(crate) fn shadowed(
-    painter: &egui::Painter,
-    at: egui::Pos2,
-    anchor: egui::Align2,
-    text: &str,
-    font: egui::FontId,
-    colour: Color32,
-) {
-    painter.text(
-        at + egui::vec2(1.0, 1.0),
-        anchor,
-        text,
-        font.clone(),
-        Color32::from_black_alpha(200),
-    );
-    painter.text(at, anchor, text, font, colour);
-}
-
-/// The conversation, following new output unless a key scrolled it back;
-/// under it, the work of a task handed over, while shown.
-fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
-    backdrop::paint(ui, &shell.app);
-    // A task handed to a model of the team (Ctrl-T) takes most of the room:
-    // the conversation keeps a third.
-    if shell.app.sub_agent().is_some() && ui.available_height() >= 240.0 {
-        let height = ui.available_height() * 2.0 / 3.0;
-        let Shell {
-            app,
-            sub_seen,
-            effects,
-            ..
-        } = &mut *shell;
-        let clicked = egui::Panel::bottom("sub-agent")
-            .resizable(true)
-            .default_size(height)
-            .show_separator_line(false)
-            .frame(Frame::NONE.inner_margin(Margin {
-                top: 8,
-                ..Margin::ZERO
-            }))
-            .show(ui, |ui| sub_agent_pane::show(ui, app, sub_seen, effects))
-            .inner;
-        if clicked {
-            shell.app.click_pane(Focus::SubAgent);
-        }
-    }
-    let row = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-    let back = shell.app.scroll_back();
-    let delta = back as f32 - shell.scroll_seen as f32;
-    shell.scroll_seen = back;
-    // Up and down only: a trackpad's sideways drift shook the conversation.
-    // Text wraps at the pane's width; code and tables too wide scroll on
-    // their own cards. Short of the scroll bar.
-    let width = ui.available_width() - ui.spacing().scroll.allocated_width();
-    let output = ScrollArea::vertical()
-        .id_salt("transcript")
-        .stick_to_bottom(true)
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            if delta != 0.0 {
-                ui.scroll_with_delta(egui::vec2(0.0, delta * row));
-            }
-            ui.set_max_width(width.min(980.0));
-            transcript::show(ui, &shell.app, &mut shell.effects);
-        });
-    shell.transcript_rows =
-        ((output.content_size.y - output.inner_rect.height()).max(0.0) / row) as usize;
-    shell.app.set_max_scroll(shell.transcript_rows);
-}
-
-/// What the current request is doing, while one runs.
-fn activity(ui: &mut Ui, app: &App) {
-    let Some(elapsed) = app.elapsed() else {
-        if let Some(matches) = app.completions() {
-            ui.label(RichText::new(matches.join("   ")).color(DIM));
-        } else if let Some(walk) = app.walk_label() {
-            // Right above the message box: where the message goes.
-            ui.label(RichText::new(format!("WALK · {walk}")).color(YELLOW));
-        }
-        return;
-    };
-    let leg = app.leg();
-    let asking = leg == Some(Leg::Approvals);
-    ui.horizontal(|ui| {
-        orbits::working(ui);
-        let doing = match leg {
-            Some(Leg::Approvals) => "Waiting for you…",
-            Some(Leg::Tests) => "Running tests…",
-            Some(Leg::Commands) => "Running a command…",
-            Some(Leg::Checks) => "Checking…",
-            Some(Leg::Model) | None => "Working…",
-        };
-        ui.label(RichText::new(doing).color(if asking { YELLOW } else { ACCENT }));
-        if let Some(step) = app.step() {
-            ui.label(RichText::new(step.to_lowercase()).color(DIM));
-        }
-        if let Some(model) = app.working_model() {
-            ui.label(RichText::new(model.to_string()).strong().color(TEXT));
-        }
-        let spent = app.request_spent();
-        if spent.usage.input.0 > 0 {
-            ui.label(RichText::new(spent.to_string()).color(DIM));
-        }
-        // The person's time is not the request's: its clock waits.
-        let paused = if asking { ", paused" } else { "" };
-        ui.label(
-            RichText::new(format!("{}s{paused} · Ctrl-C to stop", elapsed.as_secs()))
-                .small()
-                .color(DIM),
-        );
-    });
-    if let Some((number, of)) = app.step_place() {
-        ui.add_space(2.0);
-        let width = ui.available_width().min(360.0);
-        orbits::steps(ui, number, of, width);
-    }
-    ui.add_space(4.0);
-}
-
-/// The message box, or the command line in command mode, with who answers
-/// and the team above it.
-fn input(ui: &mut Ui, app: &App) {
-    if let Some((path, first, last)) = app.picked_lines() {
-        let span = if first == last {
-            format!("line {first}")
-        } else {
-            format!("lines {first}-{last}")
-        };
-        ui.label(
-            RichText::new(format!(
-                "The next message is about {path}, {span}: a click on the line again lets it go"
-            ))
-            .small()
-            .color(theme::CYAN),
-        );
-    }
-    let (editor, prompt) = match app.mode() {
-        Mode::Command => (app.command_line(), ":"),
-        Mode::Search => (app.search_line(), "Search ›"),
-        Mode::Insert | Mode::Normal => (app.input(), "›"),
-    };
-    let focused = app.mode() != Mode::Normal;
-    Frame::new()
-        .fill(ui.visuals().faint_bg_color)
-        .stroke(Stroke::new(
-            1.0,
-            if focused {
-                ACCENT.gamma_multiply(0.7)
-            } else {
-                EDGE
-            },
-        ))
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.label(RichText::new(format!("{prompt} ")).color(ACCENT).strong());
-                // A pasted line break shows as ↵; the message keeps it.
-                let text: Vec<char> = editor
-                    .text()
-                    .chars()
-                    .map(|c| if c == '\n' { '↵' } else { c })
-                    .collect();
-                if text.is_empty() && app.mode() == Mode::Insert {
-                    caret(ui);
-                    ui.label(RichText::new("Ask, or describe a change").color(DIM));
-                    return;
-                }
-                let cursor = editor.cursor().min(text.len());
-                let before: String = text[..cursor].iter().collect();
-                let after: String = text[cursor..].iter().collect();
-                ui.label(RichText::new(before).color(TEXT));
-                if focused {
-                    caret(ui);
-                }
-                ui.label(RichText::new(after).color(TEXT));
-            });
-        });
-    if let Some(model) = app.current_model() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("answers").small().color(DIM));
-            ui.label(RichText::new(app.model_label(model)).small().color(ACCENT));
-            let team: Vec<String> = app
-                .team()
-                .iter()
-                .filter(|m| *m != model)
-                .map(|m| app.model_label(m))
-                .collect();
-            ui.label(RichText::new("· team").small().color(DIM));
-            ui.label(
-                RichText::new(if team.is_empty() {
-                    "none".to_owned()
-                } else {
-                    team.join(", ")
-                })
-                .small()
-                .color(DIM),
-            );
-        });
-    }
-}
-
-/// The text cursor: a bar that blinks at the pace the window wakes to while
-/// typing. No repaint is asked for here: bevy_egui takes any request, even
-/// one for later, as one for now, which would draw without rest.
-fn caret(ui: &mut Ui) {
-    let time = ui.input(|i| i.time);
-    let on = ((time / BLINK.as_secs_f64()).floor() as u64).is_multiple_of(2);
-    let height = ui.text_style_height(&egui::TextStyle::Body);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(2.0, height), egui::Sense::hover());
-    if on {
-        ui.painter().rect_filled(rect, 1.0, ACCENT);
-    }
-}
-
-/// The mode, what a key waits for, the conversation's name; the model, the
-/// effort, the budget and what was spent.
+/// The status line: the mode, the `:` command being typed, then the note
+/// of the moment and the project.
 fn status(ui: &mut Ui, app: &App) {
     ui.horizontal(|ui| {
         let mode = match app.mode() {
             Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
             Mode::Command => "COMMAND",
             Mode::Search => "SEARCH",
         };
@@ -1950,179 +706,52 @@ fn status(ui: &mut Ui, app: &App) {
             .show(ui, |ui| {
                 ui.label(RichText::new(mode).small().strong().color(TEXT));
             });
-        // Looking at a branch's changes: which way, how many, against what.
-        if let Some(changes) = app.change_set() {
-            Frame::new()
-                .fill(theme::CYAN.gamma_multiply(0.3))
-                .corner_radius(4)
-                .inner_margin(Margin::symmetric(6, 1))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(changes.lens.name())
-                            .small()
-                            .strong()
-                            .color(TEXT),
-                    );
-                });
-            let (added, removed) = changes.lines();
-            // The base's commit alone: with its subject, the line ran over
-            // what the right of the status line says. Whole on hover.
-            let base = changes
-                .base_line
-                .split_whitespace()
-                .next()
-                .unwrap_or_default();
+        if app.mode() == Mode::Command {
+            let line = app.command_line();
+            let text: Vec<char> = line.text().chars().collect();
+            let cursor = line.cursor().min(text.len());
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.label(RichText::new(":").monospace().color(ACCENT));
             ui.label(
-                RichText::new(format!(
-                    "{} files · +{added} −{removed} · since {base}",
-                    changes.files.len(),
-                ))
-                .small()
-                .color(DIM),
-            )
-            .on_hover_text(format!(
-                "since {}\n/{} off ends it",
-                changes.base_line,
-                changes.lens.name().to_lowercase()
-            ));
-            // Who answers while walking: never a surprise.
-            if let Some(walk) = app.walk_label() {
-                Frame::new()
-                    .fill(YELLOW.gamma_multiply(0.3))
-                    .corner_radius(4)
-                    .inner_margin(Margin::symmetric(6, 1))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(walk).small().strong().color(TEXT));
-                    });
-            }
-        }
-        match app.pending() {
-            Some(Pending::Leader) => {
-                ui.label(RichText::new(",").small().color(TEXT));
-            }
-            Some(Pending::Window) => {
-                ui.label(RichText::new("^W").small().color(TEXT));
-            }
-            None => {}
+                RichText::new(text[..cursor].iter().collect::<String>())
+                    .monospace()
+                    .color(TEXT),
+            );
+            caret(ui);
+            ui.label(
+                RichText::new(text[cursor..].iter().collect::<String>())
+                    .monospace()
+                    .color(TEXT),
+            );
+            ui.spacing_mut().item_spacing.x = 8.0;
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            cache_orbit(ui, app);
-            let (usage, cost, complete) = app.totals();
-            let budget = app
-                .budget()
-                .map(|b| format!(" · budget {b}"))
-                .unwrap_or_default();
-            let context = app
-                .context()
-                .map(|c| format!(" · ctx {}%", c.percent()))
-                .unwrap_or_default();
-            ui.label(
-                RichText::new(format!(
-                    "effort {}{budget} · {} in · {} out · {cost}{}{context}",
-                    app.effort(),
-                    usage.input,
-                    usage.output,
-                    if complete { "" } else { "+?" },
-                ))
-                .small()
-                .color(DIM),
-            );
-            if let Some(model) = app.current_model() {
-                ui.label(RichText::new(app.model_label(model)).small().color(ACCENT));
-            }
-            if let Some(chats) = app.chats_label() {
-                let colour = if app.hidden_waiting() > 0 {
-                    YELLOW
-                } else {
-                    DIM
-                };
-                ui.label(RichText::new(chats).small().color(colour))
-                    .on_hover_text("Other conversations go on while hidden: /chats lists them");
-            }
-            // The subscriptions' windows: how much is used, and when each
-            // starts again.
-            let now = universe_ui::sessions::now();
-            if let Some(line) = app.subscriptions().line(now) {
-                let fullest = app
-                    .subscriptions()
-                    .windows(now)
-                    .iter()
-                    .map(|w| w.estimate.unwrap_or(w.reported))
-                    .fold(0.0_f64, f64::max);
-                let colour = if fullest >= 90.0 {
-                    theme::RED
-                } else if fullest >= 70.0 {
-                    YELLOW
-                } else {
-                    DIM
-                };
-                ui.label(RichText::new(line).small().color(colour))
-                    .on_hover_text(
-                        "Each subscription's windows: the share used, and when it starts again. \
-                         Ctrl-O twice shows what each request took",
-                    );
-            }
-            if let Some(ticks) = app.tick_label() {
-                ui.label(RichText::new(ticks).small().color(theme::CYAN))
-                    .on_hover_text(
-                        "Ticks read Claude Code's warm sessions every four minutes, so that their \
-                         cache stays warm; they stop after an hour without a request. While they \
-                         run, the machine is kept from idle sleep. /tick turns them off",
-                    );
-            }
-            // The notice, or the conversation's name, in what is left
-            // between: cut short rather than over the rest, whole on hover.
+            ui.label(RichText::new(app.project()).small().color(DIM));
+            // The note in what is left between: cut short rather than over
+            // the rest, whole on hover.
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let (text, colour) = match app.notice() {
-                    Some(notice) => (notice.to_owned(), YELLOW),
-                    None => (app.session_label(), DIM),
-                };
-                ui.add(egui::Label::new(RichText::new(&text).small().color(colour)).truncate())
-                    .on_hover_text(text);
+                if let Some((text, bad)) = app.notice() {
+                    let colour = if bad { theme::RED } else { YELLOW };
+                    ui.add(egui::Label::new(RichText::new(text).small().color(colour)).truncate())
+                        .on_hover_text(text);
+                }
             });
         });
     });
 }
 
-/// The cache's orbit, at the end of the status line: how full the context
-/// is, and how much of the prompt cache's life is left, said on hover.
-fn cache_orbit(ui: &mut Ui, app: &App) {
-    let context = app.context();
-    let cache = app.cache_left(universe_ui::sessions::now());
-    if context.is_none() && cache.is_none() {
-        return;
+/// The text cursor, lit or dark as the time says.
+fn caret(ui: &mut Ui) {
+    let lit = ((ui.input(|i| i.time) / BLINK.as_secs_f64()) as u64).is_multiple_of(2);
+    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(2.0, height), egui::Sense::hover());
+    if lit {
+        ui.painter().rect_filled(rect, 1, ACCENT);
     }
-    let full = context
-        .filter(|c| c.window.0 > 0)
-        .map(|c| (c.used.0 as f32 / c.window.0 as f32).min(1.0));
-    let context_said = context.map_or_else(
-        || "Context: not known yet".to_owned(),
-        |c| format!("Context {}% full: {} of {}", c.percent(), c.used, c.window),
-    );
-    let minutes = |s: u64| s.div_ceil(60);
-    let cache_said = match cache {
-        Some((0, _)) => "Cache cold: the next request writes it again, at full price".to_owned(),
-        Some((left, life)) => format!(
-            "Cache: about {} min left of {}, as long as it is not read again",
-            minutes(left),
-            minutes(life)
-        ),
-        None => "No cache yet: it is written by the first request".to_owned(),
-    };
-    orbits::cache(ui, full, cache).on_hover_text(format!(
-        "{context_said}\n{cache_said}\nThe planet warms as the context fills; the comet goes \
-         round once over the cache's life"
-    ));
 }
 
-/// The file tree, the selected row kept in view.
-fn tree(
-    ui: &mut Ui,
-    app: &mut App,
-    rest: &mut f32,
-    keys: &mut Vec<KeyEvent>,
-    diffs: Option<&mut diff_view::DiffView>,
-) {
+/// The project's files, each marked with git's letter when it has one.
+fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     backdrop::paint(ui, app);
     let Some(tree) = app.tree() else {
         return;
@@ -2158,35 +787,6 @@ fn tree(
     tree.set_offset(offset);
     let mut clicked = None;
     for (i, entry) in tree.rows().iter().enumerate().skip(offset).take(visible) {
-        // The row standing for a folder's unchanged files: quiet, a click
-        // away from showing them.
-        if entry.unchanged.is_some() {
-            let text = RichText::new(format!("{}  {}", "   ".repeat(entry.depth), entry.name))
-                .italics()
-                .small()
-                .color(DIM);
-            let shown = Frame::new()
-                .fill(if i == selected && focused {
-                    SELECTED
-                } else {
-                    Color32::TRANSPARENT
-                })
-                .corner_radius(4)
-                .inner_margin(Margin::symmetric(4, 1))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(text).selectable(false));
-                });
-            let response = shown.response.interact(egui::Sense::click());
-            if response.hovered() {
-                ui.painter()
-                    .rect_filled(response.rect, 4, Color32::from_white_alpha(6));
-            }
-            if response.clicked() {
-                clicked = Some(i);
-            }
-            continue;
-        }
         let icon = if entry.is_dir {
             if tree.is_expanded(&entry.path) {
                 "▾ "
@@ -2196,9 +796,6 @@ fn tree(
         } else {
             "  "
         };
-        let changed = app.is_changed(&entry.path, entry.is_dir);
-        // Each change has git's letter and colour, in every mode: against
-        // the branch's base while it is looked at, else the last commit.
         let letter = tree.git_status(&entry.path, entry.is_dir);
         let letter_colour = |letter: char| match letter {
             'A' | '?' => theme::GREEN,
@@ -2207,9 +804,7 @@ fn tree(
             _ => YELLOW,
         };
         let text = RichText::new(format!("{}{icon}{}", "   ".repeat(entry.depth), entry.name))
-            .color(if changed {
-                ACCENT
-            } else if let Some(letter) = letter.filter(|_| !entry.is_dir) {
+            .color(if let Some(letter) = letter.filter(|_| !entry.is_dir) {
                 letter_colour(letter)
             } else if entry.is_dir {
                 TEXT
@@ -2261,18 +856,7 @@ fn tree(
         app.wheel(Focus::Tree, lines);
     }
     if let Some(index) = clicked {
-        let file = app
-            .tree()
-            .and_then(|t| t.rows().get(index))
-            .filter(|row| !row.is_dir && row.unchanged.is_none())
-            .map(|row| row.path.to_string_lossy().into_owned());
-        match (diffs, file) {
-            (Some(diffs), Some(path)) => {
-                diffs.go_to(&path);
-                app.choose_in_tree(index);
-            }
-            _ => app.click_tree(index),
-        }
+        app.click_tree(index);
     }
 }
 
@@ -2294,71 +878,25 @@ fn wheel_lines(ui: &Ui, area: egui::Rect, rest: &mut f32, row: f32) -> i32 {
 }
 
 /// The open file, its lines numbered and coloured by its language, the
-/// cursor's line lit; the editor's mode and message under it.
+/// cursor's line lit; the reader's mode and message under it.
 fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     backdrop::paint(ui, app);
-    let Some(editor) = app.file() else {
+    let Some(reader) = app.file() else {
         return;
     };
     let focused = app.focus() == Focus::File;
     let mut close = false;
-    let mut whole = false;
-    let mut open_fold = None;
     let mut definition = None;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(editor.path().display().to_string())
+            RichText::new(reader.path().display().to_string())
                 .strong()
                 .color(if focused { ACCENT } else { DIM }),
         );
-        if editor.is_modified() {
-            ui.label(RichText::new("modified").small().color(YELLOW));
-        }
+        ui.label(RichText::new("read only").small().color(DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .small_button("close")
-                .on_hover_text("back to the conversation (, then c)")
-                .clicked()
-            {
+            if ui.small_button("close").on_hover_text("q").clicked() {
                 close = true;
-            }
-            // Folded to its changes, the whole file is a click away, and
-            // back.
-            let changed = editor.changes().is_some_and(|c| !c.is_empty());
-            if editor.shows_changes_only() {
-                if ui
-                    .small_button("whole file")
-                    .on_hover_text("show the lines left unchanged too (zR)")
-                    .clicked()
-                {
-                    whole = true;
-                }
-            } else if changed
-                && app.change_set().is_some()
-                && ui
-                    .small_button("only the changes")
-                    .on_hover_text("fold the lines left unchanged (zM)")
-                    .clicked()
-            {
-                whole = true;
-            }
-            if changed && let Some(changes) = editor.changes() {
-                let added = changes
-                    .marks
-                    .iter()
-                    .filter(|m| **m != universe_tools::LineMark::Same)
-                    .count();
-                let removed: usize = changes.removed.values().map(Vec::len).sum();
-                ui.label(
-                    RichText::new(format!("−{removed}"))
-                        .small()
-                        .color(theme::RED),
-                );
-                ui.label(
-                    RichText::new(format!("+{added}"))
-                        .small()
-                        .color(theme::GREEN),
-                );
             }
             // Back to where gd left from, and forward again.
             if ui
@@ -2391,50 +929,19 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         ui.fonts_mut(|f| f.glyph_width(&egui::TextStyle::Monospace.resolve(ui.style()), 'm'));
     let rows = ((ui.available_height() - 40.0) / row).max(1.0) as usize;
     let columns = ((ui.available_width() - 60.0) / glyph.max(1.0)).max(1.0) as usize;
-    editor.set_viewport(rows, columns);
-    let (cursor_row, cursor_column) = editor.cursor();
-    let styled = editor.styled();
+    reader.set_viewport(rows, columns);
+    let (cursor_row, cursor_column) = reader.cursor();
+    let selection = reader.selection();
+    let styled = reader.styled();
     let text_area = ui.available_rect_before_wrap();
     let mut clicked = None;
     // Long lines shift left together to keep the cursor in sight, as in
     // Vim with `nowrap`.
-    let left = editor.left_offset();
+    let left = reader.left_offset();
     let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let insert = editor.mode() == EditorMode::Insert;
-    let changes = editor.changes();
-    for (on_screen, screen) in editor.screen_rows(rows).into_iter().enumerate() {
-        let i = match screen {
-            ScreenRow::Line(i) => i,
-            // A line of the base, gone from here: red, under no number.
-            ScreenRow::Removed(text) => {
-                let mut job = egui::text::LayoutJob::default();
-                job.append(
-                    &format!("{:>5}  ", "−"),
-                    0.0,
-                    egui::TextFormat::simple(font.clone(), theme::RED),
-                );
-                let text: String = text.chars().skip(left).collect();
-                job.append(
-                    &text,
-                    0.0,
-                    egui::TextFormat::simple(font.clone(), theme::RED.gamma_multiply(0.8)),
-                );
-                job.wrap.max_rows = 1;
-                job.wrap.max_width = f32::INFINITY;
-                Frame::new()
-                    .fill(theme::RED.gamma_multiply(0.1))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(egui::Label::new(job).selectable(false).extend());
-                    });
-                continue;
-            }
-        };
-        let line = &editor.lines()[i];
+    for (on_screen, i) in reader.in_view(rows).enumerate() {
+        let line = &reader.lines()[i];
         let current = i == cursor_row;
-        let mark = changes
-            .and_then(|c| c.marks.get(i).copied())
-            .unwrap_or(universe_tools::LineMark::Same);
         // One piece of text per line, its runs coloured: a widget per run
         // made every key cost a frame of hundreds of them.
         let mut job = egui::text::LayoutJob::default();
@@ -2463,104 +970,71 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             }
             None => runs(line, TEXT),
         }
-        // A run of unchanged lines folded away: how many, a click to open.
-        let fold = editor.folded(i).filter(|_| editor.folds_unchanged(i));
-        if let Some(count) = fold {
-            job.append(
-                &format!(
-                    "   ⋯ {count} unchanged line{} · click to open",
-                    if count == 1 { "" } else { "s" }
-                ),
-                0.0,
-                format(DIM),
-            );
-        }
         job.wrap.max_rows = 1;
         job.wrap.max_width = f32::INFINITY;
-        let background = match mark {
-            _ if current => SELECTED,
-            universe_tools::LineMark::Added => theme::GREEN.gamma_multiply(0.1),
-            universe_tools::LineMark::Changed => theme::LINK.gamma_multiply(0.1),
-            universe_tools::LineMark::Same if fold.is_some() => RAISED,
-            universe_tools::LineMark::Same => Color32::TRANSPARENT,
+        let background = if current {
+            SELECTED
+        } else {
+            Color32::TRANSPARENT
         };
         let shown = Frame::new().fill(background).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(job).selectable(false).extend());
         });
         let rect = shown.response.rect;
-        // The change's mark, between the number and the text.
-        let sign = match mark {
-            universe_tools::LineMark::Added => Some(theme::GREEN),
-            universe_tools::LineMark::Changed => Some(theme::LINK),
-            universe_tools::LineMark::Same => None,
-        };
-        if let Some(colour) = sign {
+        // What visual mode selects, over the text.
+        if let Some((from, to)) = selection.and_then(|s| s.columns(i, line.chars().count())) {
+            let x = |column: usize| rect.left() + (7 + column.saturating_sub(left)) as f32 * glyph;
             ui.painter().rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + 5.6 * glyph, rect.top()),
-                    egui::vec2(3.0, rect.height()),
+                egui::Rect::from_min_max(
+                    egui::pos2(x(from), rect.top()),
+                    egui::pos2(x(to), rect.bottom()),
                 ),
                 1,
-                colour,
+                ACCENT.gamma_multiply(0.25),
             );
         }
         if current && focused {
-            // The cursor: a bar while typing, a block otherwise, as in Vim.
+            // The cursor: a block, as in Vim's normal mode.
             let x = rect.left() + (7 + cursor_column.saturating_sub(left)) as f32 * glyph;
-            let caret = if insert {
-                egui::Rect::from_min_size(
-                    egui::pos2(x - 1.0, rect.top()),
-                    egui::vec2(2.0, rect.height()),
-                )
-            } else {
+            ui.painter().rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(x, rect.top()),
                     egui::vec2(glyph, rect.height()),
-                )
-            };
-            ui.painter().rect_filled(
-                caret,
+                ),
                 1,
-                if insert {
-                    ACCENT
-                } else {
-                    theme::see(ACCENT, 0.45)
-                },
+                theme::see(ACCENT, 0.45),
             );
         }
         let response = shown.response.interact(egui::Sense::click());
         if response.clicked()
             && let Some(at) = response.interact_pointer_pos()
         {
-            // Past the line numbers, in characters on screen: the editor
+            // Past the line numbers, in characters on screen: the reader
             // adds the shift.
             let gutter = 7.0 * glyph;
-            let column = ((at.x - rect.left() - gutter) / glyph.max(1.0)).max(0.0);
-            if fold.is_some() {
-                open_fold = Some(i);
-            } else if ui.input(|i| i.modifiers.command) {
+            let column = ((at.x - rect.left() - gutter) / glyph.max(1.0)).max(0.0) as usize;
+            if ui.input(|i| i.modifiers.command) {
                 // Ctrl-click: to where the name clicked is defined.
-                definition = Some((on_screen, column as usize));
+                definition = Some((on_screen, column));
             } else {
-                clicked = Some((on_screen, column as usize));
+                clicked = Some((on_screen, column));
             }
         }
     }
-    // The colours are borrowed from the editor, which the clicks change.
+    // The colours are borrowed from the reader, which the clicks change.
     drop(styled);
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-        let mode = match editor.mode() {
-            EditorMode::Normal => "NORMAL".to_owned(),
-            EditorMode::Insert => "INSERT".to_owned(),
-            EditorMode::Visual { line: true } => "VISUAL LINE".to_owned(),
-            EditorMode::Visual { line: false } => "VISUAL".to_owned(),
-            EditorMode::Command => format!(":{}", editor.prompt()),
-            EditorMode::Search => format!("/{}", editor.prompt()),
+        let mode = match reader.mode() {
+            ReaderMode::Normal => "READ".to_owned(),
+            ReaderMode::Visual { line: true } => "VISUAL LINE".to_owned(),
+            ReaderMode::Visual { line: false } => "VISUAL".to_owned(),
+            ReaderMode::Command => format!(":{}", reader.prompt()),
+            ReaderMode::Search => format!("/{}", reader.prompt()),
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(mode).small().color(DIM));
-            if let Some((message, error)) = editor.message() {
+            if let Some((message, error)) = reader.message() {
                 ui.label(RichText::new(message).small().color(if error {
                     theme::RED
                 } else {
@@ -2577,158 +1051,10 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         app.click_file(row, column);
     }
     if close {
-        app.close_file(Focus::Chat);
-    }
-    if whole {
-        app.toggle_whole_file();
-    }
-    if let Some(line) = open_fold {
-        app.open_fold(line);
+        app.close_file();
     }
     if let Some((row, column)) = definition {
         app.definition_at(row, column);
-    }
-}
-
-/// Keeps the App view's page under the view: made once its front end
-/// starts, so that its DevTools have it to drive; placed in the room the
-/// view leaves for it, shown once its first page has loaded, gone when it
-/// stops. A page hidden lets go of the keys.
-fn app_page<M, D>(
-    mut commands: Commands,
-    shell: NonSend<Shell<M, D>>,
-    mut pages: Query<(Entity, &mut Node, &mut Visibility), With<AppPage>>,
-    mut materials: ResMut<Assets<WebviewUiMaterial>>,
-    camera: Query<Entity, With<PrimaryEguiContext>>,
-    mut focused: ResMut<FocusedWebview>,
-) where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    let preview = shell.app.app_preview();
-    let wanted = preview.is_on()
-        && !matches!(
-            preview.status(),
-            Some(universe_preview::Status::Reading) | None
-        );
-    let area = shell
-        .app_view
-        .page_area
-        .filter(|_| shell.app.map_view() == Some(MapView::App) && preview.page_shown());
-    let page = pages.iter_mut().next();
-    match (wanted, page) {
-        (true, None) => {
-            let Ok(camera) = camera.single() else {
-                return;
-            };
-            commands.spawn((
-                AppPage,
-                WebviewSource::new("about:blank"),
-                Node {
-                    position_type: PositionType::Absolute,
-                    width: Val::Px(1280.0),
-                    height: Val::Px(800.0),
-                    ..default()
-                },
-                MaterialNode(materials.add(WebviewUiMaterial::default())),
-                Visibility::Hidden,
-                UiTargetCamera(camera),
-            ));
-        }
-        (false, Some((entity, _, _))) => {
-            commands.entity(entity).despawn();
-            focused.0 = None;
-        }
-        (true, Some((entity, mut node, mut visibility))) => {
-            let shown = if area.is_some() {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-            if *visibility != shown {
-                *visibility = shown;
-            }
-            match area {
-                Some((rect, zoom)) => {
-                    // From egui's points to the window's logical pixels.
-                    let px = |points: f32| Val::Px((points * zoom).round());
-                    let (left, top) = (px(rect.min.x), px(rect.min.y));
-                    let (width, height) = (px(rect.width()), px(rect.height()));
-                    if node.left != left
-                        || node.top != top
-                        || node.width != width
-                        || node.height != height
-                    {
-                        node.left = left;
-                        node.top = top;
-                        node.width = width;
-                        node.height = height;
-                    }
-                }
-                None => {
-                    if focused.0 == Some(entity) {
-                        focused.0 = None;
-                    }
-                }
-            }
-        }
-        (false, None) => {}
-    }
-}
-
-/// Notes whether a field of egui's has the keys, for them not to reach
-/// universe's state too.
-fn note_typing<M, D>(mut contexts: EguiContexts, mut shell: NonSendMut<Shell<M, D>>) -> Result
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    let typing = contexts.ctx_mut()?.egui_wants_keyboard_input();
-    if shell.typing != typing {
-        shell.typing = typing;
-    }
-    Ok(())
-}
-
-/// A click elsewhere than on the App view's page gives the keys back to
-/// universe.
-fn give_keys_back<M, D>(
-    mut contexts: EguiContexts,
-    shell: NonSend<Shell<M, D>>,
-    mut page: ResMut<FocusedWebview>,
-) -> Result
-where
-    M: ChatModel + 'static,
-    D: Delegate + 'static,
-{
-    if page.0.is_none() {
-        return Ok(());
-    }
-    let ctx = contexts.ctx_mut()?;
-    if ctx.input(|i| i.pointer.any_pressed()) {
-        let on_page = ctx
-            .input(|i| i.pointer.interact_pos())
-            .zip(shell.app_view.page_area)
-            .is_some_and(|(at, (area, _))| area.contains(at));
-        if !on_page {
-            page.0 = None;
-        }
-    }
-    Ok(())
-}
-
-/// Keeps Ctrl-J and Ctrl-N from the App view's page: they move between
-/// universe's views wherever the keys are.
-fn keep_universe_keys(mut filter: ResMut<CefKeyboardFilter>, pages: Query<Entity, Added<AppPage>>) {
-    let ctrl = ModifiersState {
-        ctrl: true,
-        ..default()
-    };
-    if let Some(page) = pages.iter().next() {
-        filter.set([
-            (page, bevy::input::keyboard::KeyCode::KeyJ, ctrl),
-            (page, bevy::input::keyboard::KeyCode::KeyN, ctrl),
-        ]);
     }
 }
 

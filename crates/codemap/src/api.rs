@@ -725,12 +725,6 @@ fn path_matches(operation: &[String], written: &[String]) -> bool {
         })
 }
 
-/// The operations a spec's text declares, in its order, with no handler
-/// nor caller: to compare two versions of a spec.
-pub(crate) fn spec_operations(text: &str) -> Vec<Operation> {
-    load(text).map_or_else(Vec::new, |doc| operations_of(0, &doc))
-}
-
 /// A spec's document, read as YAML, JSON being YAML too; JSON is read as
 /// JSON, many times faster, which a spec of megabytes notices.
 fn load(text: &str) -> Option<Yaml> {

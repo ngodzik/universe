@@ -4,20 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The universe interface's state: modes, keys, commands and the editor, whatever draws them."
+description = "The universe interface's state: the views, the files, keys and commands, whatever draws them."
 
 [dependencies]
-universe-core.workspace  = true
 universe-tools.workspace = true
-universe-agent.workspace = true
-universe-preview.workspace = true
-syntect.workspace         = true
-regex.workspace           = true
-serde.workspace           = true
-serde_json.workspace      = true
-toml.workspace            = true
-jiff.workspace            = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+syntect.workspace        = true
+serde.workspace          = true
+toml.workspace           = true
 
 [dev-dependencies]
 tempfile.workspace = true

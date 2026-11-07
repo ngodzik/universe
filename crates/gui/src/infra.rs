@@ -121,7 +121,7 @@ impl Infra {
     }
 
     /// Takes what the threads finished; reports the repositories updated
-    /// in the conversation, and reads again after.
+    /// in the status line, and reads again after.
     pub(crate) fn poll(&mut self, services: Option<&Services>, app: &mut App) {
         if let Some(reading) = &self.reading {
             match reading.try_recv() {

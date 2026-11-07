@@ -1,10 +1,8 @@
-//! The codebase's plan (Ctrl-N): its components as cards in layers, the
+//! The codebase's plan (Ctrl-N from the universe): its components as cards in layers, the
 //! foundations at the bottom, each link what one uses of another, thicker
 //! for more imports, magenta when it goes through an OpenAPI spec (a front
 //! end calling its back end), red when it closes a loop. Pointing at a card lights
-//! what it uses and what uses it; clicking one lists its files. A card
-//! ripples when the agent reads one of its files, and flares when it edits
-//! one.
+//! what it uses and what uses it; clicking one lists its files.
 //!
 //! Flat and painted by egui alone: it costs nothing while still, and only
 //! asks for frames while something on it moves.
@@ -18,9 +16,9 @@ use bevy_egui::egui::{
     ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use universe_codemap::{Architecture, CodeMap, ComponentKind};
-use universe_ui::{App, Entry, MapView};
+use universe_ui::{App, MapView};
 
-use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT, YELLOW};
+use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT};
 
 /// The most files mapped: the code first, so that a monorepo's shows
 /// whole; read away from the window, which shows the last plan meanwhile.
@@ -38,18 +36,10 @@ const COLUMN_GAP: f32 = 34.0;
 /// Between the rows of one layer that wraps.
 const WRAP_GAP: f32 = 26.0;
 
-/// How long a read and an edit by the agent show on a card, in seconds.
-const READ_SHOWS: f64 = 1.8;
-const EDIT_SHOWS: f64 = 3.2;
-
 /// How long the cards take to rise into place when the plan opens, and how
 /// much later each layer starts than the one under it.
 const RISE: f64 = 0.45;
 const RISE_STAGGER: f64 = 0.09;
-
-/// How far from the conversation's border dragging leaves the plan alone:
-/// the border's own grip reaches that far into the plan.
-pub(crate) const EDGE_GRIP: f32 = 8.0;
 
 /// How long a second click may wait to make a double click, in seconds:
 /// egui's own.
@@ -58,13 +48,6 @@ const DOUBLE_CLICK: f64 = 0.3;
 /// The width of the card listing a chosen component's files.
 const DETAILS_WIDTH: f32 = 340.0;
 
-/// What the agent last did in a component.
-struct Touch {
-    at: f64,
-    edited: bool,
-    file: String,
-}
-
 /// The plan and how it is looked at.
 pub(crate) struct Plan {
     root: PathBuf,
@@ -72,17 +55,12 @@ pub(crate) struct Plan {
     design: Option<Architecture>,
     /// The project being read again, on a thread of its own.
     reading: Option<Receiver<CodeMap>>,
-    /// How many times it was read: what follows the map sees a new one.
-    reads: u64,
     /// The folder whose parts show: opened by a double click.
     scope: String,
     /// Whether it showed last frame: opening it reads the project again.
     shown: bool,
     /// When it opened, for the cards to rise.
     opened_at: f64,
-    /// How many transcript entries were looked at for the agent's work.
-    seen: usize,
-    touches: Vec<Option<Touch>>,
     /// Moved and scaled by the mouse, from the fit to the window.
     pan: Vec2,
     zoom: f32,
@@ -100,12 +78,9 @@ impl Plan {
             map: None,
             design: None,
             reading: None,
-            reads: 0,
             scope: String::new(),
             shown: false,
             opened_at: 0.0,
-            seen: 0,
-            touches: Vec::new(),
             pan: Vec2::ZERO,
             zoom: 1.0,
             hovered: None,
@@ -115,9 +90,8 @@ impl Plan {
     }
 
     /// Notes whether the plan shows this frame. Each time it opens, the
-    /// project is read again, as the agent may have changed it, and what
-    /// the agent did before is not replayed.
-    pub(crate) fn showing(&mut self, shown: bool, now: f64, transcript: &[Entry]) {
+    /// project is read again, as it may have changed meanwhile.
+    pub(crate) fn showing(&mut self, shown: bool, now: f64) {
         if shown && !self.shown && self.reading.is_none() {
             let (send, receive) = mpsc::channel();
             let root = self.root.clone();
@@ -127,7 +101,6 @@ impl Plan {
             });
             self.reading = Some(receive);
             self.opened_at = now;
-            self.seen = transcript.len();
         }
         self.shown = shown;
     }
@@ -141,7 +114,6 @@ impl Plan {
         match reading.try_recv() {
             Ok(map) => {
                 self.reading = None;
-                self.reads += 1;
                 self.map = Some(map);
                 self.redesign(now);
             }
@@ -153,11 +125,6 @@ impl Plan {
     /// The project as last read.
     pub(crate) fn map(&self) -> Option<&CodeMap> {
         self.map.as_ref()
-    }
-
-    /// How many times the project was read.
-    pub(crate) fn reads(&self) -> u64 {
-        self.reads
     }
 
     /// The project's root.
@@ -191,41 +158,11 @@ impl Plan {
             self.scope.clear();
             design = universe_codemap::architecture(map, "");
         }
-        self.touches = (0..design.components.len()).map(|_| None).collect();
         if self.chosen.is_some_and(|c| c >= design.components.len()) {
             self.chosen = None;
         }
         self.design = Some(design);
         self.opened_at = now;
-    }
-
-    /// Marks the components whose files the agent read or edited since
-    /// last frame.
-    pub(crate) fn light_up(&mut self, transcript: &[Entry], now: f64) {
-        let from = self.seen.min(transcript.len());
-        self.seen = transcript.len();
-        let (Some(map), Some(design)) = (&self.map, &self.design) else {
-            return;
-        };
-        for (path, edited) in crate::activity::touched(&transcript[from..]) {
-            let Some(component) = map.find(path).and_then(|n| design.owner(n)) else {
-                continue;
-            };
-            // A read does not hide an edit still showing.
-            let slot = &mut self.touches[component];
-            if !edited
-                && slot
-                    .as_ref()
-                    .is_some_and(|t| t.edited && now - t.at < EDIT_SHOWS)
-            {
-                continue;
-            }
-            *slot = Some(Touch {
-                at: now,
-                edited,
-                file: path.rsplit('/').next().unwrap_or(path).to_owned(),
-            });
-        }
     }
 }
 
@@ -422,11 +359,7 @@ fn at_height(p: [Pos2; 4], y: f32) -> f32 {
 /// Draws the plan in `ui`, and handles the mouse over it.
 pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     let rect = ui.max_rect();
-    // Short of the right edge, where the conversation's border is dragged.
-    let response = ui.allocate_rect(
-        rect.with_max_x(rect.max.x - EDGE_GRIP),
-        Sense::click_and_drag(),
-    );
+    let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let now = ui.input(|i| i.time);
     let project = app.project().to_owned();
@@ -533,53 +466,18 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     // What the search keeps: a part by its name, its path or any of its
     // files'; the others fade, with their links.
     let query = app.map_search().to_owned();
-    // How many files of each part the branch looked at changed: tests,
-    // documents and migrations under it count too.
-    let under = |path: &str, part: &str| {
-        path == part
-            || path
-                .strip_prefix(part)
-                .is_some_and(|rest| rest.starts_with('/'))
-    };
-    let changed: Vec<usize> = design
-        .components
-        .iter()
-        .map(|c| {
-            app.change_set().map_or(0, |changes| {
-                changes
-                    .files
-                    .iter()
-                    .filter(|f| {
-                        // The project's own part holds what no other does.
-                        if c.path.is_empty() {
-                            !design
-                                .components
-                                .iter()
-                                .any(|o| !o.path.is_empty() && under(&f.path, &o.path))
-                        } else {
-                            under(&f.path, &c.path)
-                        }
-                    })
-                    .count()
-            })
-        })
-        .collect();
-    // Looking at a branch, what it did not touch fades as the search does.
-    let reviewing = app.change_set().is_some();
     let kept: Vec<bool> = design
         .components
         .iter()
-        .zip(&changed)
-        .map(|(c, &touched)| {
-            let searched = query.is_empty()
+        .map(|c| {
+            query.is_empty()
                 || plan.map.as_ref().is_some_and(|map| {
                     let files = c.files.iter().map(|&f| map.nodes[f].path.as_str());
                     universe_ui::search_matches(
                         &query,
                         [c.name.as_str(), c.path.as_str()].into_iter().chain(files),
                     )
-                });
-            searched && (!reviewing || touched > 0)
+                })
         })
         .collect();
 
@@ -839,33 +737,6 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             CornerRadius::same(2),
             faded(colour, 0.85 * alpha),
         );
-
-        // What the branch changed in it, in a pill on its corner.
-        if changed[c] > 0 {
-            let text = format!("{} changed", changed[c]);
-            let font = FontId::proportional(10.5 * scale.clamp(0.8, 1.3));
-            let galley = painter.layout_no_wrap(text, font, YELLOW);
-            let pill = Rect::from_min_size(
-                card.right_top() + vec2(-galley.size().x - 18.0, -9.0),
-                galley.size() + vec2(12.0, 4.0),
-            );
-            painter.rect(
-                pill,
-                CornerRadius::same(8),
-                mix(theme::BACKGROUND, YELLOW, 0.18),
-                Stroke::new(1.0, faded(YELLOW, 0.7)),
-                StrokeKind::Inside,
-            );
-            painter.galley(pill.min + vec2(6.0, 2.0), galley, YELLOW);
-        }
-        if let Some(touch) = &plan.touches[c] {
-            let shows = if touch.edited { EDIT_SHOWS } else { READ_SHOWS };
-            let age = now - touch.at;
-            if age < shows {
-                moving = true;
-                agent_was_here(&painter, card, radius, touch, (age / shows) as f32, scale);
-            }
-        }
     }
 
     for (at, text, colour) in pills {
@@ -878,7 +749,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     painter.text(
         rect.left_bottom() + vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
-        "point at a part for its links · click it for its files · double-click to open it · drag to move · scroll to zoom · Ctrl-N: the universe",
+        "point at a part for its links · click it for its files · double-click to open it · drag to move · scroll to zoom · Ctrl-N: the services",
         FontId::proportional(12.0),
         DIM,
     );
@@ -975,58 +846,6 @@ fn pill(painter: &Painter, at: Pos2, text: &str, colour: Color32) {
         StrokeKind::Inside,
     );
     painter.galley(rect.center() - galley.size() / 2.0, galley, colour);
-}
-
-/// The agent's mark on a card: a ring spreading out and a glow fading, with
-/// the file's name above; orange for an edit, blue for a read.
-fn agent_was_here(
-    painter: &Painter,
-    card: Rect,
-    radius: CornerRadius,
-    touch: &Touch,
-    age: f32,
-    scale: f32,
-) {
-    let colour = if touch.edited {
-        Color32::from_rgb(255, 150, 70)
-    } else {
-        Color32::from_rgb(110, 170, 255)
-    };
-    let fade = 1.0 - age;
-    let rings = if touch.edited { 2 } else { 1 };
-    for ring in 0..rings {
-        let t = (age * 1.6 - ring as f32 * 0.25).clamp(0.0, 1.0);
-        if t <= 0.0 || t >= 1.0 {
-            continue;
-        }
-        painter.rect_stroke(
-            card.expand(t * 26.0 * scale),
-            radius,
-            Stroke::new(2.0 * scale * (1.0 - t), faded(colour, 1.0 - t)),
-            StrokeKind::Outside,
-        );
-    }
-    for (grow, a) in [(8.0, 0.10), (4.0, 0.22), (1.5, 0.5)] {
-        painter.rect_stroke(
-            card.expand(grow * scale),
-            radius,
-            Stroke::new(2.0 * scale, faded(colour, a * fade)),
-            StrokeKind::Outside,
-        );
-    }
-    let verb = if touch.edited { "editing" } else { "reading" };
-    let text = format!("{verb} {}", touch.file);
-    let at = card.center_top() - vec2(0.0, 12.0 * scale);
-    let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), faded(colour, fade));
-    let pill = Rect::from_center_size(at, galley.size() + vec2(14.0, 6.0));
-    painter.rect(
-        pill,
-        CornerRadius::same(9),
-        faded(theme::BACKGROUND, 0.9 * fade),
-        Stroke::new(1.0, faded(colour, 0.7 * fade)),
-        StrokeKind::Inside,
-    );
-    painter.galley(pill.center() - galley.size() / 2.0, galley, colour);
 }
 
 /// The title, what the plan holds, and the switch between the views.
@@ -1155,20 +974,14 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             .max_rect(area)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
-            // Right to left: the review, while there is one, comes first.
-            let mut views = vec![("Universe", MapView::Universe)];
-            if app.has_front_end() {
-                views.push(("App", MapView::App));
-            }
-            views.extend([
+            // Right to left: the last Ctrl-N reaches first.
+            let views = [
                 ("Database", MapView::Database),
                 ("API", MapView::Api),
                 ("Services", MapView::Services),
                 ("Plan", MapView::Plan),
-            ]);
-            if app.change_set().is_some() {
-                views.push(("Review", MapView::Review));
-            }
+                ("Universe", MapView::Universe),
+            ];
             for (name, view) in views {
                 let on = app.map_view() == Some(view);
                 let text = RichText::new(name)
@@ -1178,12 +991,12 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
                     app.show_map(Some(view));
                 }
             }
-            // First from the left: back to the conversation, which the views
-            // leave the whole window.
-            let back = RichText::new("✕ Chat").size(14.0).color(TEXT);
+            // First from the left: the files, which the views leave the
+            // whole window.
+            let files = RichText::new("Files").size(14.0).color(TEXT);
             if ui
-                .add(egui::Button::new(back))
-                .on_hover_text("Back to the conversation")
+                .add(egui::Button::new(files))
+                .on_hover_text("The project's files (Ctrl-A)")
                 .clicked()
             {
                 app.show_map(None);
@@ -1448,8 +1261,6 @@ fn lines(map: &CodeMap, node: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use universe_tools::ToolSummary;
-
     use super::*;
 
     fn write(root: &std::path::Path, path: &str, text: &str) {
@@ -1458,34 +1269,13 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    fn tool(path: &str, edited: bool) -> Entry {
-        let outcome = if edited {
-            ToolSummary::Changed {
-                path: path.into(),
-                created: false,
-                diff: Vec::new(),
-            }
-        } else {
-            ToolSummary::Read {
-                path: path.into(),
-                lines: 3,
-            }
-        };
-        Entry::Tool {
-            name: "tool".into(),
-            path: Some(path.into()),
-            outcome: Ok(outcome),
-        }
-    }
-
     #[test]
-    fn opening_reads_the_project_and_only_later_work_lights_its_part() {
+    fn opening_reads_the_project_on_a_thread_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a/x.py", "import b.y\n");
         write(dir.path(), "b/y.py", "");
         let mut plan = Plan::new(dir.path().to_owned());
-        let history = vec![tool("a/x.py", true)];
-        plan.showing(true, 1.0, &history);
+        plan.showing(true, 1.0);
         // Read on a thread of its own: taken once there.
         let start = std::time::Instant::now();
         while plan.is_reading() && start.elapsed().as_secs() < 10 {
@@ -1493,26 +1283,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(plan.design.as_ref().map(|d| d.components.len()), Some(2));
-
-        plan.light_up(&history, 1.0);
-        assert!(
-            plan.touches.iter().all(Option::is_none),
-            "history stays dark"
-        );
-
-        let mut later = history.clone();
-        later.push(tool("b/y.py", false));
-        later.push(tool("a/x.py", true));
-        later.push(tool("a/x.py", false));
-        plan.light_up(&later, 2.0);
-        let touch = |c: usize| {
-            plan.touches[c]
-                .as_ref()
-                .map(|t| (t.edited, t.file.as_str()))
-        };
-        // A read right after an edit does not hide it.
-        assert_eq!(touch(0), Some((true, "x.py")));
-        assert_eq!(touch(1), Some((false, "y.py")));
     }
 
     #[test]

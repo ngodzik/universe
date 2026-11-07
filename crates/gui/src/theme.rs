@@ -18,23 +18,23 @@ pub(crate) const EDGE: Color32 = Color32::from_rgb(38, 44, 58);
 pub(crate) const TEXT: Color32 = Color32::from_rgb(214, 219, 230);
 /// What is said in passing.
 pub(crate) const DIM: Color32 = Color32::from_rgb(112, 120, 138);
-/// The model in use and what has the focus.
+/// What has the focus, or is chosen.
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(215, 119, 87);
-/// Code in replies.
+/// Code.
 pub(crate) const CODE: Color32 = Color32::from_rgb(229, 192, 123);
 /// Inline code and links.
 pub(crate) const LINK: Color32 = Color32::from_rgb(130, 170, 255);
-/// What went well.
+/// What is new, or went well.
 pub(crate) const GREEN: Color32 = Color32::from_rgb(110, 180, 120);
-/// What cannot be undone, and what failed.
+/// What failed, or is missing.
 pub(crate) const RED: Color32 = Color32::from_rgb(224, 108, 117);
-/// What was held back.
+/// What asks for attention.
 pub(crate) const YELLOW: Color32 = Color32::from_rgb(229, 192, 123);
-/// Handovers between models.
+/// Calls through an API.
 pub(crate) const MAGENTA: Color32 = Color32::from_rgb(198, 120, 221);
-/// Questions that only cost money.
+/// A second accent: references, renames.
 pub(crate) const CYAN: Color32 = Color32::from_rgb(86, 182, 194);
-/// The selected row or reply.
+/// The selected row.
 pub(crate) const SELECTED: Color32 = Color32::from_rgb(34, 38, 50);
 
 /// `colour` as opaque as `opacity`, from 0 to 1, for a see-through window.
@@ -86,26 +86,8 @@ const FALLBACK_FONTS: [(&str, &str); 5] = [
     ("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
 ];
 
-/// The family bold text is drawn in: the first of [`BOLD_FONTS`] the
-/// system has, then the regular ones for what it lacks or when it has none.
-const BOLD: &str = "bold";
-
-/// Bold faces the system may have: Ubuntu's medium weight beside egui's
-/// light one, else DejaVu's, Noto's or Arial's bold.
-const BOLD_FONTS: [&str; 4] = [
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-];
-
-/// Bold text at `size`, as heavy as the system's fonts allow.
-pub(crate) fn bold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(BOLD.into()))
-}
-
-/// Adds the fallback fonts the system has, and a bold face. One missing
-/// costs only its characters, drawn as boxes; no bold face, only weight.
+/// Adds the fallback fonts the system has. One missing costs only its
+/// characters, drawn as boxes.
 fn fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, path) in FALLBACK_FONTS {
@@ -124,22 +106,6 @@ fn fonts(ctx: &egui::Context) {
                 .push(name.to_owned());
         }
     }
-    let mut bold = Vec::new();
-    if let Some(bytes) = BOLD_FONTS.iter().find_map(|path| std::fs::read(path).ok()) {
-        fonts.font_data.insert(
-            BOLD.to_owned(),
-            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        bold.push(BOLD.to_owned());
-    }
-    bold.extend(
-        fonts
-            .families
-            .get(&FontFamily::Proportional)
-            .cloned()
-            .unwrap_or_default(),
-    );
-    fonts.families.insert(FontFamily::Name(BOLD.into()), bold);
     ctx.set_fonts(fonts);
 }
 

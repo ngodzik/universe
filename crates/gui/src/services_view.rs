@@ -203,10 +203,7 @@ pub(crate) fn show(
         ui.ctx().request_repaint();
     }
     let rect = ui.max_rect();
-    let background = ui.allocate_rect(
-        rect.with_max_x(rect.max.x - crate::plan::EDGE_GRIP),
-        Sense::click(),
-    );
+    let background = ui.allocate_rect(rect, Sense::click());
     let painter = ui.painter_at(rect);
     let corner = rect.left_top() + vec2(24.0, 22.0);
     painter.text(
