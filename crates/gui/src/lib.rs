@@ -5,8 +5,8 @@
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
 //! - draws the state with egui on Bevy: the project's views (`universe`,
-//!   `plan`, `services_view`, `api_view`, `database_view`, `fleet_view`),
-//!   its files and the file open.
+//!   `plan`, `services_view`, `api_view`, `database_view` and
+//!   `database_space`, `fleet_view`), its files and the file open.
 //!
 //! Bevy owns the window and the frame loop, so that the views draw in 2D
 //! and 3D under the same panels.
@@ -17,6 +17,7 @@
 mod api_view;
 mod arch_view;
 mod backdrop;
+mod database_space;
 mod database_view;
 mod error;
 mod fleet_view;
@@ -163,6 +164,7 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
         .insert_non_send(shell)
         .insert_resource(universe)
         .insert_resource(fleet_view::FleetView::default())
+        .insert_resource(database_space::DatabaseSpace::default())
         .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
@@ -179,6 +181,8 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
                 fleet_view::spawn,
                 universe::animate,
                 fleet_view::animate,
+                database_space::spawn,
+                database_space::animate,
             )
                 .chain(),
         )
@@ -261,7 +265,7 @@ fn panels_camera(mut commands: Commands) {
 /// that a frame egui misses (it skips one while its font texture is made
 /// anew) shows the background rather than the desktop behind the window.
 fn keep_panels_over(universe: &Universe, opaque: bool, camera: &mut Mut<Camera>) {
-    let wanted = if universe.shown {
+    let wanted = if universe.in_space() {
         None
     } else if opaque {
         let [r, g, b, _] = theme::BACKGROUND.to_array();
@@ -388,14 +392,18 @@ fn drive(
     if universe.shown != shown {
         universe.shown = shown;
     }
+    let schema = shell.app.map_view() == Some(MapView::Database) && !shell.database.flat();
+    if universe.schema != schema {
+        universe.schema = schema;
+    }
     if let Ok(mut camera) = panels.single_mut() {
         keep_panels_over(&universe, shell.app.opacity() >= 1.0, &mut camera);
     }
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
-    // the time, and only it draws without rest; a service's board is flat,
-    // and the space behind it rests.
-    let continuous = shown && (!fleet.active || fleet.moving());
+    // the time, and only it and the database in space draw without rest; a
+    // service's board is flat, and the space behind it rests.
+    let continuous = (shown && (!fleet.active || fleet.moving())) || schema;
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
@@ -422,11 +430,13 @@ fn drive(
 
 /// Draws the state. Changes nothing in it but what only the drawing knows:
 /// what was clicked, and how far the panes scroll.
+#[allow(clippy::too_many_arguments)]
 fn draw(
     mut contexts: EguiContexts,
     mut shell: NonSendMut<Shell>,
     mut universe: ResMut<Universe>,
     mut fleet: ResMut<fleet_view::FleetView>,
+    mut space: ResMut<database_space::DatabaseSpace>,
     mut styled: Local<bool>,
     mut followed: Local<f32>,
     window: Query<Entity, With<PrimaryWindow>>,
@@ -515,10 +525,13 @@ fn draw(
         let free = root.available_rect_before_wrap();
         universe.covered = (ctx.content_rect().right() - free.right()).max(0.0) / window;
         fleet.covered = universe.covered;
+        space.covered = universe.covered;
+        let in_space = universe.in_space();
         egui::CentralPanel::default()
-            .frame(match view {
-                MapView::Universe => Frame::NONE,
-                _ => Frame::NONE.fill(background),
+            .frame(if in_space {
+                Frame::NONE
+            } else {
+                Frame::NONE.fill(background)
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe if fleet.active => {
@@ -548,7 +561,7 @@ fn draw(
                     &mut shell.app,
                 ),
                 MapView::Database => {
-                    database_view::show(ui, &mut shell.database, &mut shell.app);
+                    database_view::show(ui, &mut shell.database, &mut space, &mut shell.app);
                 }
             });
     } else {

@@ -1,25 +1,27 @@
-//! The codebase's database (Ctrl-N, after the API): the tables its models define, as
-//! cards of their columns, in layers by their foreign keys, the tables
-//! that point at none at the bottom; each foreign key drawn from its
-//! column to the one it points at. A table pointed at lights what it
-//! points at and what points at it; a click shows it whole, a double click
-//! opens its model.
+//! The codebase's database (Ctrl-N, after the API): the tables its models
+//! define, in space at first (`database_space`), or flat, as cards of their
+//! columns, in layers by their foreign keys, the tables that point at none
+//! at the bottom; each foreign key drawn from its column to the one it
+//! points at. A table pointed at lights what it points at and what points
+//! at it; a click shows it whole, a double click opens its model.
 //!
 //! The models are read on a thread of their own, from the files the plan
 //! read, by `universe-codemap`: never run, and the window never waits.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bevy_egui::egui::epaint::CubicBezierShape;
 use bevy_egui::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
-    Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin, Pos2, Rect,
+    Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use universe_codemap::{NodeKind, Repos, Schema, Table};
 use universe_ui::App;
 
+use crate::database_space::{self, DatabaseSpace};
 use crate::plan::Plan;
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, PANEL, RAISED, TEXT, YELLOW};
 
@@ -36,7 +38,7 @@ const GAP_X: f32 = 46.0;
 const GAP_Y: f32 = 70.0;
 
 /// The details' width, on the left.
-const DETAILS_WIDTH: f32 = 360.0;
+pub(crate) const DETAILS_WIDTH: f32 = 360.0;
 
 /// What the database view remembers between frames.
 #[derive(Default)]
@@ -45,7 +47,9 @@ pub(crate) struct DatabaseView {
     /// plan reads the project again.
     read_for: Option<usize>,
     reading: Option<Receiver<Schema>>,
-    schema: Option<Schema>,
+    schema: Option<Arc<Schema>>,
+    /// Whether the tables are shown flat, as cards, rather than in space.
+    flat: bool,
     /// Where each table stands, before panning and zooming, the size of
     /// the whole, and how many cards a row held: as many as make the whole
     /// as wide as the room it is drawn in.
@@ -55,14 +59,21 @@ pub(crate) struct DatabaseView {
     pan: Vec2,
     zoom: f32,
     hovered: Option<usize>,
-    chosen: Option<usize>,
+    /// The table shown whole, flat or in space.
+    pub(crate) chosen: Option<usize>,
 }
 
 impl DatabaseView {
     /// The schema as shown.
-    fn shown(&self) -> Option<Schema> {
+    fn shown(&self) -> Option<Arc<Schema>> {
         self.schema.clone()
     }
+
+    /// Whether the tables are shown flat rather than in space.
+    pub(crate) fn flat(&self) -> bool {
+        self.flat
+    }
+
     /// Reads the models of the project the plan read, on a thread, once
     /// per reading of the project.
     pub(crate) fn update(&mut self, plan: &Plan) {
@@ -89,7 +100,7 @@ impl DatabaseView {
             match reading.try_recv() {
                 Ok(schema) => {
                     self.per_row = 0;
-                    self.schema = Some(schema);
+                    self.schema = Some(Arc::new(schema));
                     self.reading = None;
                     self.chosen = None;
                     if self.zoom == 0.0 {
@@ -130,15 +141,16 @@ fn read(repos: &Repos, paths: &[String]) -> Schema {
     universe_codemap::schema(&files)
 }
 
-/// The columns a card lists, by their place in the table: the primary key
-/// first, then the foreign keys, then the rest, `MAX_ROWS` at most.
-fn listed(table: &Table) -> Vec<usize> {
+/// The columns a card lists, or a tower stacks, by their place in the
+/// table: the primary key first, then the foreign keys, then the rest,
+/// `most` at most.
+pub(crate) fn listed(table: &Table, most: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..table.columns.len()).collect();
     order.sort_by_key(|&i| {
         let c = &table.columns[i];
         (!c.primary, c.references.is_none(), i)
     });
-    order.truncate(MAX_ROWS);
+    order.truncate(most);
     order
 }
 
@@ -151,7 +163,7 @@ fn card_height(table: &Table) -> f32 {
 /// Each table's layer: 0 for one that points at no other, one above the
 /// highest of those it points at otherwise; a loop of keys keeps the
 /// layer it has when the passes run out.
-fn layers(schema: &Schema) -> Vec<usize> {
+pub(crate) fn layers(schema: &Schema) -> Vec<usize> {
     let keys = schema.foreign_keys();
     let mut layer = vec![0; schema.tables.len()];
     for _ in 0..schema.tables.len() {
@@ -270,7 +282,7 @@ fn arrange(schema: &Schema, per_row: usize) -> (Vec<Rect>, Vec2) {
 /// A column's type, short enough for a card: `String(512, **ARGS)` as
 /// `String(512)`, `Text().with_variant(...)` as `Text`, `Integer()` as
 /// `Integer`, nothing for a type the model leaves to its key.
-fn short_type(kind: &str) -> String {
+pub(crate) fn short_type(kind: &str) -> String {
     if kind == "?" {
         return String::new();
     }
@@ -295,19 +307,21 @@ fn cut(text: &str, most: usize) -> String {
     format!("{kept}…")
 }
 
-/// Draws the database in `ui`.
-pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
+/// Draws the database in `ui`: its title, what it holds, and the tables
+/// in space or flat, as chosen.
+pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, space: &mut DatabaseSpace, app: &mut App) {
     let rect = ui.max_rect();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let corner = rect.left_top() + vec2(24.0, 22.0);
-    painter.text(
+    let title = painter.text(
         corner,
         Align2::LEFT_TOP,
         "Database",
         FontId::proportional(26.0),
         TEXT,
     );
+    toggle(ui, pos2(title.right() + 16.0, title.top() + 1.0), view);
 
     let Some(schema) = view.shown() else {
         painter.text(
@@ -372,6 +386,66 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
         })
         .collect();
 
+    let opened = if view.flat {
+        flat(ui, rect, &response, view, &schema, &kept, app)
+    } else {
+        database_space::show(ui, rect, &response, space, view, &schema, &kept, app)
+    };
+    if opened {
+        return;
+    }
+    if let Some(chosen) = view.chosen {
+        details(ui, rect, view, &schema, chosen, app);
+    }
+    crate::plan::switch(ui, rect, app);
+}
+
+/// The choice, beside the title, between the tables in space and flat.
+fn toggle(ui: &mut Ui, at: Pos2, view: &mut DatabaseView) {
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(Rect::from_min_size(at, vec2(140.0, 30.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let choices = [
+                (
+                    "3D",
+                    false,
+                    "The tables as towers in space, on floors by their keys",
+                ),
+                ("2D", true, "The tables as cards, flat"),
+            ];
+            for (name, flat, hint) in choices {
+                let on = view.flat == flat;
+                let text = RichText::new(name)
+                    .size(13.0)
+                    .color(if on { TEXT } else { DIM });
+                if ui
+                    .add(egui::Button::selectable(on, text))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    view.flat = flat;
+                }
+            }
+        },
+    );
+}
+
+/// Draws the tables flat in `rect`, as cards in layers. Returns whether a
+/// model was opened, which leaves the view.
+fn flat(
+    ui: &mut Ui,
+    rect: Rect,
+    response: &Response,
+    view: &mut DatabaseView,
+    schema: &Schema,
+    kept: &[bool],
+    app: &mut App,
+) -> bool {
+    let painter = ui.painter_at(rect);
+    let keys = schema.foreign_keys();
     // Room for the title, and for the details when a table is chosen.
     let aside = if view.chosen.is_some() {
         DETAILS_WIDTH + 24.0
@@ -385,10 +459,10 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
     // Laid out again when the room's shape asks for other rows; not when
     // a table is chosen, which narrows it for a moment.
     let full = Rect::from_min_max(rect.min + vec2(40.0, 96.0), rect.max - vec2(40.0, 40.0));
-    let wanted = per_row(&schema, full.width() / full.height().max(1.0));
+    let wanted = per_row(schema, full.width() / full.height().max(1.0));
     if wanted != view.per_row {
         view.per_row = wanted;
-        (view.cards, view.size) = arrange(&schema, wanted);
+        (view.cards, view.size) = arrange(schema, wanted);
     }
     let fit = (room.width() / view.size.x.max(1.0))
         .min(room.height() / view.size.y.max(1.0))
@@ -428,13 +502,13 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
         let path = PathBuf::from(&table.path);
         app.show_map(None);
         app.open_path_at(path, table.line);
-        return;
+        return true;
     }
     if response.clicked() {
         view.chosen = view.hovered;
     }
     let focus = view.hovered.or(view.chosen);
-    let rows: Vec<Vec<usize>> = schema.tables.iter().map(listed).collect();
+    let rows: Vec<Vec<usize>> = schema.tables.iter().map(|t| listed(t, MAX_ROWS)).collect();
 
     // Under the title and the switch, whatever the zoom.
     let canvas = painter.with_clip_rect(Rect::from_min_max(
@@ -611,10 +685,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
         FontId::proportional(12.0),
         DIM,
     );
-    if let Some(chosen) = view.chosen {
-        details(ui, rect, view, &schema, chosen, app);
-    }
-    crate::plan::switch(ui, rect, app);
+    false
 }
 
 /// The chosen table whole: its columns, its indexes, what it points at and
@@ -891,7 +962,7 @@ class Log(Base):
         );
         let schema = schema(&text);
         let table = &schema.tables[0];
-        let rows = listed(table);
+        let rows = listed(table, MAX_ROWS);
         assert_eq!(rows.len(), MAX_ROWS);
         assert_eq!(table.columns[rows[0]].name, "id");
         assert_eq!(table.columns[rows[1]].name, "parent");

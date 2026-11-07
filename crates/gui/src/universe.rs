@@ -53,7 +53,7 @@ const FARTHEST: f32 = 320.0;
 
 /// The colours of groups that have none of their own, as directions in
 /// HDR: modules, or what a criterion leaves out.
-const PALETTE: [[f32; 3]; 10] = [
+pub(crate) const PALETTE: [[f32; 3]; 10] = [
     [1.0, 0.42, 0.18],
     [0.25, 0.6, 1.0],
     [0.3, 1.0, 0.45],
@@ -129,6 +129,9 @@ pub(crate) struct Universe {
     /// Whether the window shows the deployments rather than the code: the
     /// stars rest, and the camera is the fleet's.
     pub(crate) deployments: bool,
+    /// Whether the window shows the database in space: the code's stars
+    /// hide, and the camera and the sky are the database's.
+    pub(crate) schema: bool,
 }
 
 impl Universe {
@@ -163,6 +166,7 @@ impl Universe {
             on_screen: Vec::new(),
             covered: 0.0,
             deployments: false,
+            schema: false,
         }
     }
 
@@ -340,6 +344,12 @@ impl Universe {
     /// The map, once built.
     pub(crate) fn map(&self) -> Option<&CodeMap> {
         self.map.as_ref()
+    }
+
+    /// Whether the window shows space: the code's universe, or the database
+    /// in it.
+    pub(crate) fn in_space(&self) -> bool {
+        self.shown || self.schema
     }
 }
 
@@ -650,12 +660,13 @@ pub(crate) fn show_or_hide(
     mut parts: Query<&mut Visibility, With<InUniverse>>,
 ) {
     let shown = universe.shown;
+    let space = universe.in_space();
     if let Ok(mut camera) = camera.single_mut()
-        && camera.is_active != shown
+        && camera.is_active != space
     {
-        camera.is_active = shown;
+        camera.is_active = space;
         for mut visibility in &mut parts {
-            *visibility = if shown {
+            *visibility = if space {
                 Visibility::Visible
             } else {
                 Visibility::Hidden
