@@ -44,13 +44,14 @@ pub use fleet::{
 };
 pub use grouping::{Criterion, Group, Grouping, Key, MAX_CRITERIA, Role, group};
 pub use layout::Layout;
-pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map, map_with};
+pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map, map_system, map_with};
 pub use render::{Object, Rendered, render};
 pub use repos::{Place, Repo, Repos};
 pub use schema::{Column, ForeignKey, Index, Reference, Schema, Table, schema};
 pub use services::{Evidence, Service, ServiceLink, Services, Tool, ToolKind, Via};
 pub use settings::{
-    NamedEnvironment, Settings, SettingsError, cache_folder, read_settings, settings_file,
+    NamedEnvironment, Settings, SettingsError, System, cache_folder, open_system, read_settings,
+    save_system, settings_file, systems_folder,
 };
 pub use terraform::{
     BlockKind, CloudId, CloudKind, Inner, Quality, Resolved, Terraform, TfBlock, cloud_ids,

@@ -9,7 +9,7 @@ pub(crate) enum Command {
     Help,
     /// `:keys` lists every shortcut, as Ctrl-S does.
     Keys,
-    /// `:open <path>` opens a file of the project, from its root.
+    /// `:open <path>` opens a file, as the tree names it.
     Open(Option<String>),
     /// `:background [pattern|off] [still|slow]`: what is drawn behind the
     /// window's panels; alone, what is set.
@@ -119,10 +119,13 @@ pub(crate) fn candidates(line: &str, names: &[&str]) -> Vec<String> {
 
 /// What `:help` says: the views, the commands and the file's keys.
 pub const HELP: &str = "\
-Ctrl-N goes through the project's views: its universe of files, its plan, its
-services, its API and its database; the deployments are a click away in the
+Ctrl-N goes through the views: the universe of files, the plan, the
+services, the API and the database; the deployments are a click away in the
 universe. Ctrl-F searches the view shown. Ctrl-A shows the files.
-:open <path>         open a file of the project, from its root (:e)
+A system of several repositories, read as one, is declared in
+~/.universe/systems/<name>.toml (repos = [...], linked = [...]), or with
+universe <folders> --save <name>; universe in any of them opens it whole.
+:open <path>         open a file, as the tree names it (:e)
 :background [p] [m]  a quiet pattern behind the panels (:bg): stars, waves, grid,
                      rain or off; still (costs nothing) or slow. Ctrl-X: the next
                      one. Alone, what is set

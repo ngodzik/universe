@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use universe_codemap::{
-    Cache, Deploy, Deployment, Fleet, Place, Rendered, Repos, Services, Settings, Terraform,
-    Update, cache_folder, read_settings, settings_file,
+    Cache, Deploy, Deployment, Fleet, Place, Rendered, Repos, Services, Settings, System,
+    Terraform, Update, cache_folder, systems_folder,
 };
 use universe_ui::App;
 
@@ -38,9 +38,9 @@ pub(crate) struct EnvView {
 }
 
 /// The state of the reading.
-#[derive(Default)]
 pub(crate) struct Infra {
-    root: PathBuf,
+    /// The project or the system read, with its settings.
+    system: System,
     /// universe's own folder, `~/.universe`: where the settings and the
     /// cache are. `None` without a home.
     base: Option<PathBuf>,
@@ -69,17 +69,28 @@ pub(crate) fn base() -> Option<PathBuf> {
 }
 
 impl Infra {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(system: System) -> Self {
         Self {
-            root,
+            system,
             base: base(),
-            ..Self::default()
+            read: None,
+            reading: None,
+            error: None,
+            environment: None,
+            views: HashMap::new(),
+            rendering: None,
+            queue: Vec::new(),
+            fleet: None,
+            updating: None,
         }
     }
 
-    /// The settings file of the project, to say where it is.
+    /// The file that declares the system, or the one that would, to say
+    /// where it is.
     pub(crate) fn settings_file(&self) -> Option<PathBuf> {
-        Some(settings_file(self.base.as_ref()?, &self.root))
+        self.system.file.clone().or_else(|| {
+            Some(systems_folder(self.base.as_ref()?).join(format!("{}.toml", self.system.name)))
+        })
     }
 
     /// Starts reading when nothing is read or being read.
@@ -88,9 +99,9 @@ impl Infra {
             return;
         }
         let (send, receive) = mpsc::channel();
-        let (root, base) = (self.root.clone(), self.base.clone());
+        let (system, base) = (self.system.clone(), self.base.clone());
         std::thread::spawn(move || {
-            let _ = send.send(read(&root, base.as_deref()));
+            let _ = send.send(read(&system, base.as_deref()));
         });
         self.reading = Some(receive);
     }
@@ -213,9 +224,9 @@ impl Infra {
             let services = services.clone();
             let name = env.name.clone();
             let base = self.base.clone();
-            let root = self.root.clone();
+            let system = self.system.name.clone();
             std::thread::spawn(move || {
-                let _ = send.send(render(&read, chosen, &services, base.as_deref(), &root));
+                let _ = send.send(render(&read, chosen, &services, base.as_deref(), &system));
             });
             self.rendering = Some((name, receive));
         }
@@ -299,23 +310,13 @@ impl Infra {
     }
 }
 
-/// Reads the settings, the repositories, the deployment and Terraform,
-/// from the cache when the repositories have not changed.
-fn read(root: &Path, base: Option<&Path>) -> Result<Read, String> {
-    let home = std::env::var_os("HOME").map_or_else(|| root.to_owned(), PathBuf::from);
-    let settings = match base {
-        Some(base) => read_settings(&settings_file(base, root), &home).map_err(|e| {
-            // The cause says where in the file.
-            let cause = std::error::Error::source(&e)
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            format!("{e}: {cause}")
-        })?,
-        None => Settings::default(),
-    };
-    let repos = Repos::new(root, &settings.linked);
+/// Reads the deployment and Terraform of `system`, from the cache when its
+/// repositories have not changed.
+fn read(system: &System, base: Option<&Path>) -> Result<Read, String> {
+    let settings = system.settings.clone();
+    let repos = system.repos.clone();
     let fingerprint = format!("{}|{:?}", universe_codemap::fingerprint(&repos), settings);
-    let cache = base.map(|b| Cache::new(&cache_folder(b, root)));
+    let cache = base.map(|b| Cache::new(&cache_folder(b, &system.name)));
     let cached: Option<(Deploy, Terraform)> =
         cache.as_ref().and_then(|c| c.get("deploy", &fingerprint));
     let (deploy, terraform) = cached.unwrap_or_else(|| {
@@ -349,10 +350,10 @@ fn render(
     chosen: usize,
     services: &Services,
     base: Option<&Path>,
-    root: &Path,
+    name: &str,
 ) -> EnvView {
     let env = &read.deploy.environments[chosen];
-    let cache = base.map(|b| Cache::new(&cache_folder(b, root)));
+    let cache = base.map(|b| Cache::new(&cache_folder(b, name)));
     let key = format!("env-{}", env.name);
     let cached: Option<(Rendered, Deployment)> =
         cache.as_ref().and_then(|c| c.get(&key, &read.fingerprint));
@@ -360,7 +361,7 @@ fn render(
         let scratch = base.map_or_else(
             || std::env::temp_dir().join("universe-render"),
             |b| {
-                cache_folder(b, root)
+                cache_folder(b, name)
                     .join("scratch")
                     .join(chosen.to_string())
             },

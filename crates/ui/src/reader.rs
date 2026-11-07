@@ -93,7 +93,8 @@ impl Selection {
 
 /// One open file.
 pub struct Reader {
-    /// As it was opened: from the project's root.
+    /// As the window names it: from the root of a project alone, from its
+    /// repository's name in a system.
     path: PathBuf,
     lines: Vec<String>,
     /// Coloured as the lines are shown: drawing them colours what comes
@@ -145,8 +146,9 @@ fn load(absolute: &Path) -> (Vec<String>, bool) {
 }
 
 impl Reader {
-    pub(crate) fn open(root: &Path, path: PathBuf, highlighter: Rc<Highlighter>) -> Self {
-        let (lines, text) = load(&root.join(&path));
+    /// The file at `file`, named `path` in the window.
+    pub(crate) fn open(file: &Path, path: PathBuf, highlighter: Rc<Highlighter>) -> Self {
+        let (lines, text) = load(file);
         let styled = if text {
             highlighter.highlight(&path, &lines)
         } else {
@@ -204,7 +206,7 @@ impl Reader {
 
     // Read access for the view.
 
-    /// The file's path, from the project's root.
+    /// The file's path, as the window names it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -711,7 +713,7 @@ mod tests {
         fs::write(dir.path().join("a.py"), text).unwrap();
         let clipboard = Rc::new(Memory::default());
         let reader = Reader::open(
-            dir.path(),
+            &dir.path().join("a.py"),
             PathBuf::from("a.py"),
             Rc::new(Highlighter::new()),
         )
@@ -800,7 +802,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("bin"), [0x7f, 0, 1]).unwrap();
         let r = Reader::open(
-            dir.path(),
+            &dir.path().join("bin"),
             PathBuf::from("bin"),
             Rc::new(Highlighter::new()),
         );

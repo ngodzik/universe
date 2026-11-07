@@ -4583,6 +4583,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "universe-codemap",
  "universe-gui",
  "universe-ui",
 ]

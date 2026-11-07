@@ -164,13 +164,69 @@ struct Declared {
     environment: Vec<(String, String)>,
 }
 
-/// Reads the services of the project at `root`, whose map is `map` and
+/// The repositories a map is read from, each with the folder of the map
+/// it is read from: empty for a project alone.
+type Roots = [(String, PathBuf)];
+
+/// `path`, from the root of the repository read from `folder`, as the map
+/// names it.
+fn in_map(folder: &str, path: &str) -> String {
+    match (folder.is_empty(), path.is_empty()) {
+        (true, _) => path.to_owned(),
+        (false, true) => folder.to_owned(),
+        (false, false) => format!("{folder}/{path}"),
+    }
+}
+
+/// The repository of `roots` a path of the map is in, and the path from
+/// its root: the longest folder first, a repository told apart by its
+/// parent (`ops/api`) holding a slash.
+fn repository<'a>(roots: &'a Roots, path: &'a str) -> Option<(&'a (String, PathBuf), &'a str)> {
+    roots
+        .iter()
+        .filter_map(|r| {
+            let rest = if r.0.is_empty() {
+                path
+            } else if path == r.0 {
+                ""
+            } else {
+                path.strip_prefix(r.0.as_str())?.strip_prefix('/')?
+            };
+            Some((r, rest))
+        })
+        .max_by_key(|(r, _)| r.0.len())
+}
+
+/// The top folder of a path of the map within its repository: the
+/// repository's own folder when the path is a file at its root, for a
+/// system of several; none for a file at the root of a project alone.
+fn top_of(roots: &Roots, path: &str) -> Option<String> {
+    let ((folder, _), rest) = repository(roots, path)?;
+    match rest.split_once('/') {
+        Some((top, _)) => Some(in_map(folder, top)),
+        None if !folder.is_empty() => Some(folder.clone()),
+        None => None,
+    }
+}
+
+/// Reads the services of the repositories `roots`, whose map is `map` and
 /// whose files read are `sources`, by node.
-pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> Services {
+pub(crate) fn read(roots: &Roots, map: &CodeMap, sources: &[(usize, String)]) -> Services {
     let mut declared: Vec<(String, Declared)> = Vec::new();
-    if let Some(first) = COMPOSE.iter().find(|name| root.join(name).is_file()) {
+    for (folder, root) in roots {
+        let Some(first) = COMPOSE.iter().find(|name| root.join(name).is_file()) else {
+            continue;
+        };
+        let mut found = Vec::new();
         let mut seen = HashSet::new();
-        compose(root, Path::new(first), &mut declared, &mut seen, 0);
+        compose(root, Path::new(first), &mut found, &mut seen, 0);
+        for (name, mut declaration) in found {
+            declaration.folder = declaration.folder.map(|f| in_map(folder, &f));
+            for (file, _) in &mut declaration.environment {
+                *file = in_map(folder, file);
+            }
+            declared.push((name, declaration));
+        }
     }
     let mut services = Services {
         services: declared
@@ -203,13 +259,14 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
         .collect();
     serving.sort();
     for path in serving {
-        let Some((top, _)) = path.split_once('/') else {
+        let Some(top) = top_of(roots, &path) else {
             continue;
         };
-        if services.owner(&path).is_none() && !services.services.iter().any(|s| s.name == top) {
+        let name = top.rsplit('/').next().unwrap_or(&top).to_owned();
+        if services.owner(&path).is_none() && !services.services.iter().any(|s| s.name == name) {
             services.services.push(Service {
-                name: top.to_owned(),
-                folder: Some(top.to_owned()),
+                name,
+                folder: Some(top),
                 external: false,
                 operations: Vec::new(),
                 tools: Vec::new(),
@@ -368,7 +425,9 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
         for (file, value) in &declaration.environment {
             for (host, path) in urls(value) {
                 if let Some(&to) = names.get(&host) {
-                    let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+                    let text = repository(roots, file)
+                        .and_then(|((_, root), rest)| std::fs::read_to_string(root.join(rest)).ok())
+                        .unwrap_or_default();
                     let evidence = where_written(file, &text, value);
                     add(&mut links, from, to, via_of(&path), None, evidence);
                 }
@@ -468,7 +527,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     }
 
     services.links = links.into_values().collect();
-    apps(root, map, sources, &mut services);
+    apps(roots, map, sources, &mut services);
     services.centre = centre(&services);
     services
 }
@@ -507,7 +566,7 @@ fn package_of(
 /// script, a workflow or a Dockerfile builds (`flutter build appbundle`).
 /// Each app is its own service, or adds its platforms to the service that
 /// builds it.
-fn apps(root: &Path, map: &CodeMap, sources: &[(usize, String)], services: &mut Services) {
+fn apps(roots: &Roots, map: &CodeMap, sources: &[(usize, String)], services: &mut Services) {
     static BUILD: LazyLock<Option<Regex>> = LazyLock::new(|| {
         Regex::new(r"flutter\s+build\s+(apk|appbundle|ipa|ios|web|macos|windows|linux)\b").ok()
     });
@@ -552,13 +611,14 @@ fn apps(root: &Path, map: &CodeMap, sources: &[(usize, String)], services: &mut 
         .iter()
         .map(|(n, t)| (map.nodes[*n].path.clone(), t.clone()))
         .collect();
-    if let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) {
+    for (folder, root) in roots {
+        let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) else {
+            continue;
+        };
         for entry in entries.filter_map(Result::ok) {
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                scripts.push((
-                    format!(".github/workflows/{}", entry.file_name().to_string_lossy()),
-                    text,
-                ));
+                let file = format!(".github/workflows/{}", entry.file_name().to_string_lossy());
+                scripts.push((in_map(folder, &file), text));
             }
         }
     }
@@ -1096,6 +1156,66 @@ mod tests {
             })
             .collect();
         assert_eq!(links, ["web -> server OpenApi clients/web/src/item.ts:4"]);
+    }
+
+    #[test]
+    fn a_front_end_of_one_repository_calls_the_api_another_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, web) = (dir.path().join("shop-api"), dir.path().join("shop-web"));
+        write(
+            &api,
+            "docs/openapi.json",
+            r#"{"openapi": "3.1.0", "paths": {"/v1/items/{id}": {"get": {"operationId": "items:get"}}}}"#,
+        );
+        write(
+            &api,
+            "app.py",
+            "router = APIRouter(prefix=\"/v1/items\")\n\n@router.get(\"/{id}\")\ndef get(id):\n    pass\n",
+        );
+        write(&web, "package.json", r#"{"name": "@shop/web"}"#);
+        write(
+            &web,
+            "src/item.ts",
+            "import { client } from './client'\n\nexport const item = (id) =>\n  client.GET('/v1/items/{id}', { params: { path: { id } } })\n",
+        );
+        let repos = crate::Repos::system(&[api, web], &[]);
+        let map = crate::map_system(&repos, 100);
+        let services = &map.services;
+        let found: Vec<(&str, Option<&str>, usize)> = services
+            .services
+            .iter()
+            .map(|s| (s.name.as_str(), s.folder.as_deref(), s.operations.len()))
+            .collect();
+        // The API is served at the root of its repository: the repository
+        // is the service.
+        assert_eq!(
+            found,
+            [
+                ("shop-api", Some("shop-api"), 1),
+                ("web", Some("shop-web"), 0)
+            ]
+        );
+        let links: Vec<String> = services
+            .links
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} -> {} {:?}",
+                    services.services[l.from].name, services.services[l.to].name, l.via,
+                )
+            })
+            .collect();
+        assert_eq!(links, ["web -> shop-api OpenApi"]);
+        // And the call, from the file of one to the handler of the other.
+        let (caller, handler) = (
+            map.find("shop-web/src/item.ts").unwrap(),
+            map.find("shop-api/app.py").unwrap(),
+        );
+        assert!(
+            map.edges
+                .iter()
+                .any(|e| e.kind == crate::EdgeKind::Calls && e.from == caller && e.to == handler)
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! the way to the deployments. The stars themselves are Bevy's, in
 //! [`universe`](crate::universe).
 
+use std::path::PathBuf;
+
 use bevy::math::Vec2;
 use bevy_egui::egui::{self, Align, Color32, Id, Layout, RichText, Stroke, Ui, UiBuilder};
 use universe_codemap::NodeKind;
@@ -50,7 +52,7 @@ pub(crate) fn show(ui: &mut Ui, universe: &mut Universe, app: &mut App) -> bool 
         && let Some(map) = universe.map()
         && matches!(map.nodes[node].kind, NodeKind::File { .. })
     {
-        let path = universe.root().join(&map.nodes[node].path);
+        let path = PathBuf::from(&map.nodes[node].path);
         app.open_path(path);
         app.show_map(None);
     } else if response.clicked() {

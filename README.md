@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ngodzik/universe/actions/workflows/ci.yml/badge.svg)](https://github.com/ngodzik/universe/actions/workflows/ci.yml) [![Security](https://github.com/ngodzik/universe/actions/workflows/security.yml/badge.svg)](https://github.com/ngodzik/universe/actions/workflows/security.yml)
 
-**An experimental way to see a software project in space. It is not stable, it comes with no guarantee of any kind, and it changes all the time.**
+**An experimental way to see a software project, or a system of several repositories, in space. It is not stable, it comes with no guarantee of any kind, and it changes all the time.**
 
 ## Read this first
 
@@ -13,7 +13,7 @@ This is a personal experiment, not a product, and it is not ready for production
 
 ## The idea
 
-A large project is hard to hold in one's head. universe reads it, with deterministic tools only and no model, and draws it: its files as stars gathered into galaxies, its design, its services, its API, its database and where it is deployed, in 3D where depth helps and flat where it reads better. It never edits the project's files.
+A large project is hard to hold in one's head, more so when it spans several repositories. universe reads it, its repositories together, with deterministic tools only and no model, and draws it: its files as stars gathered into galaxies, its design, its services, its API, its database and where it is deployed, in 3D where depth helps and flat where it reads better. It never edits the project's files.
 
 ## What is there today
 
@@ -29,8 +29,8 @@ Roughly, and all of it experimental:
 ## Usage
 
 ```bash
-universe                           # opens the window on the current folder
-universe path/to/project           # or on another one
+universe                           # opens the window on the current folder, or the system that holds it
+universe api web --save shop        # declares a system of several repositories, read as one
 ```
 
 ## Building

@@ -276,6 +276,93 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
 /// ```
 #[must_use]
 pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
+    let (mut map, sources) = read_files(root, limit, first);
+    finish(&mut map, &sources, &[(String::new(), root.to_owned())]);
+    map
+}
+
+/// Reads the system of `repos` as [`map`] reads a project, `limit` files at
+/// most in all: with one repository read as code, as that project; with
+/// several, each from a folder of its name, a share of the files each, and
+/// the API and the services read over them all, so that a front end of one
+/// calls the routes another serves. The linked repositories are not read.
+///
+/// # Examples
+///
+/// ```
+/// use universe_codemap::Repos;
+///
+/// let api = tempfile::tempdir().unwrap();
+/// let web = tempfile::tempdir().unwrap();
+/// std::fs::write(api.path().join("main.py"), "").unwrap();
+/// std::fs::write(web.path().join("App.tsx"), "").unwrap();
+/// let repos = Repos::system(&[api.path().to_owned(), web.path().to_owned()], &[]);
+/// let map = universe_codemap::map_system(&repos, 100);
+/// let name = |dir: &tempfile::TempDir| dir.path().file_name().unwrap().to_string_lossy().into_owned();
+/// assert!(map.find(&format!("{}/main.py", name(&api))).is_some());
+/// assert!(map.find(&format!("{}/App.tsx", name(&web))).is_some());
+/// ```
+#[must_use]
+pub fn map_system(repos: &crate::Repos, limit: usize) -> CodeMap {
+    let code: Vec<&crate::repos::Repo> = repos.code().collect();
+    match code.as_slice() {
+        [] => CodeMap {
+            nodes: vec![Node {
+                path: String::new(),
+                kind: NodeKind::Folder,
+                depth: 0,
+            }],
+            ..CodeMap::default()
+        },
+        [one] => map(&one.root, limit),
+        several => {
+            let share = (limit / several.len()).max(1);
+            let mut map = CodeMap {
+                nodes: vec![Node {
+                    path: String::new(),
+                    kind: NodeKind::Folder,
+                    depth: 0,
+                }],
+                ..CodeMap::default()
+            };
+            let mut sources = Vec::new();
+            let mut roots = Vec::new();
+            for repo in several {
+                let (part, texts) = read_files(&repo.root, share, &[]);
+                let offset = map.nodes.len();
+                let below = repo.name.split('/').count();
+                // The part's own root is the repository's folder.
+                for node in part.nodes {
+                    map.nodes.push(Node {
+                        path: repos.map_path(repo, &node.path),
+                        kind: node.kind,
+                        depth: node.depth + below,
+                    });
+                }
+                map.edges.push(Edge {
+                    from: 0,
+                    to: offset,
+                    kind: EdgeKind::Contains,
+                });
+                map.edges.extend(part.edges.into_iter().map(|e| Edge {
+                    from: e.from + offset,
+                    to: e.to + offset,
+                    kind: e.kind,
+                }));
+                map.left_out += part.left_out;
+                sources.extend(texts.into_iter().map(|(n, t)| (n + offset, t)));
+                roots.push((repo.name.clone(), repo.root.clone()));
+            }
+            finish(&mut map, &sources, &roots);
+            map
+        }
+    }
+}
+
+/// The files of the project at `root` as a map, `limit` at most, those of
+/// `first` first, with what holds what and what imports what; and the text
+/// of each file read, by node.
+fn read_files(root: &Path, limit: usize, first: &[String]) -> (CodeMap, Vec<(usize, String)>) {
     let first: std::collections::HashSet<&str> = first.iter().map(String::as_str).collect();
     let mut files: Vec<PathBuf> = WalkBuilder::new(root)
         .hidden(true)
@@ -392,7 +479,14 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
             }
         }
     }
-    let (operations, calls) = crate::api::read(&map, &sources);
+    (map, sources)
+}
+
+/// Reads the API and the services of `map`, whose files read are
+/// `sources`, by node, and whose repositories are `roots`: each with the
+/// folder of the map it is read from, empty for a project alone.
+fn finish(map: &mut CodeMap, sources: &[(usize, String)], roots: &[(String, PathBuf)]) {
+    let (operations, calls) = crate::api::read(map, sources);
     map.operations = operations;
     for (from, to) in calls {
         if from != to {
@@ -403,8 +497,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
             });
         }
     }
-    map.services = crate::services::read(root, &map, &sources);
-    map
+    map.services = crate::services::read(roots, map, sources);
 }
 
 /// `files` in an order that takes one from every folder in turn, the

@@ -47,6 +47,7 @@ use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiOutput, EguiPlugin,
     EguiPostUpdateSet, EguiPreUpdateSet, EguiPrimaryContextPass, PrimaryEguiContext,
 };
+use universe_codemap::System;
 use universe_ui::backdrop::Motion;
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use universe_ui::keymap::{Focus, Mode};
@@ -97,25 +98,26 @@ const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 /// The height of macOS's title bar, in points.
 const TITLE_BAR: f32 = 28.0;
 
-/// Opens the window on `app`'s project, and runs it until it is closed.
+/// Opens the window on `system`, a project alone or the repositories of a
+/// system, whose state is `app`, and runs it until it is closed.
 ///
 /// # Errors
 ///
 /// When Bevy stops with an error: the window could not be opened, or a
 /// system failed.
-pub fn run(mut app: App) -> Result<(), GuiError> {
+pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
     if let Err(why) = composite_alpha() {
         app.opaque_only(why);
     }
     let title = format!("{} · universe", app.project());
-    let universe = Universe::new(app.root().to_owned());
+    let universe = Universe::new(system.repos.clone(), system.name.clone());
     let shell = Shell {
-        host: Host::new(app.root()),
-        plan: Plan::new(app.root().to_owned()),
+        host: Host::new(),
+        plan: Plan::new(system.repos.clone()),
         api: api_view::ApiView::default(),
         database: database_view::DatabaseView::default(),
         services: services_view::ServicesView::default(),
-        infra: infra::Infra::new(app.root().to_owned()),
+        infra: infra::Infra::new(system),
         app,
         keys: Vec::new(),
         wheel_rest: 0.0,

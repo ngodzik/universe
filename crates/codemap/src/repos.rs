@@ -1,6 +1,10 @@
-//! The repositories read together: the project's own, and those its
-//! settings link (deployment, infrastructure, modules). A place is a file
-//! and a line in one of them.
+//! The repositories read together as one system: those read as code, its
+//! own, and those its settings link (deployment, infrastructure, modules),
+//! read for where it runs. A place is a file and a line in one of them.
+//!
+//! The map of a system of several repositories names each file from the
+//! repository's name (`api/app/main.py`); with one, from its root, as a
+//! project alone has always been read.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -13,7 +17,8 @@ pub struct Repo {
     pub name: String,
     /// Its folder.
     pub root: PathBuf,
-    /// Whether it is the project's own, which is never changed.
+    /// Whether it is one of the system's own, read as code, which is never
+    /// changed.
     pub own: bool,
 }
 
@@ -59,7 +64,7 @@ impl std::fmt::Display for Place {
     }
 }
 
-/// The repositories read together, the project's own first.
+/// The repositories read together, the system's own first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repos {
     /// Each repository.
@@ -70,29 +75,112 @@ impl Repos {
     /// The project at `root`, and the folders `linked` to it.
     #[must_use]
     pub fn new(root: &Path, linked: &[PathBuf]) -> Self {
-        let mut repos = vec![Repo {
-            name: name_of(root),
-            root: root.to_owned(),
-            own: true,
-        }];
-        for path in linked {
-            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if repos.iter().any(|r| r.root == path) {
-                continue;
+        Self::system(&[root.to_owned()], linked)
+    }
+
+    /// A system's repositories: `code`, its own, read as code, then those
+    /// `linked` to it, read for where it runs. A folder named twice is read
+    /// once, as its own when it is.
+    #[must_use]
+    pub fn system(code: &[PathBuf], linked: &[PathBuf]) -> Self {
+        let mut out = Self { repos: Vec::new() };
+        for (paths, own) in [(code, true), (linked, false)] {
+            for path in paths {
+                // The project's own folder is kept as given; a linked one
+                // is resolved, as tools report it.
+                let path = if own {
+                    path.clone()
+                } else {
+                    path.canonicalize().unwrap_or_else(|_| path.clone())
+                };
+                if out.repos.iter().any(|r| r.root == path) {
+                    continue;
+                }
+                let mut name = name_of(&path);
+                // Two folders of the same name are told apart by their parent.
+                if out.repos.iter().any(|r| r.name == name) {
+                    let parent = path.parent().map(name_of).unwrap_or_default();
+                    name = format!("{parent}/{name}");
+                }
+                out.repos.push(Repo {
+                    name,
+                    root: path,
+                    own,
+                });
             }
-            let mut name = name_of(&path);
-            // Two folders of the same name are told apart by their parent.
-            if repos.iter().any(|r| r.name == name) {
-                let parent = path.parent().map(name_of).unwrap_or_default();
-                name = format!("{parent}/{name}");
-            }
-            repos.push(Repo {
-                name,
-                root: path,
-                own: false,
+        }
+        out
+    }
+
+    /// The repositories read as code: the system's own.
+    pub fn code(&self) -> impl Iterator<Item = &Repo> {
+        self.repos.iter().filter(|r| r.own)
+    }
+
+    /// Whether the map names files from their repository's name: when
+    /// several are read as code.
+    #[must_use]
+    pub fn prefixed(&self) -> bool {
+        self.code().nth(1).is_some()
+    }
+
+    /// The file a path of the map names, on this machine: from the root of
+    /// the one repository read as code, else from the repository its first
+    /// part names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::{Path, PathBuf};
+    /// use universe_codemap::Repos;
+    ///
+    /// let one = Repos::system(&[PathBuf::from("/code/api")], &[]);
+    /// assert_eq!(one.path_of("app/main.py"), Some(PathBuf::from("/code/api/app/main.py")));
+    /// let two = Repos::system(&[PathBuf::from("/code/api"), PathBuf::from("/code/web")], &[]);
+    /// assert_eq!(two.path_of("web/src/App.tsx"), Some(PathBuf::from("/code/web/src/App.tsx")));
+    /// assert_eq!(two.path_of("elsewhere/x"), None);
+    /// ```
+    #[must_use]
+    pub fn path_of(&self, path: &str) -> Option<PathBuf> {
+        if !self.prefixed() {
+            let root = &self.code().next()?.root;
+            return Some(if path.is_empty() {
+                root.clone()
+            } else {
+                root.join(path)
             });
         }
-        Self { repos }
+        // The longest name first: a repository told apart by its parent
+        // (`ops/api`) holds a slash.
+        self.code()
+            .filter_map(|r| {
+                let rest = if path == r.name {
+                    ""
+                } else {
+                    path.strip_prefix(&r.name)?.strip_prefix('/')?
+                };
+                Some((r, rest))
+            })
+            .max_by_key(|(r, _)| r.name.len())
+            .map(|(r, rest)| {
+                if rest.is_empty() {
+                    r.root.clone()
+                } else {
+                    r.root.join(rest)
+                }
+            })
+    }
+
+    /// The path of the map that names `repo`'s file `path`, from its root.
+    #[must_use]
+    pub fn map_path(&self, repo: &Repo, path: &str) -> String {
+        if !self.prefixed() {
+            path.to_owned()
+        } else if path.is_empty() {
+            repo.name.clone()
+        } else {
+            format!("{}/{path}", repo.name)
+        }
     }
 
     /// The repository named `name`.
@@ -174,6 +262,46 @@ pub(crate) fn files(root: &Path) -> Vec<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_systems_own_repositories_name_their_files_from_their_names() {
+        let repos = Repos::system(
+            &[
+                PathBuf::from("/code/api"),
+                PathBuf::from("/x/ops/api"),
+                PathBuf::from("/code/web"),
+            ],
+            &[PathBuf::from("/nowhere/deploy")],
+        );
+        let names: Vec<(&str, bool)> = repos
+            .repos
+            .iter()
+            .map(|r| (r.name.as_str(), r.own))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("api", true),
+                ("ops/api", true),
+                ("web", true),
+                ("deploy", false)
+            ]
+        );
+        assert!(repos.prefixed());
+        assert_eq!(
+            repos.path_of("ops/api/main.go"),
+            Some(PathBuf::from("/x/ops/api/main.go"))
+        );
+        assert_eq!(repos.path_of("api"), Some(PathBuf::from("/code/api")));
+        // A linked repository is not read as code: the map does not name it.
+        assert_eq!(repos.path_of("deploy/k.yaml"), None);
+        let web = repos.get("web").unwrap();
+        assert_eq!(repos.map_path(web, "src/App.tsx"), "web/src/App.tsx");
+        let alone = Repos::new(Path::new("/code/api"), &[]);
+        assert!(!alone.prefixed());
+        let api = alone.get("api").unwrap();
+        assert_eq!(alone.map_path(api, "main.py"), "main.py");
+    }
 
     #[test]
     fn a_path_is_found_in_the_deepest_repository() {

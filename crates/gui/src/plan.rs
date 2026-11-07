@@ -15,7 +15,7 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Painter, Pos2, Rect, RichText,
     ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use universe_codemap::{Architecture, CodeMap, ComponentKind};
+use universe_codemap::{Architecture, CodeMap, ComponentKind, Repos};
 use universe_ui::{App, MapView};
 
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT};
@@ -50,7 +50,8 @@ const DETAILS_WIDTH: f32 = 340.0;
 
 /// The plan and how it is looked at.
 pub(crate) struct Plan {
-    root: PathBuf,
+    /// The repositories read as code.
+    repos: Repos,
     map: Option<CodeMap>,
     design: Option<Architecture>,
     /// The project being read again, on a thread of its own.
@@ -72,9 +73,9 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(repos: Repos) -> Self {
         Self {
-            root,
+            repos,
             map: None,
             design: None,
             reading: None,
@@ -94,10 +95,10 @@ impl Plan {
     pub(crate) fn showing(&mut self, shown: bool, now: f64) {
         if shown && !self.shown && self.reading.is_none() {
             let (send, receive) = mpsc::channel();
-            let root = self.root.clone();
+            let repos = self.repos.clone();
             std::thread::spawn(move || {
                 // The plan may be gone by then: nothing to tell.
-                let _ = send.send(universe_codemap::map(&root, MAX_FILES));
+                let _ = send.send(universe_codemap::map_system(&repos, MAX_FILES));
             });
             self.reading = Some(receive);
             self.opened_at = now;
@@ -127,9 +128,9 @@ impl Plan {
         self.map.as_ref()
     }
 
-    /// The project's root.
-    pub(crate) fn root(&self) -> &std::path::Path {
-        &self.root
+    /// The repositories read as code, to find a file of the map in.
+    pub(crate) fn repos(&self) -> &Repos {
+        &self.repos
     }
 
     /// Whether the project is being read.
@@ -1243,7 +1244,7 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
         plan.chosen = choose;
     }
     if let Some(path) = open {
-        app.open_path(plan.root.join(path));
+        app.open_path(PathBuf::from(path));
         app.show_map(None);
     }
     if let Some(folder) = dive {
@@ -1274,7 +1275,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a/x.py", "import b.y\n");
         write(dir.path(), "b/y.py", "");
-        let mut plan = Plan::new(dir.path().to_owned());
+        let mut plan = Plan::new(Repos::new(dir.path(), &[]));
         plan.showing(true, 1.0);
         // Read on a thread of its own: taken once there.
         let start = std::time::Instant::now();
@@ -1291,7 +1292,7 @@ mod tests {
         write(dir.path(), "app/api/views.py", "import app.models.user\n");
         write(dir.path(), "app/models/user.py", "");
         write(dir.path(), "web/main.ts", "");
-        let mut plan = Plan::new(dir.path().to_owned());
+        let mut plan = Plan::new(Repos::new(dir.path(), &[]));
         plan.map = Some(universe_codemap::map(dir.path(), 100));
         plan.open("", 0.0);
         let names = |plan: &Plan| -> Vec<String> {

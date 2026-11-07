@@ -19,6 +19,7 @@ mod host;
 pub mod input;
 pub mod keymap;
 pub mod reader;
+pub mod roots;
 mod search;
 pub mod style;
 pub mod tree;

@@ -13,14 +13,13 @@
 //! panels. It is only drawn while shown: hidden, the camera sleeps and the
 //! window goes back to drawing only when something changes.
 
-use std::path::PathBuf;
-
 use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use universe_codemap::{
-    CodeMap, Criterion, EdgeKind, Grouping, Key, Language, Layout, MAX_CRITERIA, NodeKind, Role,
+    CodeMap, Criterion, EdgeKind, Grouping, Key, Language, Layout, MAX_CRITERIA, NodeKind, Repos,
+    Role,
 };
 
 /// The most files mapped: beyond, the layout would take too long to settle
@@ -79,7 +78,9 @@ const LINKS_LAYER: usize = 1;
 pub(crate) struct Universe {
     /// Whether it shows, as the state says.
     pub(crate) shown: bool,
-    root: PathBuf,
+    /// The repositories read, and the name of the project or the system.
+    repos: Repos,
+    name: String,
     map: Option<CodeMap>,
     layout: Option<Layout>,
     /// The star of each node, in the map's order.
@@ -131,10 +132,11 @@ pub(crate) struct Universe {
 }
 
 impl Universe {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(repos: Repos, name: String) -> Self {
         Self {
             shown: false,
-            root,
+            repos,
+            name,
             map: None,
             layout: None,
             stars: Vec::new(),
@@ -309,12 +311,9 @@ impl Universe {
         };
         let keys: Vec<Key> = self.entered.iter().map(|(key, _)| key.clone()).collect();
         self.grouping = universe_codemap::group(map, &keys, &self.criteria);
-        // The project's own package has no name of its own: it takes its
-        // folder's.
-        let project = self
-            .root
-            .file_name()
-            .map_or_else(|| ".".to_owned(), |n| n.to_string_lossy().into_owned());
+        // The project's own package has no name of its own: it takes the
+        // project's.
+        let project = self.name.clone();
         for group in self
             .grouping
             .groups
@@ -341,11 +340,6 @@ impl Universe {
     /// The map, once built.
     pub(crate) fn map(&self) -> Option<&CodeMap> {
         self.map.as_ref()
-    }
-
-    /// The project's root, to open a chosen file from.
-    pub(crate) fn root(&self) -> &std::path::Path {
-        &self.root
     }
 }
 
@@ -679,7 +673,7 @@ pub(crate) fn show_or_hide(
     if !shown || universe.map.is_some() {
         return;
     }
-    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &[]);
+    let map = universe_codemap::map_system(&universe.repos, MAX_FILES);
     let layout = Layout::new(&map);
     let stars = map
         .nodes
@@ -929,7 +923,7 @@ mod tests {
             left_out: 0,
             ..CodeMap::default()
         };
-        let mut universe = Universe::new(PathBuf::from("/p"));
+        let mut universe = Universe::new(Repos::new(std::path::Path::new("/p"), &[]), "p".into());
         universe.layout = Some(Layout::new(&map));
         universe.map = Some(map);
         universe.regroup();

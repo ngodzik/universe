@@ -2,7 +2,7 @@
 //! file open, and what each key and click does to them.
 
 use std::cell::OnceCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use universe_tools::{Definition, Found, Lookup};
@@ -14,6 +14,7 @@ use crate::highlight::Highlighter;
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::keymap::{self, Action, Focus, Mode};
 use crate::reader::{Outcome, Reader};
+use crate::roots::Roots;
 use crate::tree::FileTree;
 
 /// How opaque a see-through window is unless `opacity` says otherwise:
@@ -217,7 +218,9 @@ struct Place {
 
 /// Everything on screen, and what each key and click does to it.
 pub struct App {
-    root: PathBuf,
+    /// The repositories read, by name.
+    roots: Roots,
+    /// The project's or the system's name.
     project: String,
     mode: Mode,
     focus: Focus,
@@ -263,18 +266,13 @@ pub struct App {
 }
 
 impl App {
-    /// The state of the window on the project at `root`, looking as `look`
-    /// says: its universe shown first.
-    pub fn new(root: PathBuf, look: Defaults) -> Self {
-        // The folder name says which project this is; the full path only
-        // crowds the screen.
-        let project = root.file_name().map_or_else(
-            || root.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
+    /// The state of the window on the project or the system `name`, whose
+    /// repositories are `roots`, looking as `look` says: its universe shown
+    /// first.
+    pub fn new(name: String, roots: Roots, look: Defaults) -> Self {
         let mut app = Self {
-            root,
-            project,
+            roots,
+            project: name,
             mode: Mode::Normal,
             focus: Focus::Tree,
             command: LineEditor::default(),
@@ -305,14 +303,14 @@ impl App {
 
     // Read access for the view.
 
-    /// The project's name, from its folder.
+    /// The project's or the system's name.
     pub fn project(&self) -> &str {
         &self.project
     }
 
-    /// The project's folder.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The repositories read, by name.
+    pub fn roots(&self) -> &Roots {
+        &self.roots
     }
 
     /// The mode the keys type in.
@@ -432,7 +430,7 @@ impl App {
         }
         self.map = view;
         if view.is_none() && self.tree.is_none() && self.file.is_none() {
-            self.tree = Some(FileTree::new(self.root.clone()));
+            self.tree = Some(FileTree::new(self.roots.clone()));
             self.focus_on(Focus::Tree);
         }
     }
@@ -492,7 +490,7 @@ impl App {
         (!self.queued.is_empty()).then(|| self.queued.remove(0))
     }
 
-    /// Opens a file of the project, from its root, at line `line`, counted
+    /// Opens a file, by its path in the window, at line `line`, counted
     /// from 1: where a route is served, say.
     pub fn open_path_at(&mut self, path: PathBuf, line: usize) {
         self.open_path(path);
@@ -501,15 +499,27 @@ impl App {
         }
     }
 
-    /// Opens a file of the project, from its root, or by its whole path.
+    /// Opens a file by its path in the window (from the root of a project
+    /// alone, from its repository's name in a system), or by its whole path.
     pub fn open_path(&mut self, path: PathBuf) {
-        // Kept from the root, as lookups and places name files.
-        let path = path
-            .strip_prefix(&self.root)
-            .map(Path::to_owned)
-            .unwrap_or(path);
+        // Named as the window names files, which lookups and places do too.
+        let shown = if path.is_absolute() {
+            self.roots.relative(&path)
+        } else {
+            Some(path.to_string_lossy().into_owned())
+        };
+        let Some((shown, file)) = shown.and_then(|shown| {
+            let file = self.roots.file(&shown)?;
+            Some((shown, file))
+        }) else {
+            self.report_error(format!(
+                "{} is in none of the repositories read",
+                path.display()
+            ));
+            return;
+        };
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
-        self.file = Some(Reader::open(&self.root, path, highlighter));
+        self.file = Some(Reader::open(&file, PathBuf::from(shown), highlighter));
         self.focus_on(Focus::File);
     }
 
@@ -590,9 +600,15 @@ impl App {
 
     /// Goes to what a lookup found: at once when one place is the
     /// likeliest definition, else to choose among them.
-    pub fn on_found(&mut self, found: Found) {
+    pub fn on_found(&mut self, mut found: Found) {
         self.looking = false;
         self.notice = None;
+        // Places from the repository's root, named as the window names them.
+        for place in &mut found.places {
+            if let Some(named) = self.roots.named(&found.root, &place.path) {
+                place.path = named;
+            }
+        }
         let what = if found.uses { "use" } else { "definition" };
         match found.places.len() {
             0 => self.say(&format!("No {what} of {} found ({})", found.name, found.by)),
@@ -739,7 +755,7 @@ impl App {
                         self.show_map(Some(self.last_map));
                     }
                 } else {
-                    self.tree = Some(FileTree::new(self.root.clone()));
+                    self.tree = Some(FileTree::new(self.roots.clone()));
                     self.focus_on(Focus::Tree);
                 }
             }
@@ -842,10 +858,10 @@ impl App {
             Command::Quit => self.quit = true,
             Command::Help | Command::Keys => self.keys_open = Some(0),
             Command::Open(None) => {
-                self.report_error("Which file? :open src/main.rs, from the project's root".into());
+                self.report_error("Which file? :open src/main.rs, as the tree names it".into());
             }
             Command::Open(Some(path)) => {
-                if self.root.join(&path).is_file() {
+                if self.roots.file(&path).is_some_and(|f| f.is_file()) {
                     self.map = None;
                     self.open_path(PathBuf::from(path));
                 } else {
@@ -892,7 +908,7 @@ impl App {
         self.map = None;
         match &mut self.tree {
             Some(tree) => tree.refresh(),
-            None => self.tree = Some(FileTree::new(self.root.clone())),
+            None => self.tree = Some(FileTree::new(self.roots.clone())),
         }
         self.focus_on(Focus::Tree);
     }
@@ -996,9 +1012,13 @@ impl App {
     fn look_up(&mut self, name: &str, uses: bool) -> Option<Effect> {
         let file = self.file.as_ref()?;
         let (line, column) = file.cursor();
+        let shown = file.path().to_string_lossy();
+        // Looked for in the file's own repository.
+        let (root, path) = self.roots.locate(&shown)?;
         let lookup = Lookup {
             name: name.to_owned(),
-            path: file.path().to_owned(),
+            root: root.to_owned(),
+            path: PathBuf::from(path),
             line,
             column,
             text: file.lines().join("\n"),
@@ -1051,6 +1071,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn press(app: &mut App, code: KeyCode) -> Option<Effect> {
@@ -1071,7 +1093,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "one\ntwo\n").unwrap();
-        let app = App::new(dir.path().to_owned(), Defaults::default());
+        let app = App::new(
+            "project".into(),
+            Roots::alone(dir.path().to_owned()),
+            Defaults::default(),
+        );
         (dir, app)
     }
 
@@ -1092,7 +1118,11 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok);
-        let app = App::new(dir.path().to_owned(), Defaults::default());
+        let app = App::new(
+            "project".into(),
+            Roots::alone(dir.path().to_owned()),
+            Defaults::default(),
+        );
         (dir, app)
     }
 
@@ -1177,7 +1207,7 @@ mod tests {
 
     #[test]
     fn gd_goes_to_the_definition_imported_ctrl_o_comes_back_alt_right_goes_again() {
-        let (_dir, mut app) = defined();
+        let (dir, mut app) = defined();
         app.open_path_at(PathBuf::from("b.py"), 3);
         app.show_map(None);
         let here = |app: &App| {
@@ -1201,9 +1231,11 @@ mod tests {
         assert_eq!(lookup.path, PathBuf::from("b.py"));
         assert!(app.is_looking());
         let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
-        let places = universe_tools::definitions(app.root(), "f", &lookup.path, &lines);
+        assert_eq!(lookup.root, dir.path());
+        let places = universe_tools::definitions(dir.path(), "f", &lookup.path, &lines);
         app.on_found(Found {
             name: "f".into(),
+            root: dir.path().to_owned(),
             uses: false,
             places,
             by: "git grep".into(),
@@ -1230,6 +1262,55 @@ mod tests {
         // Nothing further: the place stays.
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
         assert_eq!(here(&app), ("a.py".to_owned(), 3));
+    }
+
+    #[test]
+    fn in_a_system_files_are_named_from_their_repository_and_looked_up_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, web) = (dir.path().join("api"), dir.path().join("web"));
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(web.join("src/App.tsx"), "render(item)\n").unwrap();
+        let roots = Roots::new(vec![
+            ("api".into(), api.clone()),
+            ("web".into(), web.clone()),
+        ]);
+        let mut app = App::new("shop".into(), roots, Defaults::default());
+        assert_eq!(app.project(), "shop");
+        app.open_path(PathBuf::from("web/src/App.tsx"));
+        app.show_map(None);
+        assert_eq!(app.file().unwrap().lines(), ["render(item)"]);
+        // By its whole path, it is named the same.
+        app.open_path(web.join("src/App.tsx"));
+        assert_eq!(app.file().unwrap().path(), Path::new("web/src/App.tsx"));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('g'));
+        let Some(Effect::Find(lookup)) = press(&mut app, KeyCode::Char('d')) else {
+            panic!("gd asks the loop to find");
+        };
+        assert_eq!(
+            (lookup.root.as_path(), lookup.path.as_path()),
+            (web.as_path(), Path::new("src/App.tsx"))
+        );
+        app.on_found(Found {
+            name: "item".into(),
+            root: web.clone(),
+            uses: false,
+            places: vec![Definition {
+                path: "src/item.ts".into(),
+                line: 1,
+                text: "export const item = 1".into(),
+            }],
+            by: "git grep".into(),
+        });
+        // The place, from its repository's root, named from its name.
+        assert_eq!(app.file().unwrap().path(), Path::new("web/src/item.ts"));
+        app.open_path(PathBuf::from("nowhere/x"));
+        assert!(
+            app.notice()
+                .is_some_and(|(n, bad)| bad && n.contains("none of the repositories"))
+        );
     }
 
     #[test]
@@ -1274,7 +1355,7 @@ mod tests {
             opacity: Some(0.6),
             ..Defaults::default()
         };
-        let mut app = App::new(dir.path().to_owned(), look);
+        let mut app = App::new("p".into(), Roots::alone(dir.path().to_owned()), look);
         assert_eq!(app.opacity(), 0.6);
         app.opaque_only("X11 composes no transparency for it");
         assert_eq!(app.opacity(), 1.0);
