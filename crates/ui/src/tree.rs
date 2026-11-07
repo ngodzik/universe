@@ -1,9 +1,12 @@
-//! The project's files as a tree, beside the file open.
+//! The files of the repositories read as a tree, beside the file open:
+//! a project's from its root, a system's under each repository's name.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::roots::Roots;
 
 /// Directories that hold what a build produced or downloaded, never sources.
 const SKIPPED: [&str; 3] = ["target", "node_modules", "__pycache__"];
@@ -11,35 +14,37 @@ const SKIPPED: [&str; 3] = ["target", "node_modules", "__pycache__"];
 /// One visible line of the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// Relative to the project root.
+    /// As the window names it: from the root of a project alone, from the
+    /// repository's name in a system.
     pub path: PathBuf,
     /// The file or folder's name.
     pub name: String,
-    /// How deep it is, the project's top level being 0.
+    /// How deep it is, the top level being 0.
     pub depth: usize,
     /// Whether it is a folder.
     pub is_dir: bool,
 }
 
-/// The project's files as a tree, with the directories the person opened,
-/// each file marked with what git says of it.
+/// The files as a tree, with the directories the person opened, each file
+/// marked with what git says of it.
 #[derive(Debug)]
 pub struct FileTree {
-    root: PathBuf,
+    roots: Roots,
     expanded: BTreeSet<PathBuf>,
     rows: Vec<Row>,
     selected: usize,
     /// The first row on screen, written by the view so that a mouse click
     /// can be mapped back to a row.
     offset: Cell<usize>,
-    /// What git says of files not committed, by path relative to the root.
+    /// What git says of files not committed, by path as the window names
+    /// it.
     git: HashMap<String, char>,
 }
 
 impl FileTree {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(roots: Roots) -> Self {
         let mut tree = Self {
-            root,
+            roots,
             expanded: BTreeSet::new(),
             rows: Vec::new(),
             selected: 0,
@@ -100,10 +105,34 @@ impl FileTree {
     /// when it still exists.
     pub(crate) fn refresh(&mut self) {
         let keep = self.rows.get(self.selected).map(|r| r.path.clone());
-        self.git = universe_tools::file_status(&self.root);
+        let roots = self.roots.clone();
+        self.git = roots
+            .iter()
+            .flat_map(|(_, root)| {
+                universe_tools::file_status(root)
+                    .into_iter()
+                    .filter_map(|(path, letter)| Some((roots.named(root, &path)?, letter)))
+            })
+            .collect();
         self.rows.clear();
-        let root = self.root.clone();
-        self.read_dir(&root, Path::new(""), 0);
+        if roots.prefixed() {
+            // Each repository a folder of the top level, by its name.
+            for (name, root) in roots.iter() {
+                let path = PathBuf::from(name);
+                let open = self.expanded.contains(&path);
+                self.rows.push(Row {
+                    path: path.clone(),
+                    name: name.to_owned(),
+                    depth: 0,
+                    is_dir: true,
+                });
+                if open {
+                    self.read_dir(root, &path, 1);
+                }
+            }
+        } else if let Some((_, root)) = roots.iter().next() {
+            self.read_dir(root, Path::new(""), 0);
+        }
         if let Some(path) = keep
             && let Some(i) = self.rows.iter().position(|r| r.path == path)
         {
@@ -231,7 +260,7 @@ mod tests {
     #[test]
     fn lists_directories_first_and_skips_noise() {
         let dir = project();
-        let tree = FileTree::new(dir.path().to_owned());
+        let tree = FileTree::new(Roots::alone(dir.path().to_owned()));
         assert_eq!(names(&tree), ["src", "README.md"]);
     }
 
@@ -267,7 +296,7 @@ mod tests {
         let dir = repository();
         fs::write(dir.path().join("src/lib.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("docs/new.md"), "").unwrap();
-        let mut tree = FileTree::new(dir.path().to_owned());
+        let mut tree = FileTree::new(Roots::alone(dir.path().to_owned()));
         assert_eq!(names(&tree), ["docs", "src", "README.md"]);
         assert_eq!(tree.git_status(Path::new("src/lib.rs"), false), Some('M'));
         // A folder takes the strongest of its files' letters.
@@ -292,7 +321,7 @@ mod tests {
     #[test]
     fn opening_a_directory_expands_it_and_h_goes_back() {
         let dir = project();
-        let mut tree = FileTree::new(dir.path().to_owned());
+        let mut tree = FileTree::new(Roots::alone(dir.path().to_owned()));
         assert_eq!(tree.open(), None);
         assert_eq!(names(&tree), ["src", "  bin", "  lib.rs", "README.md"]);
 
@@ -302,5 +331,21 @@ mod tests {
         assert_eq!(tree.selected(), 0);
         tree.close();
         assert_eq!(names(&tree), ["src", "README.md"]);
+    }
+
+    #[test]
+    fn a_system_shows_each_repository_under_its_name() {
+        let (api, web) = (project(), project());
+        let roots = Roots::new(vec![
+            ("api".into(), api.path().to_owned()),
+            ("web".into(), web.path().to_owned()),
+        ]);
+        let mut tree = FileTree::new(roots);
+        assert_eq!(names(&tree), ["api", "web"]);
+        tree.select(1);
+        assert_eq!(tree.open(), None);
+        assert_eq!(names(&tree), ["api", "web", "  src", "  README.md"]);
+        tree.select(3);
+        assert_eq!(tree.open(), Some(PathBuf::from("web/README.md")));
     }
 }

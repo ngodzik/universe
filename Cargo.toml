@@ -60,8 +60,9 @@ name = "universe"
 path = "src/main.rs"
 
 [dependencies]
-universe-ui.workspace  = true
-universe-gui.workspace = true
+universe-codemap.workspace = true
+universe-ui.workspace      = true
+universe-gui.workspace     = true
 anyhow.workspace       = true
 clap.workspace         = true
 

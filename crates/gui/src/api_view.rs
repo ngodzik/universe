@@ -9,7 +9,7 @@
 //! nothing while still.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::PathBuf;
 
 use bevy_egui::egui::epaint::CubicBezierShape;
 use bevy_egui::egui::{
@@ -248,7 +248,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut ApiView, plan: &Plan, app: &mut App) 
         Stroke::new(1.0, EDGE),
     );
     ui.scope_builder(UiBuilder::new().max_rect(detail), |ui| match view.chosen {
-        Some(chosen) => sheet(ui, map, &operations[chosen], app, plan.root()),
+        Some(chosen) => sheet(ui, map, &operations[chosen], app),
         None => most_called(ui, view, operations, &found),
     });
 }
@@ -430,7 +430,7 @@ fn most_called(ui: &mut Ui, view: &mut ApiView, operations: &[Operation], found:
 /// A route, as one would call it: what it does, what it takes, what it
 /// answers and how it fails, a request to try; then, below, what serves it
 /// and what calls it, drawn.
-fn sheet(ui: &mut Ui, map: &CodeMap, operation: &Operation, app: &mut App, root: &Path) {
+fn sheet(ui: &mut Ui, map: &CodeMap, operation: &Operation, app: &mut App) {
     let mut open: Option<(String, Option<usize>)> = None;
     ScrollArea::vertical()
         .id_salt(("api-sheet", &operation.id))
@@ -782,7 +782,7 @@ fn sheet(ui: &mut Ui, map: &CodeMap, operation: &Operation, app: &mut App, root:
         });
 
     if let Some((path, line)) = open {
-        let path = root.join(path);
+        let path = PathBuf::from(path);
         match line {
             Some(line) => app.open_path_at(path, line),
             None => app.open_path(path),

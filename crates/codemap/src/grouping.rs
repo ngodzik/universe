@@ -567,4 +567,23 @@ mod tests {
         let narrowed = group(&map, &focus, &[Criterion::Module]);
         assert!(narrowed.inside(tools) && !narrowed.inside(main));
     }
+
+    #[test]
+    fn each_repository_of_a_system_is_a_galaxy_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, web) = (dir.path().join("api"), dir.path().join("web"));
+        write(&api, "pyproject.toml", "");
+        write(&api, "app/main.py", "import app.db\n");
+        write(&api, "app/db.py", "");
+        write(&web, "package.json", "{}");
+        write(&web, "src/App.tsx", "import { db } from './db'\n");
+        write(&web, "src/db.ts", "");
+        let map = crate::map_system(&crate::Repos::system(&[api, web], &[]), 100);
+        let grouping = group(&map, &[], &[Criterion::Module]);
+        let labels: Vec<&str> = grouping.groups.iter().map(|g| g.label.as_str()).collect();
+        assert!(
+            labels.contains(&"api") && labels.contains(&"web"),
+            "{labels:?}"
+        );
+    }
 }

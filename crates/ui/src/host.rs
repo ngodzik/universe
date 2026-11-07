@@ -3,7 +3,8 @@
 //! window drives the [`Host`] rather than carrying out an effect its own
 //! way, so that effects are tested without it.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -14,43 +15,48 @@ use crate::defaults::Defaults;
 
 /// Carries out the state's effects, and hands it what they found.
 pub struct Host {
-    root: PathBuf,
-    /// The project's language servers, each started the first time a file
-    /// of its language is looked up, and kept.
-    servers: Arc<Servers>,
+    /// The language servers of each repository looked in, each started the
+    /// first time a file of its language is looked up there, and kept.
+    servers: HashMap<PathBuf, Arc<Servers>>,
     found: (Sender<Found>, Receiver<Found>),
 }
 
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Host")
-            .field("root", &self.root)
+            .field("repositories", &self.servers.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
 
+impl Default for Host {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Host {
-    /// The host of the project at `root`.
-    pub fn new(root: &Path) -> Self {
+    /// A host, with no language server started yet.
+    pub fn new() -> Self {
         Self {
-            root: root.to_owned(),
-            servers: Arc::new(Servers::new(root)),
+            servers: HashMap::new(),
             found: mpsc::channel(),
         }
     }
 
     /// Carries out `effect`, without waiting: a lookup runs on a thread of
     /// its own, and what it finds comes through [`Host::receive`].
-    pub fn carry_out(&self, app: &mut App, effect: Effect) {
+    pub fn carry_out(&mut self, app: &mut App, effect: Effect) {
         match effect {
             Effect::Find(lookup) => {
-                let (servers, root, tx) = (
-                    Arc::clone(&self.servers),
-                    self.root.clone(),
-                    self.found.0.clone(),
+                let servers = Arc::clone(
+                    self.servers
+                        .entry(lookup.root.clone())
+                        .or_insert_with(|| Arc::new(Servers::new(&lookup.root))),
                 );
+                let tx = self.found.0.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(universe_tools::find(&servers, &root, &lookup));
+                    let _ = tx.send(universe_tools::find(&servers, &lookup));
                 });
             }
             Effect::SaveDefaults(look) => {
@@ -86,11 +92,16 @@ mod tests {
     fn a_lookup_runs_apart_and_its_places_reach_the_state() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "nothing here\n").unwrap();
-        let mut app = App::new(dir.path().to_owned(), Defaults::default());
-        let host = Host::new(dir.path());
+        let mut app = App::new(
+            "p".into(),
+            crate::roots::Roots::alone(dir.path().to_owned()),
+            Defaults::default(),
+        );
+        let mut host = Host::new();
         app.open_path(PathBuf::from("a.txt"));
         let effect = universe_tools::Lookup {
             name: "missing".into(),
+            root: dir.path().to_owned(),
             path: PathBuf::from("a.txt"),
             line: 0,
             column: 0,

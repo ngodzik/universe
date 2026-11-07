@@ -9,7 +9,7 @@
 //! read, by `universe-codemap`: never run, and the window never waits.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bevy_egui::egui::epaint::CubicBezierShape;
@@ -17,7 +17,7 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
     Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use universe_codemap::{NodeKind, Schema, Table};
+use universe_codemap::{NodeKind, Repos, Schema, Table};
 use universe_ui::App;
 
 use crate::plan::Plan;
@@ -77,10 +77,10 @@ impl DatabaseView {
                     .map(|n| n.path.clone())
                     .filter(|p| models_may_be_in(p))
                     .collect();
-                let root = plan.root().to_owned();
+                let repos = plan.repos().clone();
                 let (send, receive) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = send.send(read(&root, &paths));
+                    let _ = send.send(read(&repos, &paths));
                 });
                 self.reading = Some(receive);
             }
@@ -114,13 +114,13 @@ fn models_may_be_in(path: &str) -> bool {
         && !name.starts_with("test_")
 }
 
-/// The schema the models among `paths` define, read from the files that
-/// may define a table.
-fn read(root: &Path, paths: &[String]) -> Schema {
+/// The schema the models among `paths`, paths of the map, define, read
+/// from the files of `repos` that may define a table.
+fn read(repos: &Repos, paths: &[String]) -> Schema {
     let files: Vec<(String, String)> = paths
         .iter()
         .filter_map(|path| {
-            let text = std::fs::read_to_string(root.join(path)).ok()?;
+            let text = std::fs::read_to_string(repos.path_of(path)?).ok()?;
             let defines = text.contains("__tablename__")
                 || text.contains("Table(")
                 || text.contains("table=True");
@@ -425,7 +425,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
         && let Some(t) = view.hovered
     {
         let table = &schema.tables[t];
-        let path: PathBuf = app.root().join(&table.path);
+        let path = PathBuf::from(&table.path);
         app.show_map(None);
         app.open_path_at(path, table.line);
         return;
@@ -796,7 +796,7 @@ fn details(
         view.chosen = Some(next);
     }
     if open {
-        let path = app.root().join(&table.path);
+        let path = PathBuf::from(&table.path);
         app.show_map(None);
         app.open_path_at(path, table.line);
     }

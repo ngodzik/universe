@@ -2,7 +2,7 @@
 //! for its file says, else as `git grep` reads it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::definitions::{Definition, definitions, uses};
 use crate::lsp::Servers;
@@ -12,7 +12,9 @@ use crate::lsp::Servers;
 pub struct Lookup {
     /// The name.
     pub name: String,
-    /// The file it is in, from the project's root.
+    /// The repository it is looked for in.
+    pub root: PathBuf,
+    /// The file it is in, from the repository's root.
     pub path: PathBuf,
     /// Its line, from 0.
     pub line: usize,
@@ -29,6 +31,9 @@ pub struct Lookup {
 pub struct Found {
     /// The name looked up.
     pub name: String,
+    /// The repository it was looked for in, whose root the places are
+    /// from.
+    pub root: PathBuf,
     /// Whether its uses were looked for, rather than its definition.
     pub uses: bool,
     /// The places, the likeliest first.
@@ -37,12 +42,13 @@ pub struct Found {
     pub by: String,
 }
 
-/// Where `lookup`'s name is defined or used in the project at `root`: as
-/// the language server for its file says, or, when none answers or it only
-/// points at an import of the file itself (an alias it could not follow),
-/// as `git grep` reads it. Blocks while the server answers: to be called
-/// from a thread of its own.
-pub fn find(servers: &Servers, root: &Path, lookup: &Lookup) -> Found {
+/// Where `lookup`'s name is defined or used in its repository, whose
+/// language servers are `servers`: as the language server for its file
+/// says, or, when none answers or it only points at an import of the file
+/// itself (an alias it could not follow), as `git grep` reads it. Blocks
+/// while the server answers: to be called from a thread of its own.
+pub fn find(servers: &Servers, lookup: &Lookup) -> Found {
+    let root = lookup.root.as_path();
     let asked = if lookup.uses {
         servers.references(&lookup.path, &lookup.text, lookup.line, lookup.column)
     } else {
@@ -77,6 +83,7 @@ pub fn find(servers: &Servers, root: &Path, lookup: &Lookup) -> Found {
         if !places.is_empty() && (lookup.uses || !only_imports) {
             return Found {
                 name: lookup.name.clone(),
+                root: lookup.root.clone(),
                 uses: lookup.uses,
                 places,
                 by: program.to_owned(),
@@ -91,6 +98,7 @@ pub fn find(servers: &Servers, root: &Path, lookup: &Lookup) -> Found {
     };
     Found {
         name: lookup.name.clone(),
+        root: lookup.root.clone(),
         uses: lookup.uses,
         places,
         by: "git grep".to_owned(),

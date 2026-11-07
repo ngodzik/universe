@@ -7,6 +7,8 @@
 //! Drawn from the plan's map, which reads the services with the rest:
 //! flat, painted by egui alone, nothing to wait for.
 
+use std::path::PathBuf;
+
 use bevy_egui::egui::epaint::CubicBezierShape;
 use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText,
@@ -716,7 +718,7 @@ fn details(
         view.centre = Some(s);
     }
     if let Some((path, line)) = open {
-        let path = app.root().join(path);
+        let path = PathBuf::from(path);
         app.show_map(None);
         app.open_path_at(path, line);
     }
@@ -884,7 +886,7 @@ fn bar(ui: &mut Ui, rect: Rect, view: &mut ServicesView, infra: &mut Infra) -> f
         painter.text(
             pos2(rect.left() + 24.0, y),
             Align2::LEFT_TOP,
-            format!("To read where it runs, link its deployment repositories in {file}: linked = [\"~/code/deploy\"]"),
+            format!("To read where it runs, link its deployment repositories in the system's file {file}: linked = [\"~/code/deploy\"]"),
             FontId::proportional(12.5),
             DIM,
         );
