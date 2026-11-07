@@ -1,60 +1,19 @@
 //! Deterministic tools for universe.
 //!
-//! Everything here gives the same answer for the same input and costs no
-//! tokens: reading and editing files inside a sandboxed workspace, running the
-//! checks that judge a change, asking git about the working tree. The model
-//! reaches the file tools through [`Toolbox`]; it never reaches [`Check`],
-//! which the agent runs itself, so that a model cannot skip or fake a check.
+//! Everything here gives the same answer for the same input and asks no
+//! model: where a name is defined or used, as the project's language
+//! servers say or as `git grep` reads it, and what git says of each file.
+//! Nothing here writes to the project.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-mod check;
-mod command;
 mod definitions;
-mod detect;
-mod diff;
-mod docker;
-mod duplicates;
-mod error;
 mod git;
-mod gitview;
+mod lookup;
 mod lsp;
-mod outline;
-mod picture;
-mod pulls;
-mod rules;
-mod search;
-mod secrets;
-mod snapshot;
-mod sources;
-mod toolbox;
-mod workspace;
 
-pub use check::{Check, CheckFailure, CheckReport, Trial};
-pub use command::{
-    Assessment, CommandOutput, Policy, assess, known_hosts, redact_secrets, run_command, unreadable,
-};
 pub use definitions::{Definition, definitions, uses};
-pub use detect::detect_checks;
-pub use diff::{DiffLine, line_diff};
-pub use docker::{Container, running_containers};
-pub use duplicates::{Repeat, repeats, repeats_said};
-pub use error::ToolError;
-pub use git::{changes_text, diff_stat, is_clean, project_context, project_files, tracked_files};
-pub use gitview::{
-    Aligned, Change, ChangedFile, Hunk, LineChanges, LineMark, aligned, branch_base, changed_files,
-    commit_line, committed_lines, current_branch, diff_hunks, file_status, is_commit, line_changes,
-    lines_at,
-};
+pub use git::file_status;
+pub use lookup::{Found, Lookup, find};
 pub use lsp::{Location, LspError, Servers};
-pub use outline::project_map;
-pub use picture::Picture;
-pub use pulls::{
-    CheckedOut, PullRequest, check_out_pull, diff_between, pull_number, review_folder, stable_hash,
-};
-pub use rules::{folder_guides, folder_instructions, project_instructions};
-pub use snapshot::Snapshot;
-pub use sources::open_source;
-pub use toolbox::{ToolOutput, ToolSummary, Toolbox};
-pub use workspace::Workspace;

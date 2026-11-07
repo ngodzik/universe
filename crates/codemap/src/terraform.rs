@@ -470,6 +470,11 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .arg("-C")
         .arg(dir)
         .args(args)
+        // The repository of the folder given, whatever started universe: a
+        // git hook exports these, and from a worktree they name its own.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

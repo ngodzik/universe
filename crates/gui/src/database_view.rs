@@ -1,4 +1,4 @@
-//! The codebase's database (Ctrl-N): the tables its models define, as
+//! The codebase's database (Ctrl-N, after the API): the tables its models define, as
 //! cards of their columns, in layers by their foreign keys, the tables
 //! that point at none at the bottom; each foreign key drawn from its
 //! column to the one it points at. A table pointed at lights what it
@@ -17,11 +17,10 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
     Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use universe_codemap::{Delta, NodeKind, Schema, Table};
+use universe_codemap::{NodeKind, Schema, Table};
 use universe_ui::App;
 
 use crate::plan::Plan;
-use crate::review_view::ReviewView;
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, PANEL, RAISED, TEXT, YELLOW};
 
 /// A card's width, and the height of its title and of each column's row.
@@ -57,52 +56,12 @@ pub(crate) struct DatabaseView {
     zoom: f32,
     hovered: Option<usize>,
     chosen: Option<usize>,
-    /// The tables shown alone, a branch's and those their keys link; all
-    /// when `None`.
-    focus: Option<Vec<String>>,
 }
 
 impl DatabaseView {
-    /// Shows only `tables` and those their foreign keys link, laid out on
-    /// their own.
-    pub(crate) fn focus(&mut self, tables: Vec<String>) {
-        self.focus = Some(tables);
-        self.per_row = 0;
-        self.pan = Vec2::ZERO;
-        self.zoom = 1.0;
-        self.chosen = None;
-    }
-
-    /// The schema as shown: all of it, or the tables focused on and those
-    /// their keys link, either way.
+    /// The schema as shown.
     fn shown(&self) -> Option<Schema> {
-        let schema = self.schema.clone()?;
-        let Some(focus) = &self.focus else {
-            return Some(schema);
-        };
-        let keys = schema.foreign_keys();
-        let named: HashSet<usize> = schema
-            .tables
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| focus.contains(&t.name))
-            .map(|(i, _)| i)
-            .collect();
-        let linked: HashSet<usize> = keys
-            .iter()
-            .filter(|k| named.contains(&k.from) || named.contains(&k.to))
-            .flat_map(|k| [k.from, k.to])
-            .chain(named.iter().copied())
-            .collect();
-        Some(Schema {
-            tables: schema
-                .tables
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| linked.contains(i))
-                .map(|(_, t)| t)
-                .collect(),
-        })
+        self.schema.clone()
     }
     /// Reads the models of the project the plan read, on a thread, once
     /// per reading of the project.
@@ -336,36 +295,10 @@ fn cut(text: &str, most: usize) -> String {
     format!("{kept}…")
 }
 
-/// What the branch looked at changed in the database, by table: the
-/// table itself, or some of its columns by name.
-fn changed(review: &ReviewView) -> Vec<(String, Delta, Option<String>)> {
-    let Some(read) = review.review() else {
-        return Vec::new();
-    };
-    let steps = read
-        .models
-        .iter()
-        .flat_map(|(_, changes)| changes.iter())
-        .chain(read.migrations.iter().flat_map(|(_, m)| m.steps.iter()));
-    steps
-        .filter_map(|step| {
-            let table = step.table.clone()?;
-            let column = step
-                .what
-                .strip_prefix("column ")
-                .map(|c| c.split_whitespace().next().unwrap_or(c).to_owned());
-            Some((table, step.delta, column))
-        })
-        .collect()
-}
-
 /// Draws the database in `ui`.
-pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, app: &mut App) {
+pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, app: &mut App) {
     let rect = ui.max_rect();
-    let response = ui.allocate_rect(
-        rect.with_max_x(rect.max.x - crate::plan::EDGE_GRIP),
-        Sense::click_and_drag(),
-    );
+    let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let corner = rect.left_top() + vec2(24.0, 22.0);
     painter.text(
@@ -419,40 +352,13 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
         FontId::proportional(13.0),
         DIM,
     );
-    // Showing only a branch's tables: the way back to all of them.
-    if view.focus.is_some() {
-        let area = Rect::from_min_size(corner + vec2(0.0, 56.0), vec2(360.0, 24.0));
-        let mut all = false;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
-            all = ui
-                .button(RichText::new("Only the branch's tables · show all").size(12.5))
-                .clicked();
-        });
-        if all {
-            view.focus = None;
-            view.per_row = 0;
-        }
-    }
-
-    // The changes of the branch looked at, and what the search keeps.
-    let touched = changed(review);
-    let table_changed = |name: &str| {
-        touched
-            .iter()
-            .find(|(t, _, _)| t == name)
-            .map(|(_, d, _)| *d)
-    };
-    let column_changed = |table: &str, column: &str| {
-        touched
-            .iter()
-            .any(|(t, _, c)| t == table && c.as_deref() == Some(column))
-    };
+    // What the search keeps.
     let query = app.map_search().to_owned();
     let kept: Vec<bool> = schema
         .tables
         .iter()
         .map(|t| {
-            let searched = query.is_empty()
+            query.is_empty()
                 || universe_ui::search_matches(
                     &query,
                     [
@@ -462,9 +368,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
                     ]
                     .into_iter()
                     .chain(t.columns.iter().map(|c| c.name.as_str())),
-                );
-            let reviewing = app.change_set().is_some() && !touched.is_empty();
-            searched && (!reviewing || table_changed(&t.name).is_some())
+                )
         })
         .collect();
 
@@ -606,14 +510,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
             0.3
         };
         let picked = focus == Some(t);
-        let delta = table_changed(&table.name);
-        let edge = match delta {
-            Some(Delta::Added) => theme::GREEN,
-            Some(Delta::Removed) => theme::RED,
-            Some(Delta::Changed) => YELLOW,
-            None if picked => ACCENT,
-            None => EDGE,
-        };
+        let edge = if picked { ACCENT } else { EDGE };
         canvas.rect(
             card,
             CornerRadius::same((8.0 * scale.min(1.4)) as u8),
@@ -653,16 +550,6 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
         for (row, &c) in rows[t].iter().enumerate() {
             let column = &table.columns[c];
             let y = card.top() + (TITLE + row as f32 * ROW) * scale;
-            if column_changed(&table.name, &column.name) {
-                canvas.rect_filled(
-                    Rect::from_min_size(
-                        pos2(card.left() + 2.0, y),
-                        vec2(card.width() - 4.0, ROW * scale),
-                    ),
-                    CornerRadius::same(3),
-                    YELLOW.gamma_multiply(0.12 * alpha),
-                );
-            }
             let (mark, mark_colour) = if column.primary {
                 ("◆", YELLOW)
             } else if column.references.is_some() {

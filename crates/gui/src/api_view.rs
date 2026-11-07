@@ -1,4 +1,4 @@
-//! The codebase's API (Ctrl-N, twice): every route of its OpenAPI specs,
+//! The codebase's API (Ctrl-N, after the services): every route of its OpenAPI specs,
 //! grouped by what they are about, each with its method and path, and for
 //! the one chosen, all one needs to call it: its parameters, its body with an
 //! example, its answers and the errors it may give, a request to copy; then
@@ -16,11 +16,10 @@ use bevy_egui::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, text::LayoutJob, vec2,
 };
-use universe_codemap::{CodeMap, Delta, Operation, RouteChange};
-use universe_ui::{App, Effect};
+use universe_codemap::{CodeMap, Operation};
+use universe_ui::App;
 
 use crate::plan::Plan;
-use crate::review_view::ReviewView;
 use crate::theme::{
     self, ACCENT, CODE, DIM, EDGE, GREEN, LINK, MAGENTA, PANEL, RED, SELECTED, TEXT, YELLOW, mix,
 };
@@ -38,8 +37,6 @@ pub(crate) struct ApiView {
     chosen: Option<usize>,
     /// The only method shown, if one is picked.
     method: Option<&'static str>,
-    /// Only the routes the branch looked at changed, when picked.
-    changed_only: bool,
 }
 
 impl ApiView {
@@ -53,16 +50,6 @@ impl ApiView {
             self.method = None;
         }
     }
-}
-
-/// How the branch looked at touched a route: its spec, or the code that
-/// serves or calls it.
-#[derive(Clone)]
-struct Touched {
-    /// What its spec changed, if it did.
-    spec: Option<RouteChange>,
-    /// Whether a file that serves or calls it changed.
-    code: bool,
 }
 
 /// A method's colour, as REST tools tend to give them.
@@ -122,14 +109,7 @@ pub(crate) fn method_pill(ui: &mut Ui, method: &str, size: f32) {
 }
 
 /// Draws the API in `ui`.
-pub(crate) fn show(
-    ui: &mut Ui,
-    view: &mut ApiView,
-    plan: &Plan,
-    review: &ReviewView,
-    app: &mut App,
-    effects: &mut Vec<Effect>,
-) {
+pub(crate) fn show(ui: &mut Ui, view: &mut ApiView, plan: &Plan, app: &mut App) {
     let rect = ui.max_rect();
     let painter = ui.painter_at(rect);
     let project = app.project().to_owned();
@@ -169,37 +149,9 @@ pub(crate) fn show(
         view.chosen = None;
     }
     let query = app.map_search().to_owned();
-    // What the branch looked at did to each route.
-    let touched: Vec<Option<Touched>> = operations
-        .iter()
-        .map(|o| {
-            let changes = app.change_set()?;
-            let changed = |node: usize| {
-                map.nodes
-                    .get(node)
-                    .is_some_and(|n| changes.find(&n.path).is_some())
-            };
-            let spec = review.route(&o.method, &o.path).cloned();
-            // The function that serves it, not only its file: a router
-            // serves many routes.
-            let served = o.handler.is_some_and(|(node, line)| {
-                map.nodes
-                    .get(node)
-                    .is_some_and(|n| review.changed_at(&n.path, line))
-            });
-            let code = served || o.callers.iter().any(|&node| changed(node));
-            (spec.is_some() || code).then_some(Touched { spec, code })
-        })
-        .collect();
-    if touched.iter().all(Option::is_none) {
-        view.changed_only = false;
-    }
     let found: Vec<bool> = operations
         .iter()
-        .zip(&touched)
-        .map(|(o, t)| {
-            (query.is_empty() || found(map, o, &query)) && (!view.changed_only || t.is_some())
-        })
+        .map(|o| query.is_empty() || found(map, o, &query))
         .collect();
 
     // What the API is, under the title.
@@ -256,20 +208,6 @@ pub(crate) fn show(
             {
                 view.method = None;
             }
-            let changed = touched.iter().filter(|t| t.is_some()).count();
-            if changed > 0 {
-                let on = view.changed_only;
-                let text = RichText::new(format!("changed {changed}"))
-                    .size(12.5)
-                    .color(if on { YELLOW } else { DIM });
-                if ui
-                    .add(egui::Button::selectable(on, text))
-                    .on_hover_text("only the routes the branch changed: their spec, or the code that serves or calls them")
-                    .clicked()
-                {
-                    view.changed_only = !on;
-                }
-            }
             for method in METHODS {
                 let count = operations.iter().filter(|o| o.method == method).count();
                 if count == 0 {
@@ -298,19 +236,8 @@ pub(crate) fn show(
         pos2(rect.right() - 24.0, rect.bottom() - 12.0),
     );
 
-    let removed: Vec<RouteChange> = review
-        .review()
-        .filter(|_| app.change_set().is_some())
-        .map(|r| {
-            r.routes
-                .iter()
-                .filter(|c| c.delta == Delta::Removed)
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
     ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-        routes(ui, view, operations, &found, &touched, &removed);
+        routes(ui, view, operations, &found);
     });
     // Between the two, a line.
     painter.line_segment(
@@ -321,15 +248,7 @@ pub(crate) fn show(
         Stroke::new(1.0, EDGE),
     );
     ui.scope_builder(UiBuilder::new().max_rect(detail), |ui| match view.chosen {
-        Some(chosen) => sheet(
-            ui,
-            map,
-            &operations[chosen],
-            touched[chosen].as_ref(),
-            app,
-            plan.root(),
-            effects,
-        ),
+        Some(chosen) => sheet(ui, map, &operations[chosen], app, plan.root()),
         None => most_called(ui, view, operations, &found),
     });
 }
@@ -352,14 +271,7 @@ fn found(map: &CodeMap, operation: &Operation, query: &str) -> bool {
 }
 
 /// Every route, grouped by its first tag, each a row to choose.
-fn routes(
-    ui: &mut Ui,
-    view: &mut ApiView,
-    operations: &[Operation],
-    found: &[bool],
-    touched: &[Option<Touched>],
-    removed: &[RouteChange],
-) {
+fn routes(ui: &mut Ui, view: &mut ApiView, operations: &[Operation], found: &[bool]) {
     let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, operation) in operations.iter().enumerate() {
         if view.method.is_some_and(|m| m != operation.method) || !found[i] {
@@ -378,29 +290,6 @@ fn routes(
         .id_salt("api-routes")
         .auto_shrink(false)
         .show(ui, |ui| {
-            // What the branch took away is in the spec no more: listed
-            // first, struck through.
-            if !removed.is_empty() {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("Removed by the branch")
-                        .size(15.0)
-                        .strong()
-                        .color(RED),
-                );
-                for change in removed {
-                    ui.horizontal(|ui| {
-                        method_pill(ui, &change.method, 11.0);
-                        ui.label(
-                            RichText::new(&change.path)
-                                .monospace()
-                                .size(12.5)
-                                .strikethrough()
-                                .color(DIM),
-                        );
-                    });
-                }
-            }
             for (tag, mut members) in groups {
                 members.sort_by(|&a, &b| {
                     let (a, b) = (&operations[a], &operations[b]);
@@ -419,7 +308,7 @@ fn routes(
                 });
                 ui.add_space(2.0);
                 for i in members {
-                    route_row(ui, view, i, &operations[i], touched[i].as_ref());
+                    route_row(ui, view, i, &operations[i]);
                 }
             }
             ui.add_space(16.0);
@@ -427,13 +316,7 @@ fn routes(
 }
 
 /// A route in the list: its method, its path, how many call it.
-fn route_row(
-    ui: &mut Ui,
-    view: &mut ApiView,
-    index: usize,
-    operation: &Operation,
-    touched: Option<&Touched>,
-) {
+fn route_row(ui: &mut Ui, view: &mut ApiView, index: usize, operation: &Operation) {
     let chosen = view.chosen == Some(index);
     let unserved = operation.handler.is_none();
     let shown = Frame::new()
@@ -454,24 +337,6 @@ fn route_row(
                 job.wrap.max_width = (ui.available_width() - 44.0).max(40.0);
                 ui.add(egui::Label::new(job).selectable(false).truncate());
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    // What the branch did to it, before its counts.
-                    match touched {
-                        Some(Touched {
-                            spec: Some(change), ..
-                        }) => {
-                            let (word, colour) = match change.delta {
-                                Delta::Added => ("new", GREEN),
-                                _ => ("changed", YELLOW),
-                            };
-                            ui.label(RichText::new(word).size(11.0).strong().color(colour))
-                                .on_hover_text(change.details.join("\n"));
-                        }
-                        Some(Touched { code: true, .. }) => {
-                            ui.label(RichText::new("code").size(11.0).color(YELLOW))
-                                .on_hover_text("a file that serves or calls it changed");
-                        }
-                        _ => {}
-                    }
                     let callers = operation.callers.len();
                     if unserved {
                         ui.label(RichText::new("✗").color(RED))
@@ -565,15 +430,7 @@ fn most_called(ui: &mut Ui, view: &mut ApiView, operations: &[Operation], found:
 /// A route, as one would call it: what it does, what it takes, what it
 /// answers and how it fails, a request to try; then, below, what serves it
 /// and what calls it, drawn.
-fn sheet(
-    ui: &mut Ui,
-    map: &CodeMap,
-    operation: &Operation,
-    touched: Option<&Touched>,
-    app: &mut App,
-    root: &Path,
-    effects: &mut Vec<Effect>,
-) {
+fn sheet(ui: &mut Ui, map: &CodeMap, operation: &Operation, app: &mut App, root: &Path) {
     let mut open: Option<(String, Option<usize>)> = None;
     ScrollArea::vertical()
         .id_salt(("api-sheet", &operation.id))
@@ -586,44 +443,6 @@ fn sheet(
             ui.add_space(4.0);
             if !operation.summary.is_empty() {
                 ui.label(RichText::new(&operation.summary).size(15.0).color(TEXT));
-            }
-            // What the branch looked at changed in it, first.
-            if let Some(touched) = touched {
-                ui.add_space(6.0);
-                Frame::new()
-                    .fill(YELLOW.gamma_multiply(0.08))
-                    .stroke(Stroke::new(1.0, YELLOW.gamma_multiply(0.4)))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new("In this branch")
-                                .size(13.0)
-                                .strong()
-                                .color(YELLOW),
-                        );
-                        match &touched.spec {
-                            Some(change) if change.delta == Delta::Added => {
-                                ui.label(RichText::new("• a new route").size(12.5).color(TEXT));
-                            }
-                            Some(change) => {
-                                for detail in &change.details {
-                                    ui.label(
-                                        RichText::new(format!("• {detail}")).size(12.5).color(TEXT),
-                                    );
-                                }
-                            }
-                            None => {}
-                        }
-                        if touched.code {
-                            ui.label(
-                                RichText::new("• a file that serves or calls it changed")
-                                    .size(12.5)
-                                    .color(TEXT),
-                            );
-                        }
-                    });
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -723,7 +542,7 @@ fn sheet(
                     }
                 });
                 if let Some(example) = &body.example {
-                    code(ui, example, true, effects);
+                    code(ui, example, true);
                 }
             }
 
@@ -768,13 +587,13 @@ fn sheet(
                     egui::CollapsingHeader::new(RichText::new("example").size(12.0).color(DIM))
                         .id_salt(("api-response", &operation.id, i))
                         .default_open(false)
-                        .show(ui, |ui| code(ui, example, true, effects));
+                        .show(ui, |ui| code(ui, example, true));
                 }
                 ui.add_space(3.0);
             }
 
             section(ui, "EXAMPLE REQUEST");
-            code(ui, &operation.curl(), false, effects);
+            code(ui, &operation.curl(), false);
 
             section(
                 ui,
@@ -992,7 +811,7 @@ fn status_colour(status: &str) -> Color32 {
 }
 
 /// A block of code to read and copy: JSON coloured, keys from values.
-fn code(ui: &mut Ui, text: &str, json: bool, effects: &mut Vec<Effect>) {
+fn code(ui: &mut Ui, text: &str, json: bool) {
     Frame::new()
         .fill(theme::RAISED)
         .stroke(Stroke::new(1.0, EDGE))
@@ -1003,7 +822,9 @@ fn code(ui: &mut Ui, text: &str, json: bool, effects: &mut Vec<Effect>) {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
                     if ui.small_button(RichText::new("copy").color(DIM)).clicked() {
-                        effects.push(Effect::Copy(text.to_owned()));
+                        // egui's copy, which the window puts on the
+                        // system's clipboard.
+                        ui.ctx().copy_text(text.to_owned());
                     }
                 });
             });

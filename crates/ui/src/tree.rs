@@ -1,4 +1,4 @@
-//! The file tree shown beside the chat.
+//! The project's files as a tree, beside the file open.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
@@ -19,17 +19,10 @@ pub struct Row {
     pub depth: usize,
     /// Whether it is a folder.
     pub is_dir: bool,
-    /// For the row that stands for the files of a folder left out, showing
-    /// only the changes: how many; and opening it shows them, or hides them
-    /// again when it reads so.
-    pub unchanged: Option<usize>,
 }
 
-/// The project's files as a tree, with the directories the person opened.
-///
-/// It shows the work: a branch's changes while they are looked at, else
-/// the files not committed yet, with the rest of each folder standing as
-/// one row, a click away. With nothing to show, it shows everything.
+/// The project's files as a tree, with the directories the person opened,
+/// each file marked with what git says of it.
 #[derive(Debug)]
 pub struct FileTree {
     root: PathBuf,
@@ -41,13 +34,6 @@ pub struct FileTree {
     offset: Cell<usize>,
     /// What git says of files not committed, by path relative to the root.
     git: HashMap<String, char>,
-    /// A branch's changes with git's letters, while they are looked at.
-    only: Option<HashMap<String, char>>,
-    /// What the tree shows only: the branch's changes, else the files not
-    /// committed; `None` shows everything.
-    filter: Option<HashMap<String, char>>,
-    /// The folders shown whole all the same, the root being `""`.
-    whole: BTreeSet<PathBuf>,
 }
 
 impl FileTree {
@@ -59,12 +45,8 @@ impl FileTree {
             selected: 0,
             offset: Cell::new(0),
             git: HashMap::new(),
-            only: None,
-            filter: None,
-            whole: BTreeSet::new(),
         };
         tree.refresh();
-        tree.reveal();
         tree
     }
 
@@ -87,8 +69,7 @@ impl FileTree {
     /// strongest of its files': changes to tracked files before new files.
     pub fn git_status(&self, path: &Path, is_dir: bool) -> Option<char> {
         let path = path.to_string_lossy();
-        // Showing a branch's changes, the letters are against its base.
-        let git = self.only.as_ref().unwrap_or(&self.git);
+        let git = &self.git;
         if !is_dir {
             return git.get(path.as_ref()).copied();
         }
@@ -105,65 +86,6 @@ impl FileTree {
         found
     }
 
-    /// Whether only a branch's changes are shown.
-    pub fn shows_changes_only(&self) -> bool {
-        self.only.is_some()
-    }
-
-    /// Shows only `files`, changed with git's letter, and the folders that
-    /// hold them, unfolded; the rest of each folder stands as one row.
-    pub(crate) fn show_changes(&mut self, files: Vec<(String, char)>) {
-        self.only = Some(files.into_iter().collect());
-        self.whole.clear();
-        self.selected = 0;
-        self.refresh();
-        self.reveal();
-        // The first changed file chosen, ready to open.
-        if let Some(first) = self
-            .rows
-            .iter()
-            .position(|r| !r.is_dir && r.unchanged.is_none())
-        {
-            self.selected = first;
-        }
-    }
-
-    /// Leaves the branch's changes: the files not committed show again.
-    pub(crate) fn show_everything(&mut self) {
-        self.only = None;
-        self.whole.clear();
-        self.refresh();
-        self.reveal();
-    }
-
-    /// Opens the folders leading to every file shown as changed.
-    pub(crate) fn reveal(&mut self) {
-        let paths: Vec<String> = self
-            .filter
-            .as_ref()
-            .map(|f| f.keys().cloned().collect())
-            .unwrap_or_default();
-        for path in paths {
-            self.open_parents(&path);
-        }
-        self.refresh();
-    }
-
-    /// Opens the folders leading to `path` only, as when the agent writes
-    /// it: a folder folded by hand elsewhere stays folded.
-    pub(crate) fn reveal_one(&mut self, path: &str) {
-        self.open_parents(path);
-        self.refresh();
-    }
-
-    fn open_parents(&mut self, path: &str) {
-        let mut folder = Path::new(path).parent();
-        while let Some(f) = folder.filter(|f| !f.as_os_str().is_empty()) {
-            self.expanded.insert(f.to_owned());
-            folder = f.parent();
-        }
-    }
-
     /// The first row in view.
     pub fn offset(&self) -> usize {
         self.offset.get()
@@ -175,14 +97,10 @@ impl FileTree {
     }
 
     /// Reads the directories again, keeping the selection on the same path
-    /// when it still exists. Called when the agent may have added files.
+    /// when it still exists.
     pub(crate) fn refresh(&mut self) {
         let keep = self.rows.get(self.selected).map(|r| r.path.clone());
         self.git = universe_tools::file_status(&self.root);
-        self.filter = self
-            .only
-            .clone()
-            .or_else(|| (!self.git.is_empty()).then(|| self.git.clone()));
         self.rows.clear();
         let root = self.root.clone();
         self.read_dir(&root, Path::new(""), 0);
@@ -213,51 +131,8 @@ impl FileTree {
         }
         dirs.sort();
         files.sort();
-        // Showing only the work: what was deleted is listed too, and the
-        // rest of the folder, unless shown whole, is counted aside. Every
-        // folder of the root stays listed, after those with changes; a
-        // folder without any shows all it holds once opened.
-        let at_root = relative.as_os_str().is_empty();
-        let mut left_out = 0;
-        let mut quiet_dirs = Vec::new();
-        let mut filtered = false;
-        if let Some(filter) = &self.filter {
-            let prefix = relative.to_string_lossy();
-            for (path, letter) in filter {
-                let parent = Path::new(path).parent().unwrap_or(Path::new(""));
-                if *letter == 'D' && parent.to_string_lossy() == prefix {
-                    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-                    if !files.contains(&name) {
-                        files.push(name);
-                    }
-                }
-            }
-            files.sort();
-            let changed = |path: &Path, is_dir: bool| {
-                let path = path.to_string_lossy();
-                if is_dir {
-                    let inside = format!("{path}/");
-                    filter.keys().any(|f| f.starts_with(&inside))
-                } else {
-                    filter.contains_key(path.as_ref())
-                }
-            };
-            let holds_changes = at_root || changed(relative, true);
-            if holds_changes && !self.whole.contains(relative) {
-                filtered = true;
-                let before = dirs.len() + files.len();
-                if at_root {
-                    (dirs, quiet_dirs) =
-                        dirs.into_iter().partition(|d| changed(Path::new(d), true));
-                } else {
-                    dirs.retain(|d| changed(&relative.join(d), true));
-                }
-                files.retain(|f| changed(&relative.join(f), false));
-                left_out = before - dirs.len() - quiet_dirs.len() - files.len();
-            }
-        }
         // Directories first, as in most file trees.
-        for name in dirs.into_iter().chain(quiet_dirs) {
+        for name in dirs {
             let path = relative.join(&name);
             let open = self.expanded.contains(&path);
             self.rows.push(Row {
@@ -265,7 +140,6 @@ impl FileTree {
                 name,
                 depth,
                 is_dir: true,
-                unchanged: None,
             });
             if open {
                 self.read_dir(
@@ -281,24 +155,6 @@ impl FileTree {
                 name,
                 depth,
                 is_dir: false,
-                unchanged: None,
-            });
-        }
-        if left_out > 0 {
-            self.rows.push(Row {
-                path: relative.to_owned(),
-                name: format!("+{left_out} unchanged"),
-                depth,
-                is_dir: false,
-                unchanged: Some(left_out),
-            });
-        } else if !filtered && self.filter.is_some() && self.whole.contains(relative) {
-            self.rows.push(Row {
-                path: relative.to_owned(),
-                name: "− only the changes".to_owned(),
-                depth,
-                is_dir: false,
-                unchanged: Some(0),
             });
         }
     }
@@ -322,15 +178,6 @@ impl FileTree {
     /// is returned for the caller to show.
     pub(crate) fn open(&mut self) -> Option<PathBuf> {
         let row = self.rows.get(self.selected)?.clone();
-        // The row standing for a folder's unchanged files shows them, or
-        // hides them again.
-        if row.unchanged.is_some() {
-            if !self.whole.remove(&row.path) {
-                self.whole.insert(row.path);
-            }
-            self.refresh();
-            return None;
-        }
         if row.is_dir {
             if !self.expanded.remove(&row.path) {
                 self.expanded.insert(row.path);
@@ -388,51 +235,6 @@ mod tests {
         assert_eq!(names(&tree), ["src", "README.md"]);
     }
 
-    #[test]
-    fn showing_only_changes_keeps_their_folders_and_counts_the_rest() {
-        let dir = project();
-        let mut tree = FileTree::new(dir.path().to_owned());
-        tree.show_changes(vec![
-            ("src/lib.rs".into(), 'M'),
-            ("src/gone.rs".into(), 'D'),
-        ]);
-        assert_eq!(
-            names(&tree),
-            [
-                "src",
-                "  gone.rs",
-                "  lib.rs",
-                "  +1 unchanged",
-                "+1 unchanged"
-            ]
-        );
-        // The first changed file is chosen; letters are the branch's.
-        assert_eq!(tree.rows()[tree.selected()].name, "gone.rs");
-        assert_eq!(tree.git_status(Path::new("src"), true), Some('M'));
-        assert_eq!(tree.git_status(Path::new("src/gone.rs"), false), Some('D'));
-
-        // src's unchanged files, shown, then hidden again.
-        tree.select(3);
-        assert_eq!(tree.open(), None);
-        assert_eq!(
-            names(&tree),
-            [
-                "src",
-                "  bin",
-                "  gone.rs",
-                "  lib.rs",
-                "  − only the changes",
-                "+1 unchanged"
-            ]
-        );
-        tree.select(4);
-        assert_eq!(tree.open(), None);
-        assert_eq!(names(&tree)[3], "  +1 unchanged");
-
-        tree.show_everything();
-        assert_eq!(names(&tree), ["src", "  bin", "  lib.rs", "README.md"]);
-    }
-
     /// `project()` as a repository, everything committed.
     fn repository() -> tempfile::TempDir {
         let dir = project();
@@ -461,30 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_shows_what_is_not_committed_and_keeps_the_root_in_reach() {
+    fn the_tree_shows_everything_and_marks_what_is_not_committed() {
         let dir = repository();
-        // Nothing changed: everything shows, as before.
-        let tree = FileTree::new(dir.path().to_owned());
-        assert_eq!(names(&tree), ["docs", "src", "README.md"]);
-
-        // One file changed: its folders open, the folders of the root stay
-        // listed after it, the rest of each folder counted.
         fs::write(dir.path().join("src/lib.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("docs/new.md"), "").unwrap();
         let mut tree = FileTree::new(dir.path().to_owned());
-        assert_eq!(
-            names(&tree),
-            ["src", "  lib.rs", "  +1 unchanged", "docs", "+1 unchanged"]
-        );
+        assert_eq!(names(&tree), ["docs", "src", "README.md"]);
         assert_eq!(tree.git_status(Path::new("src/lib.rs"), false), Some('M'));
-        // A folder without changes, opened, shows all it holds.
-        tree.select(3);
-        assert_eq!(tree.open(), None);
-        assert_eq!(
-            &names(&tree)[3..],
-            ["docs", "  faq.md", "  guide.md", "+1 unchanged"]
-        );
-        // The root shown whole: everything, in order, and the way back.
-        tree.select(6);
+        // A folder takes the strongest of its files' letters.
+        assert_eq!(tree.git_status(Path::new("src"), true), Some('M'));
+        assert_eq!(tree.git_status(Path::new("docs"), true), Some('?'));
+        assert_eq!(tree.git_status(Path::new("README.md"), false), None);
+        tree.select(0);
         assert_eq!(tree.open(), None);
         assert_eq!(
             names(&tree),
@@ -492,33 +282,11 @@ mod tests {
                 "docs",
                 "  faq.md",
                 "  guide.md",
+                "  new.md",
                 "src",
-                "  lib.rs",
-                "  +1 unchanged",
-                "README.md",
-                "− only the changes"
+                "README.md"
             ]
         );
-
-        // A file the agent writes opens its own path only: docs, folded by
-        // hand, stays folded.
-        tree.select(0);
-        assert_eq!(tree.open(), None);
-        fs::write(dir.path().join("src/bin/x.rs"), "fn main() {}").unwrap();
-        tree.reveal_one("src/bin/x.rs");
-        assert_eq!(
-            names(&tree),
-            [
-                "docs",
-                "src",
-                "  bin",
-                "    x.rs",
-                "  lib.rs",
-                "README.md",
-                "− only the changes"
-            ]
-        );
-        assert_eq!(tree.git_status(Path::new("src"), true), Some('M'));
     }
 
     #[test]

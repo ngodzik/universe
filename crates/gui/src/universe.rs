@@ -1,8 +1,7 @@
-//! The codebase as a universe (Ctrl-N, twice): each file a star sized by its
-//! length, each folder a dimmer one, the links between them what holds what
-//! and what imports what. The stars spread out from the centre as the
-//! layout finds their places, and light up as the agent reads them, or
-//! flare with sparks as it edits them.
+//! The codebase as a universe: each file a star sized by its length, each
+//! folder a dimmer one, the links between them what holds what, what
+//! imports what and what calls what through the API. The stars spread out
+//! from the centre as the layout finds their places.
 //!
 //! The stars gather into galaxies by what the person chose: by module at
 //! first, or by language, layer or role, and by a second criterion into
@@ -23,7 +22,6 @@ use bevy::prelude::*;
 use universe_codemap::{
     CodeMap, Criterion, EdgeKind, Grouping, Key, Language, Layout, MAX_CRITERIA, NodeKind, Role,
 };
-use universe_ui::Entry;
 
 /// The most files mapped: beyond, the layout would take too long to settle
 /// and the sky too busy to read.
@@ -40,17 +38,6 @@ const REST: f32 = 3.6;
 const FADED: f32 = 0.16;
 /// How much smaller a star outside the galaxy entered is.
 const FADED_SIZE: f32 = 0.55;
-
-/// How much brighter a star a file the agent just read or edited is, and
-/// how fast that fades, per second.
-const READ_FLASH: f32 = 10.0;
-const EDIT_FLASH: f32 = 28.0;
-const FADE: f32 = 1.6;
-
-/// Sparks thrown by an edit, how fast at most, and how long they live.
-const SPARKS: usize = 36;
-const SPARK_SPEED: f32 = 3.2;
-const SPARK_LIFE: f32 = 1.4;
 
 /// The camera's nearest to what it looks at: closer, a star would pass
 /// through it and its glow fill the window.
@@ -97,12 +84,6 @@ pub(crate) struct Universe {
     layout: Option<Layout>,
     /// The star of each node, in the map's order.
     stars: Vec<Entity>,
-    /// How much each node glows above its rest, and in which colour.
-    flash: Vec<(f32, LinearRgba)>,
-    /// How many transcript entries were looked at for the agent's work.
-    seen: usize,
-    /// The map was just built: the transcript so far is not replayed.
-    fresh: bool,
     /// The camera: around which point, from which angles, how far.
     focus: Vec3,
     yaw: f32,
@@ -126,19 +107,11 @@ pub(crate) struct Universe {
     legend: Legend,
     /// The stars must take their colours again.
     recolour: bool,
-    /// The map must be read again: a branch changed files it left out;
-    /// and the changes it was last read again for.
-    rebuild: bool,
-    rebuilt_for: Vec<String>,
     /// What the stars are searched for, and whether the search finds each:
     /// a file by its path, a folder when it holds a file found. Empty when
     /// nothing is searched for.
     query: String,
     found: Vec<bool>,
-    /// The files of the branch looked at, and whether each node is one of
-    /// them or holds one. Empty when no branch is.
-    changed_paths: Vec<String>,
-    changed: Vec<bool>,
     /// Where each galaxy's name goes on screen, in logical pixels.
     pub(crate) galaxies_on_screen: Vec<Option<Vec2>>,
     /// What the panels report of the mouse, for the next frame.
@@ -152,9 +125,6 @@ pub(crate) struct Universe {
     /// How much of the window's width the panels cover on the right: the
     /// view moves so that the universe is centred in what is left.
     pub(crate) covered: f32,
-    /// For each node a file the branch changed since it left the main
-    /// one: the colour it pulses in, how strongly, and its phase.
-    pulses: Vec<Option<(LinearRgba, f32, f32)>>,
     /// Whether the window shows the deployments rather than the code: the
     /// stars rest, and the camera is the fleet's.
     pub(crate) deployments: bool,
@@ -168,9 +138,6 @@ impl Universe {
             map: None,
             layout: None,
             stars: Vec::new(),
-            flash: Vec::new(),
-            seen: 0,
-            fresh: false,
             focus: Vec3::ZERO,
             yaw: 0.6,
             pitch: 0.35,
@@ -186,19 +153,14 @@ impl Universe {
             cluster_colours: Vec::new(),
             legend: Vec::new(),
             recolour: false,
-            rebuild: false,
-            rebuilt_for: Vec::new(),
             query: String::new(),
             found: Vec::new(),
-            changed_paths: Vec::new(),
-            changed: Vec::new(),
             galaxies_on_screen: Vec::new(),
             hovered: None,
             chosen: None,
             on_screen: Vec::new(),
             covered: 0.0,
             deployments: false,
-            pulses: Vec::new(),
         }
     }
 
@@ -273,54 +235,6 @@ impl Universe {
         self.chosen = None;
     }
 
-    /// Lights only the stars of `paths`, the files a branch changed, and
-    /// the folders that hold them; all of them again with none.
-    pub(crate) fn show_changes(&mut self, paths: &[String]) {
-        if paths == self.changed_paths.as_slice() {
-            return;
-        }
-        self.changed_paths = paths.to_vec();
-        // A changed file the map left out: read it again, that file in.
-        // Once per set of changes: a file the map cannot take (one git
-        // ignores) would have it read again and again.
-        if let Some(map) = &self.map
-            && self.rebuilt_for.as_slice() != paths
-            && paths
-                .iter()
-                .any(|p| map.find(p).is_none() && self.root.join(p).is_file())
-        {
-            self.rebuilt_for = paths.to_vec();
-            self.rebuild = true;
-            return;
-        }
-        self.changed = match &self.map {
-            Some(map) if !paths.is_empty() => {
-                let files: std::collections::HashSet<&str> =
-                    paths.iter().map(String::as_str).collect();
-                let mut ways: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for path in &files {
-                    ways.insert("");
-                    ways.extend(path.match_indices('/').map(|(at, _)| &path[..at]));
-                }
-                map.nodes
-                    .iter()
-                    .map(|n| match n.kind {
-                        NodeKind::File { .. } => files.contains(n.path.as_str()),
-                        NodeKind::Folder => ways.contains(n.path.as_str()),
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
-        self.recolour = true;
-        self.chosen = None;
-    }
-
-    /// Whether only a branch's changes are lit.
-    pub(crate) fn shows_changes(&self) -> bool {
-        !self.changed.is_empty()
-    }
-
     /// Whether the stars are searched for something.
     pub(crate) fn searching(&self) -> bool {
         !self.query.is_empty()
@@ -329,9 +243,7 @@ impl Universe {
     /// Whether a node's star is lit: inside the galaxy entered, and found
     /// by the search, if any.
     pub(crate) fn lit(&self, node: usize) -> bool {
-        self.grouping.inside(node)
-            && self.found.get(node).copied().unwrap_or(true)
-            && self.changed.get(node).copied().unwrap_or(true)
+        self.grouping.inside(node) && self.found.get(node).copied().unwrap_or(true)
     }
 
     /// The colour of galaxy `group`, for its name.
@@ -431,11 +343,6 @@ impl Universe {
         self.map.as_ref()
     }
 
-    /// How much a node glows above its rest, from 0.
-    pub(crate) fn glow(&self, node: usize) -> f32 {
-        self.flash.get(node).map_or(0.0, |f| f.0)
-    }
-
     /// The project's root, to open a chosen file from.
     pub(crate) fn root(&self) -> &std::path::Path {
         &self.root
@@ -454,18 +361,10 @@ pub(crate) struct CodeStar;
 #[derive(Component)]
 pub(crate) struct UniverseCamera;
 
-/// A spark thrown by an edit: where it goes, and how long it has left.
-#[derive(Component)]
-pub(crate) struct Spark {
-    velocity: Vec3,
-    life: f32,
-}
-
-/// Shared meshes and the sparks' material.
+/// Shared meshes.
 #[derive(Resource)]
 pub(crate) struct Assets3d {
     pub(crate) sphere: Handle<Mesh>,
-    spark: Handle<StandardMaterial>,
 }
 
 /// Sets up the camera, the links' look and the sky, all hidden until shown.
@@ -504,11 +403,6 @@ pub(crate) fn setup(
     config.line.width = 1.4;
 
     let sphere = meshes.add(Sphere::new(1.0).mesh().uv(24, 16));
-    let spark = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::rgb(9.0, 3.6, 0.8),
-        ..default()
-    });
     // The sky: faint stars far off, placed the same each time.
     let mut seed = 0x2545_f491_u32;
     let mut random = move || {
@@ -547,7 +441,7 @@ pub(crate) fn setup(
             InUniverse,
         ));
     }
-    commands.insert_resource(Assets3d { sphere, spark });
+    commands.insert_resource(Assets3d { sphere });
 }
 
 /// `colour` made `brightness` times brighter, in HDR where above 1 blooms,
@@ -751,32 +645,6 @@ fn size(node: &universe_codemap::Node) -> f32 {
     }
 }
 
-/// How bright a branch's file pulses at most, above its rest.
-const PULSE: f32 = 7.0;
-
-/// How a file the branch changed pulses: green when new, amber when changed,
-/// cyan when renamed, stronger with more lines changed (on a log scale),
-/// with a phase of its own; nothing for a deleted file, which has no star.
-fn pulse(
-    change: &universe_tools::Change,
-    lines: usize,
-    path: &str,
-) -> Option<(LinearRgba, f32, f32)> {
-    let hue = match change {
-        universe_tools::Change::Added => LinearRgba::rgb(0.3, 1.0, 0.45),
-        universe_tools::Change::Modified => LinearRgba::rgb(1.0, 0.7, 0.15),
-        universe_tools::Change::Renamed { .. } => LinearRgba::rgb(0.2, 0.9, 1.0),
-        universe_tools::Change::Deleted => return None,
-    };
-    let strength = ((1.0 + lines as f32).ln() / (1.0 + 500.0_f32).ln()).clamp(0.2, 1.0);
-    // FNV-1a over the path: the same phase from one frame to the next.
-    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    let phase = (hash % 6283) as f32 / 1000.0;
-    Some((hue, strength, phase))
-}
-
 /// Builds the map and the stars the first time the universe shows, and
 /// shows or hides the scene with it.
 pub(crate) fn show_or_hide(
@@ -808,39 +676,10 @@ pub(crate) fn show_or_hide(
     let Some(assets) = assets else {
         return;
     };
-    // Read again: the stars of the old map go, the new ones spread out.
-    if universe.rebuild && shown {
-        universe.rebuild = false;
-        for star in std::mem::take(&mut universe.stars) {
-            commands.entity(star).despawn();
-        }
-        universe.map = None;
-        universe.layout = None;
-    }
     if !shown || universe.map.is_some() {
         return;
     }
-    // The files the branch changed since it left the main one, and those
-    // of a review, come first: they show, whatever fits.
-    let branch: Vec<universe_tools::ChangedFile> = universe_tools::branch_base(&universe.root)
-        .and_then(|base| universe_tools::changed_files(&universe.root, &base))
-        .unwrap_or_default();
-    let mut forced = universe.changed_paths.clone();
-    forced.extend(
-        branch
-            .iter()
-            .filter(|f| f.change != universe_tools::Change::Deleted)
-            .map(|f| f.path.clone()),
-    );
-    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &forced);
-    universe.pulses = map
-        .nodes
-        .iter()
-        .map(|node| {
-            let file = branch.iter().find(|f| f.path == node.path)?;
-            pulse(&file.change, file.added + file.removed, &file.path)
-        })
-        .collect();
+    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &[]);
     let layout = Layout::new(&map);
     let stars = map
         .nodes
@@ -866,74 +705,13 @@ pub(crate) fn show_or_hide(
                 .id()
         })
         .collect();
-    universe.flash = vec![(0.0, LinearRgba::BLACK); map.nodes.len()];
     universe.on_screen = vec![None; map.nodes.len()];
     universe.stars = stars;
     universe.map = Some(map);
     universe.layout = Some(layout);
-    universe.fresh = true;
-    // What was searched for and changed is found again in the new map.
+    // What was searched for is found again in the new map.
     universe.query.clear();
-    universe.changed_paths.clear();
     universe.regroup();
-}
-
-/// Lights the files the agent read or edited since last frame, and throws
-/// sparks from those it edited.
-pub(crate) fn light_up(
-    universe: &mut Universe,
-    transcript: &[Entry],
-    commands: &mut Commands,
-    assets: Option<&Assets3d>,
-) {
-    // What the agent did before the universe was built is history: only
-    // what it does from then on lights up.
-    if universe.fresh {
-        universe.fresh = false;
-        universe.seen = transcript.len();
-    }
-    let from = universe.seen.min(transcript.len());
-    universe.seen = transcript.len();
-    let Some(map) = universe.map.as_ref() else {
-        return;
-    };
-    let lit: Vec<(usize, bool)> = crate::activity::touched(&transcript[from..])
-        .into_iter()
-        .filter_map(|(path, edited)| Some((map.find(path)?, edited)))
-        .collect();
-    for (node, edited) in lit {
-        universe.flash[node] = if edited {
-            (EDIT_FLASH, LinearRgba::rgb(1.0, 0.55, 0.2))
-        } else {
-            (READ_FLASH, LinearRgba::rgb(0.35, 0.65, 1.0))
-        };
-        if edited && let Some(assets) = assets {
-            let at = universe
-                .layout
-                .as_ref()
-                .and_then(|l| l.positions().get(node).copied())
-                .map_or(Vec3::ZERO, Vec3::from_array);
-            for i in 0..SPARKS {
-                // Spread evenly over a sphere, at speeds that vary.
-                let t = (i as f32 + 0.5) / SPARKS as f32;
-                let y = 1.0 - 2.0 * t;
-                let r = (1.0 - y * y).sqrt();
-                let a = i as f32 * 2.399_963;
-                let direction = Vec3::new(a.cos() * r, y, a.sin() * r);
-                let speed = SPARK_SPEED * (0.45 + 0.55 * ((i * 7) % 11) as f32 / 10.0);
-                commands.spawn((
-                    Mesh3d(assets.sphere.clone()),
-                    MeshMaterial3d(assets.spark.clone()),
-                    Transform::from_translation(at).with_scale(Vec3::splat(0.045)),
-                    Spark {
-                        velocity: direction * speed,
-                        life: SPARK_LIFE,
-                    },
-                    InUniverse,
-                ));
-            }
-        }
-    }
 }
 
 /// What the camera's query reads and moves.
@@ -943,23 +721,19 @@ type CameraParts = (
     &'static GlobalTransform,
 );
 
-/// The universe's camera alone: no star, no spark.
+/// The universe's camera alone: no star.
 type CameraOnly = (
     With<UniverseCamera>,
-    Without<Spark>,
     Without<MeshMaterial3d<StandardMaterial>>,
 );
 
 /// Each frame while shown: the layout's next steps, the stars where it
-/// put them, the glow fading, the sparks flying, the links, the camera.
-#[allow(clippy::too_many_arguments)]
+/// put them, the links, the camera.
 pub(crate) fn animate(
-    mut commands: Commands,
     mut universe: ResMut<Universe>,
     time: Res<Time>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut stars: Query<(&mut Transform, &MeshMaterial3d<StandardMaterial>), Without<Spark>>,
-    mut sparks: Query<(Entity, &mut Transform, &mut Spark), Without<UniverseCamera>>,
+    mut stars: Query<(&mut Transform, &MeshMaterial3d<StandardMaterial>), Without<UniverseCamera>>,
     mut camera: Query<CameraParts, CameraOnly>,
     mut gizmos: Gizmos,
 ) {
@@ -983,14 +757,11 @@ pub(crate) fn animate(
         .map(|node| universe.lit(node))
         .collect();
     let recolour = std::mem::take(&mut universe.recolour);
-    let now = time.elapsed_secs_wrapped();
     let Universe {
         map,
         layout,
         stars: entities,
-        flash,
         grouping,
-        pulses,
         ..
     } = &mut *universe;
     let (Some(map), Some(layout)) = (map.as_ref(), layout.as_mut()) else {
@@ -1014,73 +785,33 @@ pub(crate) fn animate(
         };
         transform.translation = positions[node];
         let (colour, rest, scale) = tints[node];
-        let (glow, tint) = &mut flash[node];
         if recolour {
             transform.scale = Vec3::splat(scale);
             if let Some(mut material) = materials.get_mut(&material.0) {
-                material.emissive = hdr(colour, rest, 1.0) + hdr(*tint, *glow, 0.0);
+                material.emissive = hdr(colour, rest, 1.0);
             }
         }
-        if *glow > 0.0 {
-            *glow = (*glow - *glow * FADE * dt - 0.05).max(0.0);
-            if let Some(mut material) = materials.get_mut(&material.0) {
-                material.emissive = hdr(colour, rest, 1.0) + hdr(*tint, *glow, 0.0);
-            }
-            let swell = 1.0 + (*glow / EDIT_FLASH) * 1.6;
-            transform.scale = Vec3::splat(scale * swell);
-        } else if let Some(Some((hue, strength, phase))) = pulses.get(node)
-            && lit[node]
-        {
-            // A file of the branch breathes in its colour, each at its own
-            // pace, so that they do not beat together.
-            let breath = 0.5 + 0.5 * (now * 2.2 + phase).sin();
-            if let Some(mut material) = materials.get_mut(&material.0) {
-                material.emissive =
-                    hdr(colour, rest, 1.0) + hdr(*hue, PULSE * strength * breath, 0.0);
-            }
-            transform.scale = Vec3::splat(scale * (1.0 + 0.35 * strength * breath));
-        }
-    }
-
-    for (entity, mut transform, mut spark) in &mut sparks {
-        spark.life -= dt;
-        if spark.life <= 0.0 {
-            commands.entity(entity).despawn();
-            continue;
-        }
-        transform.translation += spark.velocity * dt;
-        spark.velocity *= 1.0 - 1.8 * dt;
-        transform.scale = Vec3::splat(0.05 * spark.life / SPARK_LIFE + 0.005);
     }
 
     // The links: what holds what faint and violet, imports in the colour of
-    // the file that imports, brighter when either end glows. Only within
-    // the galaxy entered: the rest is background.
+    // the file that imports. Only within the galaxy entered: the rest is
+    // background.
     for edge in &map.edges {
         if !lit[edge.from] || !lit[edge.to] {
             continue;
         }
         let (a, b) = (positions[edge.from], positions[edge.to]);
-        let lit = flash[edge.from].0.max(flash[edge.to].0) / EDIT_FLASH;
         let colour = match edge.kind {
-            EdgeKind::Contains => hdr(
-                LinearRgba::rgb(0.35, 0.25, 0.9),
-                0.9 + lit * 4.0,
-                0.25 + lit * 0.6,
-            ),
-            EdgeKind::Imports => hdr(tints[edge.from].0, 1.1 + lit * 6.0, 0.32 + lit * 0.6),
+            EdgeKind::Contains => hdr(LinearRgba::rgb(0.35, 0.25, 0.9), 0.9, 0.25),
+            EdgeKind::Imports => hdr(tints[edge.from].0, 1.1, 0.32),
             // Through the API, from the front end to the back: magenta.
-            EdgeKind::Calls => hdr(
-                LinearRgba::rgb(0.85, 0.35, 0.95),
-                1.4 + lit * 6.0,
-                0.45 + lit * 0.5,
-            ),
+            EdgeKind::Calls => hdr(LinearRgba::rgb(0.85, 0.35, 0.95), 1.4, 0.45),
         };
-        // Between galaxies, fainter, unless lit: the galaxies stand out,
-        // and what ties them still shows.
+        // Between galaxies, fainter: the galaxies stand out, and what ties
+        // them still shows.
         let galaxy = |node: usize| grouping.of(node).map(|(g, _)| g);
         let between = galaxy(edge.from) != galaxy(edge.to);
-        let colour = if between && lit < 0.05 {
+        let colour = if between {
             hdr(colour, 0.45, colour.alpha * 0.45)
         } else {
             colour
@@ -1173,9 +904,7 @@ pub(crate) fn animate(
 
 #[cfg(test)]
 mod tests {
-    use bevy::ecs::world::CommandQueue;
     use universe_codemap::Node;
-    use universe_tools::ToolSummary;
 
     use super::*;
 
@@ -1192,6 +921,7 @@ mod tests {
         let map = CodeMap {
             nodes: vec![
                 node("", NodeKind::Folder),
+                node("src", NodeKind::Folder),
                 node("src/a.rs", file),
                 node("src/b.rs", file),
             ],
@@ -1201,98 +931,21 @@ mod tests {
         };
         let mut universe = Universe::new(PathBuf::from("/p"));
         universe.layout = Some(Layout::new(&map));
-        universe.flash = vec![(0.0, LinearRgba::BLACK); map.nodes.len()];
         universe.map = Some(map);
-        universe.fresh = true;
+        universe.regroup();
         universe
     }
 
-    fn edit(path: &str) -> Entry {
-        Entry::Tool {
-            name: "replace".into(),
-            path: Some(path.into()),
-            outcome: Ok(ToolSummary::Changed {
-                path: path.into(),
-                created: false,
-                diff: Vec::new(),
-            }),
-        }
-    }
-
-    fn read(path: &str) -> Entry {
-        Entry::Tool {
-            name: "read_file".into(),
-            path: Some(path.into()),
-            outcome: Ok(ToolSummary::Read {
-                path: path.into(),
-                lines: 10,
-            }),
-        }
-    }
-
     #[test]
-    fn a_branchs_files_pulse_by_how_they_changed_and_how_much() {
-        use universe_tools::Change;
-        let (new, small, _) = pulse(&Change::Added, 3, "a.rs").unwrap();
-        let (changed, big, _) = pulse(&Change::Modified, 900, "b.rs").unwrap();
-        let (renamed, ..) = pulse(
-            &Change::Renamed {
-                from: "c.rs".into(),
-            },
-            1,
-            "d.rs",
-        )
-        .unwrap();
-        assert!(new.green > new.red && changed.red > changed.blue && renamed.blue > renamed.red);
-        assert!(small < big && (big - 1.0).abs() < f32::EPSILON);
-        assert!(pulse(&Change::Deleted, 10, "e.rs").is_none());
-        // Each its own phase, the same each time.
-        assert_ne!(
-            pulse(&Change::Added, 1, "x.rs").unwrap().2,
-            pulse(&Change::Added, 1, "y.rs").unwrap().2
-        );
-        assert_eq!(
-            pulse(&Change::Added, 1, "x.rs"),
-            pulse(&Change::Added, 1, "x.rs")
-        );
-    }
-
-    #[test]
-    fn an_edit_flares_with_sparks_a_read_lights_up_and_history_stays_dark() {
-        let mut world = World::new();
-        let mut queue = CommandQueue::default();
-        let assets = Assets3d {
-            sphere: Handle::default(),
-            spark: Handle::default(),
-        };
+    fn a_search_lights_only_the_files_it_finds() {
         let mut universe = universe();
-        let mut transcript = vec![edit("src/b.rs")];
-        {
-            let mut commands = Commands::new(&mut queue, &world);
-            // Built after that edit: it is history, and stays dark.
-            light_up(&mut universe, &transcript, &mut commands, Some(&assets));
-        }
-        assert!(universe.glow(2) == 0.0);
-
-        transcript.push(edit("src/a.rs"));
-        transcript.push(read("src/b.rs"));
-        {
-            let mut commands = Commands::new(&mut queue, &world);
-            light_up(&mut universe, &transcript, &mut commands, Some(&assets));
-        }
-        queue.apply(&mut world);
-        assert!((universe.glow(1) - EDIT_FLASH).abs() < f32::EPSILON);
-        assert!((universe.glow(2) - READ_FLASH).abs() < f32::EPSILON);
-        assert!(universe.glow(0) == 0.0);
-        let sparks = world.query::<&Spark>().iter(&world).count();
-        assert_eq!(sparks, SPARKS);
-
-        // Nothing new: nothing more.
-        {
-            let mut commands = Commands::new(&mut queue, &world);
-            light_up(&mut universe, &transcript, &mut commands, Some(&assets));
-        }
-        queue.apply(&mut world);
-        assert_eq!(world.query::<&Spark>().iter(&world).count(), SPARKS);
+        let lit = |universe: &Universe| (2..4).map(|n| universe.lit(n)).collect::<Vec<_>>();
+        assert_eq!(lit(&universe), [true, true]);
+        universe.search("a.rs");
+        assert!(universe.searching());
+        assert_eq!(lit(&universe), [true, false]);
+        universe.search("");
+        assert!(!universe.searching());
+        assert_eq!(lit(&universe), [true, true]);
     }
 }

@@ -12,60 +12,39 @@
 
 ## Principle
 
-**A deterministic tool does the work before any model does.** Compilers, tests, linters, the LSP and git are cheap, fast and right. A model is called for what they cannot do, and its output is checked by them before it is kept. A feature that sends a model what a tool could have answered is a bug.
+**Deterministic tools read the project, and no model is called.** Parsers, patterns, the LSP, git, `kustomize` and `helm` read what the project is; universe draws it. What cannot be read is left out rather than guessed or drawn wrong. universe never edits the project's files; the one thing it changes, when the person asks, is a linked repository fast-forwarded where nothing can be lost.
 
 ## Architecture
 
 Separation of concerns is **enforced by the crate dependency graph**, not by convention. The compiler refuses inverted dependencies.
 
 ```
-                crates/core   ← no internal dependencies, no I/O
-                ↑         ↑
-      crates/llm          crates/tools
-     (core)               (core)
-          ↑               ↑
-          |         crates/agent  (core + tools, never llm)
-          |               ↑
-          |         crates/ui     (core + tools + agent + preview, never llm, never a window library)
-          |               ↑
-          |         crates/gui    (core + tools + agent + ui + codemap + preview, never llm)
-          |               ↑
-          universe  (bin, depends on all)
-
       crates/codemap  (no internal dependencies, no rendering)
-      crates/mcp      (core)
-      crates/preview  (no internal dependencies)
+      crates/tools    (no internal dependencies)
+                ↑
+      crates/ui       (tools, never a window library)
+                ↑
+      crates/gui      (tools + ui + codemap)
+                ↑
+      universe        (bin, depends on ui and gui)
 ```
 
 | Crate             | Single responsibility                                                      |
 |-------------------|----------------------------------------------------------------------------|
-| `universe-core`  | Domain types and traits, zero I/O, zero network                            |
-| `universe-llm`   | Model providers, one `impl ChatModel` per protocol, the Claude Code and Codex `Delegate`, and what their subscriptions report (quotas, each call from their own files) |
-| `universe-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git, a pull request checked out apart for review, the lines a change added that repeat the project's code, and the document sources the settings name (a file, a page behind an MCP server's tools) |
-| `universe-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
-| `universe-ui`    | The interface's state: modes, keys, commands, the editor, the App view's preview (what it tells, what the person asks of it). Draws nothing |
-| `universe-gui`   | Draws `universe-ui`'s state in a window, with egui on Bevy, and runs its loop; holds the Chrome (CEF) the App view shows its page with, under the view. Generic over `ChatModel` |
-| `universe-codemap` | The codebase as a graph (folders, files, imports read by patterns, Python packages, TypeScript aliases, Dart packages and Go modules (each `go.mod`, a module's `vendor` folder) resolved, routes read from FastAPI's decorators when there is no spec and calls from the paths clients write, a front end's calls to its back end through an OpenAPI spec (the latest of an API's versions, each operation served by the function its id names, else by the route of its method and path)), its design one level at a time (parts, packages found by their manifests, what uses what, layers, loops), its front ends' screens as their routers declare them (Next.js's `app` and `pages`, React Router, TanStack Router, a Flutter app's go_router and named routes) with the links between them, what each calls through its imports and the workflows these make (each action of the API at the screen that calls it, with the way there), and what runs each (its script, its runner, the variable of its API's address, its session's cookies), its files grouped by module, language, layer or role, its services (those of its Compose files, the folders that serve an API or MCP tools and the front ends that call one) and who reaches whom, through an OpenAPI spec, over MCP or by a URL naming a service, each link with where it was read, the tables its SQLAlchemy and SQLModel models define (columns, keys, indexes, foreign keys), a branch's changes read for review (routes from the OpenAPI specs before and after, Alembic migrations, models' tables, files by area), where the project runs as its deployment and infrastructure say (per-project local settings linking repositories and saying how its front end runs, Helm charts, Kustomize trees and Flux objects, also declared in Terraform, Terragrunt units, AWS, Google Cloud and DigitalOcean with every setting's layers, each environment rendered by `kustomize` and `helm` with origins kept and secrets hidden, Terraform read with modules at their pinned ref, cloud identifiers matched to the blocks that configure them, an architecture model, every environment assembled at once (each release's images, its objects with what they say of themselves and how they act on each other, its settings told by the kind of layer that set them), a cache keyed by the repositories' state, and linked repositories fast-forwarded where nothing can be lost), and a force-directed layout that gathers groups into galaxies. Draws nothing |
-| `universe-mcp`   | A client of the Model Context Protocol: the servers the settings declare, over stdio or streamable HTTP with fixed headers or OAuth (discovery, dynamic registration, PKCE, the grant kept and renewed), their tools offered to models through core's `ExternalTools` |
-| `universe-preview` | A project's front end run as its developers run it (its own command, else its `dev` script through its runner, a Flutter app with `flutter run` for the web and what it reads as `--dart-define`, on a free local port), against a back end simulated from its API's spec (each answer a fixture kept to be changed by hand, else made from the schema the same for the same place, bent on demand to empty lists, rights withheld, flags on, slowness, failures or one operation's declared status, what a page creates, changes and deletes held as the spec's paths say (an action on an item, ids given for objects, a creation listed elsewhere) until forgotten, each item the same wherever it shows, then bent by the JavaScript a model wrote for it, run in QuickJS with no access to the machine, its answers given only when they hold to the schemas, each call told with the operation it reached), in the Chrome universe holds, driven over the DevTools protocol through its page's own socket, the system's Chrome, Chromium or Edge started headless for tests (its address, its loads, its console's errors, a workflow's steps shown in turn); everything it starts stopped with it, a browser's profile removed |
-| `universe`       | CLI entry point                                                            |
+| `universe-codemap` | The codebase as a graph (folders, files, imports read by patterns, Python packages, TypeScript aliases, Dart packages and Go modules (each `go.mod`, a module's `vendor` folder) resolved, routes read from FastAPI's decorators when there is no spec and calls from the paths clients write, a front end's calls to its back end through an OpenAPI spec (the latest of an API's versions, each operation served by the function its id names, else by the route of its method and path)), its design one level at a time (parts, packages found by their manifests, what uses what, layers, loops), its files grouped by module, language, layer or role, its services (those of its Compose files, the folders that serve an API or MCP tools and the front ends that call one) and who reaches whom, through an OpenAPI spec, over MCP or by a URL naming a service, each link with where it was read, the tables its SQLAlchemy and SQLModel models define (columns, keys, indexes, foreign keys), where the project runs as its deployment and infrastructure say (per-project local settings linking repositories, Helm charts, Kustomize trees and Flux objects, also declared in Terraform, Terragrunt units, AWS, Google Cloud and DigitalOcean with every setting's layers, each environment rendered by `kustomize` and `helm` with origins kept and secrets hidden, Terraform read with modules at their pinned ref, cloud identifiers matched to the blocks that configure them, an architecture model, every environment assembled at once (each release's images, its objects with what they say of themselves and how they act on each other, its settings told by the kind of layer that set them), a cache keyed by the repositories' state, and linked repositories fast-forwarded where nothing can be lost), and a force-directed layout that gathers groups into galaxies. Draws nothing |
+| `universe-tools` | Deterministic tools for the file open: where a name is defined or used, as the project's language servers say or as `git grep` reads it, and what git says of each file. Writes nothing |
+| `universe-ui`    | The interface's state: the view shown, the files, the file open read only, modes, keys, commands, how the window looks. Draws nothing |
+| `universe-gui`   | Draws `universe-ui`'s state in a window, with egui on Bevy, the project's views in 2D and 3D, and runs its loop |
+| `universe`       | CLI entry point: opens the window on a folder                              |
 
-In `universe-ui`, keys become actions only in `keymap.rs`, and `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O. It reads keys, clicks and areas in its own types (`input.rs`) and colours as RGB (`style.rs`), never the window's: `universe-gui` translates its events into them, so that the state is tested without a window. Effects are carried out by `universe-ui`'s `Host`, never by the window itself. `universe-gui` draws the state without changing anything, and drives the `Host` once a frame without ever waiting on it. The window sleeps between keys: nothing in it may ask egui to repaint unless something moves, since bevy_egui takes any request, even one for later, as one for now. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
+In `universe-ui`, keys become actions only in `keymap.rs` (and, inside the file open, in `reader.rs`, which follows Vim), and `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O, but reading the files it opens. It reads keys and clicks in its own types (`input.rs`) and colours as RGB (`style.rs`), never the window's: `universe-gui` translates its events into them, so that the state is tested without a window. Effects are carried out by `universe-ui`'s `Host`, never by the window itself; a lookup runs on a thread of its own. `universe-gui` draws the state without changing anything but what only the drawing knows (what was clicked, how far a pane scrolls), and drives the `Host` once a frame without ever waiting on it. The window sleeps between keys: nothing in it may ask egui to repaint unless something moves, since bevy_egui takes any request, even one for later, as one for now; only the universe, while shown, draws without rest. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
 
-The App view runs the project's front end only when the person presses the button that shows its exact command; the host writes that command to the audit log, and the preview writes down what it starts so that the next start stops what a universe stopped without leaving left running. Its page is drawn by the Chrome universe holds (CEF) under the App view, which leaves room for it: the person uses it there as in any browser, at Chrome's own speed, and its keys are the page's once it is clicked, but the few that move between views. That Chrome keeps its data in universe's own folder, apart from the person's, and its pages from leaving the machine: a front end sending its pages to where it is deployed would show what is not its own. `scripts/setup-chrome.sh` installs it for macOS. What the spec's paths cannot tell of the back end (a checkout confirmed makes an order), the person asks a model for: it writes a program kept in universe's folder, read again whenever it changes, that runs in a sandbox with no files, network or processes, so it needs no approval; it is kept only once tried, each handler asked once and its answers checked against the schemas, and what is refused goes back to the model.
-
-`universe-agent` does not depend on `universe-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network. Tools served by others reach it the same way, as core's `ExternalTools`, which `universe-mcp` implements: each call waits for the person, one its server says only reads once per server, the person's always letting that server's reads run for the rest of the conversation. A server's OAuth grant is kept for the address it was given for, and never sent to another.
-
-A `Delegate` (Claude Code, Codex) is an agent rather than a model: it gets a whole task, edits files and runs commands itself, and reports what it does as events. Claude Code runs in its own auto permission mode, Codex in its sandbox; a planner or reviewer only reads. What their safety checks refuse is shown, for the person to approve in their next message.
-
-A model edits files through `Toolbox` and runs commands through the agent's `run_command`, where `universe_tools::assess` holds what cannot be undone, leaves the machine or cannot be read, for the person to approve; a command held only because it cannot be read is first read by the cheapest priced model. Writing where code runs later (hooks, CI workflows, shell start-up files, tools' settings) is held, and every command is written to `~/.universe/audit.log`. A command that would show a secret is refused outright; secrets reach a command only when a program reads its own or the person allowed one it names, and what commands and checks print is redacted of them and of those the project's `.env` files hold. A file of secrets is never read, searched or edited through `Toolbox`, nor named by a command: of a `.env` file, a model sees the names it sets, then the value of one whose name and look say it is no secret. Checks are run by the agent, so a model can neither skip nor fake them; they judge a pair and `universe do`, not a request in the conversation.
-
-A new crate (workflows, context) is added when its first real code lands, not before, and this graph is updated in the same commit.
+A new crate is added when its first real code lands, not before, and this graph is updated in the same commit.
 
 ## Idiomatic Rust patterns
 
 1. **Traits** are the only abstraction mechanism. `impl Trait` for static dispatch, `dyn Trait` only for heterogeneous collections.
-2. **Newtypes** for domain primitives: `TokenCount`, `Usd`, `ModelId`. Never a bare `u64` or `f64` where a domain type makes sense.
+2. **Newtypes** for domain primitives. Never a bare `u64` or `f64` where a domain type makes sense.
 3. **Typestate** for lifecycles where calling a method in the wrong state is a bug the compiler can catch.
 4. **Builders** for complex configuration, validated at `build()`, returning `Result`.
 5. **Iterators** over indexed loops.
@@ -79,9 +58,9 @@ A new crate (workflows, context) is added when its first real code lands, not be
 - An error keeps its source: wrap with `#[source]`, never stringify the cause away
 
 ### Secrets
-- API keys come from the environment, never from a flag value in shell history, never from a committed file
-- A type that holds a key implements `Debug` by hand and redacts it
-- universe's own folder, `~/.universe`, and all it holds are readable by their owner only: `Defaults::keep_home_private` shuts it when universe starts and when its window closes, so what writes there needs nothing more
+- A type that holds a key or a token implements `Debug` by hand and redacts it
+- What deployments hold as secrets is hidden when they are rendered, never shown
+- universe's own folder, `~/.universe`, and all it holds are readable by their owner only: `Defaults::keep_home_private` shuts it when universe starts, so what writes there needs nothing more
 
 ### Unsafe
 - `#![deny(unsafe_code)]` in every crate, the binary included
@@ -94,8 +73,7 @@ A new crate (workflows, context) is added when its first real code lands, not be
 ### Testing
 - Unit tests `#[cfg(test)]` in the relevant module
 - Integration tests in `crate/tests/`
-- `proptest` for invariants (a session total does not depend on how it was split into requests)
-- Wire formats are tested against fixed JSON bodies, never against a live provider
+- Formats read from files are tested against fixed texts, never against a live service
 
 ### Documentation
 - Every `pub` item: `///` doc-comment required

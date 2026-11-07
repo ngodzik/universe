@@ -801,10 +801,7 @@ pub(crate) fn show(
         crate::plan::switch(ui, rect, app);
         return false;
     }
-    let response = ui.allocate_rect(
-        rect.with_max_x(rect.max.x - crate::plan::EDGE_GRIP),
-        egui::Sense::click_and_drag(),
-    );
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
     if response.dragged() {
         let d = response.drag_delta();
         view.drag += Vec2::new(d.x, d.y);
@@ -885,7 +882,7 @@ pub(crate) fn show(
                 star.name.clone()
             };
             let colour = egui_colour(view.star_colour(g, s));
-            crate::shadowed(
+            crate::universe_view::shadowed(
                 &painter,
                 // Beside the star, up and right, however near it is.
                 egui::pos2(at.x + radius * 0.7 + 6.0, at.y - radius * 0.7 - 2.0),
@@ -901,7 +898,7 @@ pub(crate) fn show(
     {
         for (cluster, at) in placed.clusters.iter().zip(&view.clusters_on_screen) {
             if let Some(at) = at {
-                crate::shadowed(
+                crate::universe_view::shadowed(
                     &painter,
                     egui::pos2(at.x, at.y),
                     egui::Align2::CENTER_BOTTOM,
@@ -945,7 +942,7 @@ pub(crate) fn show(
                 egui::StrokeKind::Inside,
             );
         }
-        crate::shadowed(
+        crate::universe_view::shadowed(
             &painter,
             name_at,
             egui::Align2::CENTER_BOTTOM,
@@ -960,7 +957,7 @@ pub(crate) fn show(
         } else {
             format!("{} services · not rendered yet", galaxy.stars.len())
         };
-        crate::shadowed(
+        crate::universe_view::shadowed(
             &painter,
             at,
             egui::Align2::CENTER_BOTTOM,
