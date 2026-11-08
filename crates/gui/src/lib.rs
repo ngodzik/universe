@@ -5,8 +5,9 @@
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
 //! - draws the state with egui on Bevy: the project's views (`universe`,
-//!   `plan`, `services_view`, `api_view`, `database_view` and
-//!   `database_space`, `fleet_view`), its files and the file open.
+//!   `plan` and `plan_space`, `services_view`, `api_view`, `database_view`
+//!   and `database_space`, `fleet_view`, the views in space sharing
+//!   `space`), its files and the file open.
 //!
 //! Bevy owns the window and the frame loop, so that the views draw in 2D
 //! and 3D under the same panels.
@@ -24,8 +25,10 @@ mod fleet_view;
 mod infra;
 mod keys;
 mod plan;
+mod plan_space;
 mod service_board;
 mod services_view;
+mod space;
 mod theme;
 mod universe;
 mod universe_view;
@@ -60,7 +63,7 @@ pub use error::GuiError;
 use crate::keys::{Held, Pressed};
 use crate::plan::Plan;
 use crate::theme::{ACCENT, DIM, PANEL, RAISED, SELECTED, TEXT, YELLOW};
-use crate::universe::Universe;
+use crate::universe::{Space, Universe};
 
 /// How the window's pixels blend with what is behind it, or why they cannot.
 /// Metal offers only `Opaque` and `PostMultiplied`; a Wayland compositor
@@ -165,6 +168,7 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
         .insert_resource(universe)
         .insert_resource(fleet_view::FleetView::default())
         .insert_resource(database_space::DatabaseSpace::default())
+        .insert_resource(plan_space::PlanSpace::default())
         .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
@@ -183,6 +187,8 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
                 fleet_view::animate,
                 database_space::spawn,
                 database_space::animate,
+                plan_space::spawn,
+                plan_space::animate,
             )
                 .chain(),
         )
@@ -392,18 +398,22 @@ fn drive(
     if universe.shown != shown {
         universe.shown = shown;
     }
-    let schema = shell.app.map_view() == Some(MapView::Database) && !shell.database.flat();
-    if universe.schema != schema {
-        universe.schema = schema;
+    let space = match shell.app.map_view() {
+        Some(MapView::Database) if !shell.database.flat() => Some(Space::Database),
+        Some(MapView::Plan) if !shell.plan.flat() => Some(Space::Plan),
+        _ => None,
+    };
+    if universe.space != space {
+        universe.space = space;
     }
     if let Ok(mut camera) = panels.single_mut() {
         keep_panels_over(&universe, shell.app.opacity() >= 1.0, &mut camera);
     }
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
-    // the time, and only it and the database in space draw without rest; a
+    // the time, and only it and the views in space draw without rest; a
     // service's board is flat, and the space behind it rests.
-    let continuous = (shown && (!fleet.active || fleet.moving())) || schema;
+    let continuous = (shown && (!fleet.active || fleet.moving())) || space.is_some();
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
@@ -437,6 +447,7 @@ fn draw(
     mut universe: ResMut<Universe>,
     mut fleet: ResMut<fleet_view::FleetView>,
     mut space: ResMut<database_space::DatabaseSpace>,
+    mut plan_space: ResMut<plan_space::PlanSpace>,
     mut styled: Local<bool>,
     mut followed: Local<f32>,
     window: Query<Entity, With<PrimaryWindow>>,
@@ -525,7 +536,8 @@ fn draw(
         let free = root.available_rect_before_wrap();
         universe.covered = (ctx.content_rect().right() - free.right()).max(0.0) / window;
         fleet.covered = universe.covered;
-        space.covered = universe.covered;
+        space.rig.covered = universe.covered;
+        plan_space.rig.covered = universe.covered;
         let in_space = universe.in_space();
         egui::CentralPanel::default()
             .frame(if in_space {
@@ -550,7 +562,7 @@ fn draw(
                         fleet.active = true;
                     }
                 }
-                MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
+                MapView::Plan => plan::show(ui, &mut shell.plan, &mut plan_space, &mut shell.app),
                 MapView::Api => api_view::show(ui, &mut shell.api, &shell.plan, &mut shell.app),
                 MapView::Services => services_view::show(
                     ui,

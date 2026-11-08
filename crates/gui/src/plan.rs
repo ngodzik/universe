@@ -1,11 +1,12 @@
-//! The codebase's plan (Ctrl-N from the universe): its components as cards in layers, the
-//! foundations at the bottom, each link what one uses of another, thicker
-//! for more imports, magenta when it goes through an OpenAPI spec (a front
-//! end calling its back end), red when it closes a loop. Pointing at a card lights
-//! what it uses and what uses it; clicking one lists its files.
+//! The codebase's plan (Ctrl-N from the universe): its components in space
+//! at first (`plan_space`), or flat, as cards in layers, the foundations at
+//! the bottom; each link what one uses of another, thicker for more
+//! imports, magenta when it goes through an OpenAPI spec (a front end
+//! calling its back end), red when it closes a loop. Pointing at a part
+//! lights what it uses and what uses it; clicking one lists its files.
 //!
-//! Flat and painted by egui alone: it costs nothing while still, and only
-//! asks for frames while something on it moves.
+//! Flat, it is painted by egui alone: it costs nothing while still, and
+//! only asks for frames while something on it moves.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,6 +19,7 @@ use bevy_egui::egui::{
 use universe_codemap::{Architecture, CodeMap, ComponentKind, Repos};
 use universe_ui::{App, MapView};
 
+use crate::plan_space::{self, PlanSpace};
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT};
 
 /// The most files mapped: the code first, so that a monorepo's shows
@@ -70,6 +72,11 @@ pub(crate) struct Plan {
     /// When the part was chosen: its files show a double click's time
     /// later, so that the card they show on does not take the second click.
     chosen_at: f64,
+    /// Whether it shows flat, as cards, rather than in space.
+    flat: bool,
+    /// How many times the design was drawn: the scene in space lays out
+    /// each anew.
+    designs: u64,
 }
 
 impl Plan {
@@ -87,7 +94,14 @@ impl Plan {
             hovered: None,
             chosen: None,
             chosen_at: 0.0,
+            flat: false,
+            designs: 0,
         }
+    }
+
+    /// Whether it shows flat, as cards, rather than in space.
+    pub(crate) fn flat(&self) -> bool {
+        self.flat
     }
 
     /// Notes whether the plan shows this frame. Each time it opens, the
@@ -163,6 +177,7 @@ impl Plan {
             self.chosen = None;
         }
         self.design = Some(design);
+        self.designs += 1;
         self.opened_at = now;
     }
 }
@@ -223,7 +238,8 @@ fn arrange(painter: &Painter, design: &Architecture, project: &str) -> (Vec<Rect
     (cards, vec2(widest, tall))
 }
 
-fn title<'a>(component: &'a universe_codemap::Component, project: &'a str) -> &'a str {
+/// A part's name: its folder's or file's, the project's for its root.
+pub(crate) fn title<'a>(component: &'a universe_codemap::Component, project: &'a str) -> &'a str {
     if component.name.is_empty() {
         project
     } else {
@@ -247,7 +263,7 @@ fn subtitle(component: &universe_codemap::Component) -> String {
 
 /// What a link is made of: `12 imports · 3 API calls · loop`, a call being
 /// a file calling, through the spec, a file that serves it.
-fn counts(link: &universe_codemap::Link) -> String {
+pub(crate) fn counts(link: &universe_codemap::Link) -> String {
     let mut said = Vec::new();
     if link.imports > 0 {
         said.push(format!(
@@ -270,7 +286,7 @@ fn counts(link: &universe_codemap::Link) -> String {
 }
 
 /// Whether a part opens onto parts of its own.
-fn opens(component: &universe_codemap::Component) -> bool {
+pub(crate) fn opens(component: &universe_codemap::Component) -> bool {
     component.kind != ComponentKind::File
 }
 
@@ -309,7 +325,7 @@ fn text_size(size: f32) -> f32 {
 }
 
 /// A layer's colour: cool for the foundations, warm for what sits on top.
-fn layer_colour(layer: usize, layers: usize) -> Color32 {
+pub(crate) fn layer_colour(layer: usize, layers: usize) -> Color32 {
     let t = if layers > 1 {
         layer as f32 / (layers - 1) as f32
     } else {
@@ -357,8 +373,8 @@ fn at_height(p: [Pos2; 4], y: f32) -> f32 {
     (low + high) / 2.0
 }
 
-/// Draws the plan in `ui`, and handles the mouse over it.
-pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
+/// Draws the plan in `ui`, in space or flat, and handles the mouse over it.
+pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, space: &mut PlanSpace, app: &mut App) {
     let rect = ui.max_rect();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -392,8 +408,18 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             FontId::proportional(18.0),
             DIM,
         );
-        if let Some(folder) = header(ui, &painter, rect, app, design, &project) {
+        let mut flat = plan.flat;
+        if let Some(folder) = header(ui, &painter, rect, app, design, &project, &mut flat) {
             plan.open(&folder, now);
+        }
+        plan.flat = flat;
+        return;
+    }
+    let kept = kept(plan, design, app);
+    if !plan.flat {
+        in_space(ui, rect, &response, plan, space, &kept, app);
+        if moving {
+            ui.ctx().request_repaint();
         }
         return;
     }
@@ -464,23 +490,6 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     }
     let shown_chosen = plan.chosen.filter(|_| settled);
     let focus = plan.hovered.or(plan.chosen);
-    // What the search keeps: a part by its name, its path or any of its
-    // files'; the others fade, with their links.
-    let query = app.map_search().to_owned();
-    let kept: Vec<bool> = design
-        .components
-        .iter()
-        .map(|c| {
-            query.is_empty()
-                || plan.map.as_ref().is_some_and(|map| {
-                    let files = c.files.iter().map(|&f| map.nodes[f].path.as_str());
-                    universe_ui::search_matches(
-                        &query,
-                        [c.name.as_str(), c.path.as_str()].into_iter().chain(files),
-                    )
-                })
-        })
-        .collect();
 
     // The cards rise into place layer by layer as the plan opens.
     let since = now - plan.opened_at;
@@ -744,9 +753,11 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
         pill(&painter, at, &text, colour);
     }
 
-    if let Some(folder) = header(ui, &painter, rect, app, design, &project) {
+    let mut flat = plan.flat;
+    if let Some(folder) = header(ui, &painter, rect, app, design, &project, &mut flat) {
         opening = Some(folder);
     }
+    plan.flat = flat;
     painter.text(
         rect.left_bottom() + vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
@@ -763,6 +774,85 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     }
     if moving {
         ui.ctx().request_repaint();
+    }
+}
+
+/// What the search keeps: a part by its name, its path or any of its
+/// files'; the others fade, with their links.
+fn kept(plan: &Plan, design: &Architecture, app: &App) -> Vec<bool> {
+    let query = app.map_search();
+    design
+        .components
+        .iter()
+        .map(|c| {
+            query.is_empty()
+                || plan.map.as_ref().is_some_and(|map| {
+                    let files = c.files.iter().map(|&f| map.nodes[f].path.as_str());
+                    universe_ui::search_matches(
+                        query,
+                        [c.name.as_str(), c.path.as_str()].into_iter().chain(files),
+                    )
+                })
+        })
+        .collect()
+}
+
+/// The plan in space in `rect`, the mouse over it in `response`: pointing
+/// at a part, choosing it, opening it, as flat; its header and its files
+/// as flat too.
+fn in_space(
+    ui: &mut Ui,
+    rect: Rect,
+    response: &egui::Response,
+    plan: &mut Plan,
+    space: &mut PlanSpace,
+    kept: &[bool],
+    app: &mut App,
+) {
+    let now = ui.input(|i| i.time);
+    let project = app.project().to_owned();
+    let (Some(design), Some(map)) = (plan.design.as_ref(), plan.map.as_ref()) else {
+        return;
+    };
+    space.take(design, map, plan.designs);
+    space.rig.follow(ui, response);
+    plan.hovered = response.hover_pos().and_then(|at| space.under(at));
+    let mut opening = None;
+    if response.double_clicked()
+        && let Some(c) = plan.chosen.or(plan.hovered)
+        && opens(&design.components[c])
+    {
+        opening = Some(design.components[c].path.clone());
+    } else if response.clicked() {
+        plan.chosen = plan.hovered;
+        plan.chosen_at = now;
+    }
+    let shown_chosen = plan.chosen.filter(|_| now - plan.chosen_at > DOUBLE_CLICK);
+    space.light(kept, plan.hovered.or(plan.chosen), plan.chosen);
+    space.rig.left = if shown_chosen.is_some() {
+        (DETAILS_WIDTH + 24.0) / rect.width().max(1.0)
+    } else {
+        0.0
+    };
+    let painter = ui.painter_at(rect);
+    plan_space::draw(&painter, rect, space, design, map, &project, kept);
+    let mut flat = plan.flat;
+    if let Some(folder) = header(ui, &painter, rect, app, design, &project, &mut flat) {
+        opening = Some(folder);
+    }
+    plan.flat = flat;
+    painter.text(
+        rect.left_bottom() + vec2(24.0, -18.0),
+        Align2::LEFT_BOTTOM,
+        "drag to turn · scroll to come closer · point at a part for its links and files · click it for its files · double-click to open it · what uses nothing at the heart, each part outside what it uses · Ctrl-N: the services",
+        FontId::proportional(12.0),
+        DIM,
+    );
+    if let Some(chosen) = shown_chosen {
+        details(ui, rect, plan, chosen, app, &project);
+    }
+    if let Some(folder) = opening {
+        plan.open(&folder, now);
     }
 }
 
@@ -836,7 +926,7 @@ fn arrow(painter: &Painter, points: [Pos2; 4], colour: Color32, size: f32) {
 }
 
 /// A small label on a dark pill, for a link's count.
-fn pill(painter: &Painter, at: Pos2, text: &str, colour: Color32) {
+pub(crate) fn pill(painter: &Painter, at: Pos2, text: &str, colour: Color32) {
     let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(11.5), colour);
     let rect = Rect::from_center_size(at, galley.size() + vec2(14.0, 6.0));
     painter.rect(
@@ -849,8 +939,9 @@ fn pill(painter: &Painter, at: Pos2, text: &str, colour: Color32) {
     painter.galley(rect.center() - galley.size() / 2.0, galley, colour);
 }
 
-/// The title, what the plan holds, and the switch between the views.
-/// Returns the folder of the way there clicked, to show its parts.
+/// The title, the choice between space and flat, what the plan holds, and
+/// the switch between the views. Returns the folder of the way there
+/// clicked, to show its parts.
 fn header(
     ui: &mut Ui,
     painter: &Painter,
@@ -858,6 +949,7 @@ fn header(
     app: &mut App,
     design: &Architecture,
     project: &str,
+    flat: &mut bool,
 ) -> Option<String> {
     let corner = rect.left_top() + vec2(24.0, 22.0);
     let title = painter.text(
@@ -867,9 +959,16 @@ fn header(
         FontId::proportional(26.0),
         TEXT,
     );
+    let right = toggle(
+        ui,
+        pos2(title.right() + 16.0, title.top() + 1.0),
+        flat,
+        "The parts as planets in space, each outside what it uses",
+        "The parts as cards, in layers",
+    );
     let clicked = trail(
         ui,
-        title.right_center() + vec2(16.0, 0.0),
+        pos2(right + 14.0, title.center().y),
         &design.level,
         project,
     );
@@ -965,6 +1064,34 @@ fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
         },
     );
     clicked
+}
+
+/// The choice, beside a view's title at `at`, between the view in space and
+/// flat, each told by its hint. Returns where the choice ends on the right.
+pub(crate) fn toggle(ui: &mut Ui, at: Pos2, flat: &mut bool, in_space: &str, as_flat: &str) -> f32 {
+    let mut right = at.x;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_size(at, vec2(140.0, 30.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (name, choice, hint) in [("3D", false, in_space), ("2D", true, as_flat)] {
+                let on = *flat == choice;
+                let text = RichText::new(name)
+                    .size(13.0)
+                    .color(if on { TEXT } else { DIM });
+                let button = ui
+                    .add(egui::Button::selectable(on, text))
+                    .on_hover_text(hint);
+                right = button.rect.right();
+                if button.clicked() {
+                    *flat = choice;
+                }
+            }
+        },
+    );
+    right
 }
 
 /// The two views of the codebase, top right, to pick with the mouse.

@@ -129,9 +129,18 @@ pub(crate) struct Universe {
     /// Whether the window shows the deployments rather than the code: the
     /// stars rest, and the camera is the fleet's.
     pub(crate) deployments: bool,
-    /// Whether the window shows the database in space: the code's stars
-    /// hide, and the camera and the sky are the database's.
-    pub(crate) schema: bool,
+    /// The view the window shows in space instead of the code, if any: the
+    /// code's stars hide, and the camera and the sky are that view's.
+    pub(crate) space: Option<Space>,
+}
+
+/// A view drawn in space other than the code's universe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Space {
+    /// The database: its tables as planets.
+    Database,
+    /// The plan: the project's parts as planets.
+    Plan,
 }
 
 impl Universe {
@@ -166,7 +175,7 @@ impl Universe {
             on_screen: Vec::new(),
             covered: 0.0,
             deployments: false,
-            schema: false,
+            space: None,
         }
     }
 
@@ -346,10 +355,10 @@ impl Universe {
         self.map.as_ref()
     }
 
-    /// Whether the window shows space: the code's universe, or the database
+    /// Whether the window shows space: the code's universe, or another view
     /// in it.
     pub(crate) fn in_space(&self) -> bool {
-        self.shown || self.schema
+        self.shown || self.space.is_some()
     }
 }
 

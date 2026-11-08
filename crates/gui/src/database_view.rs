@@ -15,8 +15,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bevy_egui::egui::epaint::CubicBezierShape;
 use bevy_egui::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin, Pos2, Rect,
-    Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Rect, Response, RichText,
+    ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use universe_codemap::{NodeKind, Repos, Schema, Table};
 use universe_ui::App;
@@ -321,7 +321,13 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, space: &mut DatabaseSpa
         FontId::proportional(26.0),
         TEXT,
     );
-    toggle(ui, pos2(title.right() + 16.0, title.top() + 1.0), view);
+    crate::plan::toggle(
+        ui,
+        pos2(title.right() + 16.0, title.top() + 1.0),
+        &mut view.flat,
+        "The tables as planets in space, each outside what it points at",
+        "The tables as cards, flat",
+    );
 
     let Some(schema) = view.shown() else {
         painter.text(
@@ -398,39 +404,6 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, space: &mut DatabaseSpa
         details(ui, rect, view, &schema, chosen, app);
     }
     crate::plan::switch(ui, rect, app);
-}
-
-/// The choice, beside the title, between the tables in space and flat.
-fn toggle(ui: &mut Ui, at: Pos2, view: &mut DatabaseView) {
-    ui.scope_builder(
-        UiBuilder::new()
-            .max_rect(Rect::from_min_size(at, vec2(140.0, 30.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let choices = [
-                (
-                    "3D",
-                    false,
-                    "The tables as planets in space, each outside what it points at",
-                ),
-                ("2D", true, "The tables as cards, flat"),
-            ];
-            for (name, flat, hint) in choices {
-                let on = view.flat == flat;
-                let text = RichText::new(name)
-                    .size(13.0)
-                    .color(if on { TEXT } else { DIM });
-                if ui
-                    .add(egui::Button::selectable(on, text))
-                    .on_hover_text(hint)
-                    .clicked()
-                {
-                    view.flat = flat;
-                }
-            }
-        },
-    );
 }
 
 /// Draws the tables flat in `rect`, as cards in layers. Returns whether a

@@ -74,8 +74,9 @@ impl MapView {
                  a galaxy's name to enter it; Ctrl-N for the plan"
             }
             Self::Plan => {
-                "The plan: what uses what, foundations at the bottom. Click a part to see its \
-                 files, double-click to open it; Ctrl-N for the services"
+                "The plan: each part a planet, its files its moons, outside what it uses. Point \
+                 at a part for its links, click it for its files, double-click to open it; 2D \
+                 beside the title for cards; Ctrl-N for the services"
             }
             Self::Services => {
                 "The services: who calls the one in the middle on the left, what it calls on \
