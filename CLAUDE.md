@@ -85,3 +85,7 @@ A new crate is added when its first real code lands, not before, and this graph 
 ```bash
 scripts/check.sh    # everything CI runs, locally
 ```
+
+## Releases
+
+A version is released by a tag `vX.Y.Z` equal to the workspace's version in `Cargo.toml`, pushed once `CHANGELOG.md` has a section `## X.Y.Z (date)` saying what changed since the last tag. `.github/workflows/release.yml` refuses a tag that disagrees with the manifest, makes the release from that section and attaches the binaries for Linux and macOS.

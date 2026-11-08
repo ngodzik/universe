@@ -35,6 +35,8 @@ universe api web --save shop        # declares a system of several repositories,
 
 ## Building
 
+Each [release](https://github.com/ngodzik/universe/releases) carries the binary built for Linux (x86_64) and macOS (Apple Silicon); its notes say what it needs to run. To build it from the source instead:
+
 On Linux the window needs Wayland's client library: `sudo apt install libwayland-dev` on Debian and Ubuntu.
 
 ```bash
