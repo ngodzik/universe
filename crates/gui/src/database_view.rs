@@ -412,7 +412,7 @@ fn toggle(ui: &mut Ui, at: Pos2, view: &mut DatabaseView) {
                 (
                     "3D",
                     false,
-                    "The tables as planets in space, on orbits by their keys",
+                    "The tables as planets in space, each outside what it points at",
                 ),
                 ("2D", true, "The tables as cards, flat"),
             ];

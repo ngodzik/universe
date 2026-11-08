@@ -1,12 +1,13 @@
 //! The database in space, as the database view first shows it: each table
 //! a planet in its file's colour, larger the more tables point at it, its
 //! keys moons on a ring close around it and its other columns on a ring
-//! beyond; the tables that point at none at the core, the others on orbits
-//! around it by their foreign keys, each outside what it points at and near
-//! it, and near its file's other tables; each foreign key an arc from the
-//! moon of its column in to the one it points at. The scene shares the
-//! universe's camera and sky: the camera drifts, turns on a drag and comes
-//! closer with the wheel, and the moons turn while nothing is pointed at.
+//! beyond; the tables that point at none gathered at the heart, the others
+//! in shells around it by their foreign keys, each outside what it points
+//! at and near it, and near its file's other tables; each foreign key an
+//! arc from the moon of its column in to the one it points at, bowing away
+//! from the heart. The scene shares the universe's camera and sky: the
+//! camera drifts, turns on a drag and comes closer with the wheel, and the
+//! moons turn while nothing is pointed at.
 //!
 //! A table pointed at lights its keys, the tables they join and its
 //! columns' names; a click glides to it and shows it whole, a double click
@@ -50,11 +51,14 @@ const MOON: f32 = 0.11;
 const INNER_SPIN: f32 = 0.35;
 const OUTER_SPIN: f32 = 0.2;
 
-/// The room kept between two planets' outer rings, between two orbits, and
-/// how much more room an orbit takes than its planets would packed tight.
+/// The room kept between two planets' outer rings, how much more room the
+/// heart and a shell take than their planets would packed tight, how far a
+/// shell is at least beyond the one inside, and how far within it a planet
+/// may stand nearer or farther.
 const ROOM: f32 = 1.2;
-const GAP: f32 = 3.0;
 const PACK: f32 = 1.7;
+const STEP: f32 = 3.0;
+const SLACK: f32 = 1.0;
 
 /// How the planets find their places: how hard planets push each other
 /// away, a foreign key pulls its tables together, a file gathers its
@@ -87,14 +91,23 @@ const GREY: [f32; 3] = [0.4, 0.44, 0.55];
 /// accent, as a direction in HDR.
 const ORANGE: [f32; 3] = [1.0, 0.45, 0.25];
 
-/// Where the planets are: each on the orbit of its layer, and on it near
-/// the tables it is joined to by a foreign key and its file's others.
+/// The `i`th of `n` directions spread evenly over a sphere.
+fn fibonacci(i: usize, n: usize) -> Vec3 {
+    let y = 1.0 - 2.0 * (i as f32 + 0.5) / n.max(1) as f32;
+    let across = (1.0 - y * y).max(0.0).sqrt();
+    let angle = i as f32 * 2.399_963;
+    Vec3::new(across * angle.cos(), y, across * angle.sin())
+}
+
+/// Where the planets are: each in the shell of its layer around the core,
+/// and in it near the tables it is joined to by a foreign key and its
+/// file's others.
 #[derive(Debug, Clone)]
 pub(crate) struct Orbits {
-    /// Each planet's orbit, from the core.
+    /// Each planet's shell, from the core.
     orbit: Vec<usize>,
-    /// Where each is in the plane of the orbits.
-    spots: Vec<Vec2>,
+    /// Where each is.
+    spots: Vec<Vec3>,
     /// Each one's radius, and how far out its outer ring reaches.
     size: Vec<f32>,
     reach: Vec<f32>,
@@ -104,8 +117,9 @@ pub(crate) struct Orbits {
     /// The pairs of tables a foreign key joins, once each, the lower
     /// first, a table never with itself.
     joins: Vec<(usize, usize)>,
-    /// Each orbit's band, from how far from the middle to how far: the
-    /// core's from the middle itself, each other's beyond the one inside.
+    /// How near the middle and how far from it the planets of each shell
+    /// stand: those of the heart from the middle itself, those of each
+    /// other shell beyond the one inside.
     bands: Vec<(f32, f32)>,
     /// How far a planet may move in the next step.
     heat: f32,
@@ -113,7 +127,7 @@ pub(crate) struct Orbits {
 
 impl Orbits {
     /// The orbits of `schema`, in their first places: each file's tables
-    /// at an angle of their own, on the orbit of their layer.
+    /// toward a side of their own, in the shell of their layer.
     pub(crate) fn new(schema: &Schema) -> Self {
         let count = schema.tables.len();
         let mut joins: Vec<(usize, usize)> = Vec::new();
@@ -141,36 +155,42 @@ impl Orbits {
             .map(|t| paths.binary_search(&t.path.as_str()).unwrap_or(0))
             .collect();
         let orbit = database_view::layers(schema);
-        // Each orbit as wide as its planets need, around the one inside.
+        // The heart a ball as large as its planets need, each shell a
+        // sphere as large as its planets need, a step beyond the one inside.
         let orbits = orbit.iter().copied().max().map_or(0, |o| o + 1);
-        let mut bands = Vec::with_capacity(orbits);
-        let mut inside = 0.0_f32;
+        let mut bands: Vec<(f32, f32)> = Vec::with_capacity(orbits);
         for o in 0..orbits {
             let cells: Vec<f32> = (0..count)
                 .filter(|t| orbit[*t] == o)
                 .map(|t| 2.0 * reach[t] + ROOM)
                 .collect();
-            let area: f32 = cells.iter().map(|c| c * c).sum();
-            let widest = cells.iter().copied().fold(0.0_f32, f32::max);
-            let start = if o == 0 { 0.0 } else { inside + GAP };
-            let end = (start * start + area * PACK / PI)
-                .sqrt()
-                .max(start + widest);
-            bands.push((start, end));
-            inside = end;
+            let band = match bands.last() {
+                None => {
+                    let volume: f32 = cells.iter().map(|c| c.powi(3)).sum();
+                    (0.0, (volume * PACK * 3.0 / (4.0 * PI)).cbrt())
+                }
+                Some((_, inside)) => {
+                    let area: f32 = cells.iter().map(|c| c * c).sum();
+                    let radius = (area * PACK / (4.0 * PI)).sqrt().max(inside + STEP);
+                    (radius, radius + SLACK)
+                }
+            };
+            bands.push(band);
         }
         let files = paths.len().max(1);
         let spots = (0..count)
             .map(|t| {
                 let (start, end) = bands[orbit[t]];
-                // A small turn each, for no two to start on one spot.
-                let angle = file[t] as f32 * TAU / files as f32 + t as f32 * 0.11;
+                // Toward its file's side, each a little aside, for no two
+                // to start on one spot.
+                let way =
+                    (fibonacci(file[t], files) + fibonacci(t, count) * 0.35).normalize_or(Vec3::Y);
                 let radius = if orbit[t] == 0 {
                     end * 0.5
                 } else {
                     (start + end) * 0.5
                 };
-                Vec2::from_angle(angle) * radius
+                way * radius
             })
             .collect();
         Self {
@@ -196,29 +216,34 @@ impl Orbits {
         self.heat < SETTLED
     }
 
-    /// Moves each planet a step toward its place: away from the others on
-    /// its orbit, where they would stand in each other, and a little from
+    /// Moves each planet a step toward its place: away from the others in
+    /// its shell, where they would stand in each other, and a little from
     /// the rest; toward those it is joined to, the rest of its file and the
-    /// middle of its orbit; never out of its orbit's band.
+    /// middle of its shell; never out of it.
     pub(crate) fn step(&mut self) {
         let count = self.len();
-        let mut push = vec![Vec2::ZERO; count];
+        let mut push = vec![Vec3::ZERO; count];
         for a in 0..count {
             for b in a + 1..count {
                 let apart = self.spots[a] - self.spots[b];
                 let distance = apart.length();
                 // Two planets on one spot part along a way of their own.
                 let direction = if distance < 1e-3 {
-                    Vec2::from_angle(a as f32 * 2.399_963 + b as f32)
+                    fibonacci((a * 31 + b) % 97, 97)
                 } else {
                     apart / distance
                 };
                 let distance = distance.max(0.05);
-                let near = self.orbit[a] == self.orbit[b];
-                let weight = if near { 1.0 } else { 0.06 };
+                // Shells near each other leave too little room between them
+                // for a planet not to stand in its neighbour's.
+                let weight = match self.orbit[a].abs_diff(self.orbit[b]) {
+                    0 => 1.0,
+                    1 => 0.5,
+                    _ => 0.1,
+                };
                 let room = self.reach[a] + self.reach[b] + ROOM;
                 let mut force = weight * PUSH * room * room / (distance * distance);
-                if near && distance < room {
+                if distance < room {
                     force += (room - distance) * 0.5;
                 }
                 push[a] += direction * force;
@@ -230,7 +255,7 @@ impl Orbits {
             push[a] += pull;
             push[b] -= pull;
         }
-        let mut middles = vec![(Vec2::ZERO, 0_usize); self.files];
+        let mut middles = vec![(Vec3::ZERO, 0_usize); self.files];
         for (spot, &file) in self.spots.iter().zip(&self.file) {
             middles[file].0 += *spot;
             middles[file].1 += 1;
@@ -245,30 +270,21 @@ impl Orbits {
                 (start + end) * 0.5
             };
             let spot = self.spots[t];
-            let out = spot.try_normalize().unwrap_or(Vec2::X);
+            let out = spot.normalize_or(Vec3::Y);
             *push += (middle - spot) * KIN + out * (held - spot.length()) * HOLD;
         }
         for (t, push) in push.into_iter().enumerate() {
             let spot = self.spots[t] + push.clamp_length_max(self.heat);
-            let (start, end) = self.bands[self.orbit[t]];
-            let lowest = if self.orbit[t] == 0 {
-                0.0
-            } else {
-                start + self.reach[t]
-            };
-            let highest = (end - self.reach[t]).max(lowest);
-            let out = spot
-                .try_normalize()
-                .unwrap_or_else(|| Vec2::from_angle(t as f32 * 2.399_963));
-            self.spots[t] = out * spot.length().clamp(lowest, highest);
+            let (nearest, farthest) = self.bands[self.orbit[t]];
+            let out = spot.normalize_or(fibonacci(t, count));
+            self.spots[t] = out * spot.length().clamp(nearest, farthest);
         }
         self.heat *= COOLING;
     }
 
     /// The centre of planet `t`.
     pub(crate) fn centre(&self, t: usize) -> Vec3 {
-        let spot = self.spots[t];
-        Vec3::new(spot.x, 0.0, spot.y)
+        self.spots[t]
     }
 
     /// Whether tables `a` and `b` are joined by a foreign key.
@@ -276,19 +292,20 @@ impl Orbits {
         self.joins.contains(&(a.min(b), a.max(b)))
     }
 
-    /// The circle each orbit is drawn as: the core's edge, the middle of
-    /// each other's band.
-    fn rings(&self) -> Vec<f32> {
-        self.bands
-            .iter()
-            .enumerate()
-            .map(|(o, (start, end))| if o == 0 { *end } else { (start + end) * 0.5 })
-            .collect()
-    }
-
-    /// How far from the middle the farthest planet's outer ring may reach.
-    fn extent(&self) -> f32 {
-        self.bands.last().map_or(0.0, |(_, end)| *end)
+    /// The middle of the box the planets fill, and how far from it the
+    /// farthest one's outer ring reaches.
+    fn bounds(&self) -> (Vec3, f32) {
+        let low = self.spots.iter().copied().fold(Vec3::MAX, Vec3::min);
+        let high = self.spots.iter().copied().fold(Vec3::MIN, Vec3::max);
+        let middle = if self.spots.is_empty() {
+            Vec3::ZERO
+        } else {
+            (low + high) * 0.5
+        };
+        let reach = (0..self.len())
+            .map(|t| self.spots[t].distance(middle) + self.reach[t])
+            .fold(0.0_f32, f32::max);
+        (middle, reach)
     }
 }
 
@@ -523,11 +540,10 @@ pub(crate) struct DatabaseSpace {
     /// the details on the left.
     pub(crate) covered: f32,
     left: f32,
-    /// Where each planet is on screen, the moons of the one pointed at
-    /// with their columns, and each orbit's name.
+    /// Where each planet is on screen, and the moons of the one pointed at
+    /// with their columns.
     on_screen: Vec<Option<OnScreen>>,
     columns_on_screen: Vec<(Option<usize>, Vec2)>,
-    orbits_on_screen: Vec<Option<Vec2>>,
 }
 
 impl Default for DatabaseSpace {
@@ -547,7 +563,7 @@ impl Default for DatabaseSpace {
             chosen: None,
             centre: Vec3::ZERO,
             yaw: 0.7,
-            pitch: 0.6,
+            pitch: 0.35,
             distance: 260.0,
             target_distance: 260.0,
             zoomed: false,
@@ -557,7 +573,6 @@ impl Default for DatabaseSpace {
             left: 0.0,
             on_screen: Vec::new(),
             columns_on_screen: Vec::new(),
-            orbits_on_screen: Vec::new(),
         }
     }
 }
@@ -650,11 +665,17 @@ impl DatabaseSpace {
         }
     }
 
+    /// How planet `t`'s ring is turned: tilted as the planet's rings are,
+    /// and turned about their axis.
+    fn ring_rotation(&self, t: usize, inner: bool) -> Quat {
+        tilt(t) * Quat::from_rotation_y(self.turn(t, inner))
+    }
+
     /// Where `moon` of planet `t` is, from its centre.
     fn moon_offset(&self, orbits: &Orbits, t: usize, moon: &MoonAt) -> Vec3 {
         let radius = orbits.size[t] + if moon.inner { INNER } else { OUTER };
         let local = Vec3::new(moon.angle.cos(), 0.0, moon.angle.sin()) * radius;
-        Quat::from_rotation_y(self.turn(t, moon.inner)) * local
+        self.ring_rotation(t, moon.inner) * local
     }
 
     /// Where the moon of `column` of planet `t` is, that of the columns left
@@ -670,6 +691,13 @@ impl DatabaseSpace {
             }
         }
     }
+}
+
+/// How planet `t`'s rings are tilted: each about an axis of its own, for
+/// no two neighbours to show theirs the same way.
+fn tilt(t: usize) -> Quat {
+    Quat::from_rotation_y(t as f32 * 1.1)
+        * Quat::from_rotation_x(0.3 + 0.25 * ((t * 7) % 5) as f32 / 4.0)
 }
 
 /// Puts up the scene when shown and laid out, takes it down when left.
@@ -806,7 +834,7 @@ pub(crate) fn animate(
         space.spin += dt;
     }
     for (ring, mut transform) in &mut rings {
-        transform.rotation = Quat::from_rotation_y(space.turn(ring.table, ring.inner));
+        transform.rotation = space.ring_rotation(ring.table, ring.inner);
     }
     if std::mem::take(&mut space.reshade) {
         let count = space.orbits.as_ref().map_or(0, Orbits::len);
@@ -823,43 +851,23 @@ pub(crate) fn animate(
     let Some(layout) = space.orbits.as_ref() else {
         return;
     };
-    let flat = Quat::from_rotation_x(FRAC_PI_2);
-
-    // The orbits, faint circles around the middle.
-    let orbit_rings = layout.rings();
-    for radius in &orbit_rings {
-        gizmos
-            .circle(
-                Isometry3d::new(Vec3::ZERO, flat),
-                *radius,
-                Color::from(LinearRgba::new(0.35, 0.4, 0.8, 0.2)),
-            )
-            .resolution(160);
-    }
-
-    // Each planet's rings, the faint paths its moons turn on.
-    for t in 0..layout.len() {
-        let alpha = match space.shade(t) {
-            Shade::Picked => 0.5,
-            Shade::Lit => 0.16,
-            Shade::Dim => 0.04,
-            Shade::Faded => 0.015,
-        };
-        let around = Isometry3d::new(layout.centre(t), flat);
-        let own = PALETTE[layout.file[t] % PALETTE.len()];
+    // The rings of the table pointed at, the paths its moons turn on.
+    if let Some(f) = space.focus.filter(|f| *f < layout.len()) {
+        let around = Isometry3d::new(layout.centre(f), tilt(f) * Quat::from_rotation_x(FRAC_PI_2));
+        let own = PALETTE[layout.file[f] % PALETTE.len()];
         for (out, colour) in [(INNER, GOLD), (OUTER, own)] {
             gizmos
                 .circle(
                     around,
-                    layout.size[t] + out,
-                    Color::from(hdr(colour, 1.0, alpha)),
+                    layout.size[f] + out,
+                    Color::from(hdr(colour, 1.0, 0.35)),
                 )
-                .resolution(48);
+                .resolution(64);
         }
     }
 
-    // The keys: from the moon of the column that points, arcing over the
-    // plane, in to the moon of the column pointed at. Those of the table
+    // The keys: from the moon of the column that points, bowing away from
+    // the core, in to the moon of the column pointed at. Those of the table
     // pointed at lit, a spark running along each from the table that points
     // to the one pointed at; the others faint.
     for (i, key) in space.keys.iter().enumerate() {
@@ -868,13 +876,14 @@ pub(crate) fn animate(
         let a = space.moon_at(layout, key.from, Some(key.from_column), to);
         let b = space.moon_at(layout, key.to, key.to_column, from);
         let points = if key.from == key.to {
-            // A table pointing at itself: a loop over it.
-            let up = Vec3::Y * (layout.size[key.from] + 2.0);
-            [a, a + up, b + up, b]
+            // A table pointing at itself: a loop out of it, away from the
+            // core.
+            let out = from.normalize_or(Vec3::Y) * (layout.size[key.from] + 2.0);
+            [a, a + out, b + out, b]
         } else {
-            let lift = Vec3::Y * (a.distance(b) * 0.22).max(1.0);
+            let out = ((a + b) * 0.5).normalize_or(Vec3::Y) * (a.distance(b) * 0.25).max(1.0);
             let way = (b - a) * 0.2;
-            [a, a + lift + way, b + lift - way, b]
+            [a, a + out + way, b + out - way, b]
         };
         let (start, end, alpha, spark) = match space.focus {
             Some(f) if f == key.from => (ORANGE, ORANGE, 0.95, Some(ORANGE)),
@@ -901,10 +910,10 @@ pub(crate) fn animate(
 
     // The camera: drifting while nothing is pointed at, turned by a drag,
     // gliding to frame the whole, or the table chosen.
-    let whole = (layout.extent() * 2.2).clamp(12.0, FARTHEST);
+    let (middle, reach) = layout.bounds();
     let goal = match space.chosen.filter(|c| *c < layout.len()) {
         Some(c) => (layout.centre(c), (layout.reach[c] * 7.0).max(14.0)),
-        None => (Vec3::ZERO, whole),
+        None => (middle, (reach * 2.9).clamp(12.0, FARTHEST)),
     };
     let planets_at: Vec<(Vec3, f32, f32)> = (0..layout.len())
         .map(|t| (layout.centre(t), layout.size[t], layout.reach[t]))
@@ -972,14 +981,6 @@ pub(crate) fn animate(
     space.columns_on_screen = moons_at
         .into_iter()
         .filter_map(|(column, at)| Some((column, on_screen(at)?)))
-        .collect();
-    // Each orbit's name on its circle between its right and the camera,
-    // where the circles stand apart the most on screen.
-    let toward = Vec3::new(offset.x, 0.0, offset.z).normalize_or(Vec3::Z);
-    let named = (right + toward).normalize_or(right);
-    space.orbits_on_screen = orbit_rings
-        .iter()
-        .map(|radius| on_screen(named * *radius))
         .collect();
 }
 
@@ -1140,27 +1141,6 @@ pub(crate) fn show(
         );
     }
 
-    // The orbits' names, on their circles, but where they would cover a
-    // table's.
-    for (orbit, at) in space.orbits_on_screen.iter().enumerate() {
-        let Some(at) = at else { continue };
-        let name = if orbit == 0 {
-            "the core · points at no table".to_owned()
-        } else {
-            format!("orbit {orbit}")
-        };
-        let font = FontId::proportional(11.5);
-        let at = pos(*at) + egui::vec2(8.0, 0.0);
-        let size = painter
-            .layout_no_wrap(name.clone(), font.clone(), DIM)
-            .size();
-        let area = Rect::from_min_size(at - egui::vec2(0.0, size.y / 2.0), size);
-        if taken.iter().any(|r| r.intersects(area)) {
-            continue;
-        }
-        shadowed(&canvas, at, Align2::LEFT_CENTER, &name, font, DIM);
-    }
-
     // The columns of the table pointed at, once its rings are large enough
     // to tell their moons apart: those on the planet's right in a column
     // right of its rings, the others left of them, each tied to its moon by
@@ -1213,7 +1193,7 @@ pub(crate) fn show(
         &painter,
         rect.left_bottom() + egui::vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
-        "drag to turn · scroll to come closer · point at a table for its keys and columns · click it to go to it · double-click to open its model · each orbit points at those inside it · ◆ primary key · → foreign key",
+        "drag to turn · scroll to come closer · point at a table for its keys and columns · click it to go to it · double-click to open its model · the tables that point at none at the heart, each other outside what it points at · ◆ primary key · → foreign key",
         FontId::proportional(12.0),
         DIM,
     );
@@ -1276,13 +1256,13 @@ class Setting(Base):
 "#;
 
     #[test]
-    fn a_table_orbits_outside_what_it_points_at_and_no_planet_stands_in_another() {
+    fn a_table_turns_outside_what_it_points_at_and_no_planet_stands_in_another() {
         let schema = schema(SHOP);
         let orbits = settled(&schema);
         let from_middle = |t: usize| orbits.centre(t).length();
         for key in schema.foreign_keys() {
             assert!(
-                from_middle(key.from) > from_middle(key.to) + orbits.reach[key.from],
+                from_middle(key.from) > from_middle(key.to),
                 "{} outside {}",
                 schema.tables[key.from].name,
                 schema.tables[key.to].name
@@ -1299,8 +1279,9 @@ class Setting(Base):
                 );
             }
         }
-        // All in the plane of the orbits.
-        assert!((0..orbits.len()).all(|t| orbits.centre(t).y == 0.0));
+        // Spread in all three dimensions, not on a plane.
+        let height = |t: usize| orbits.centre(t).y.abs();
+        assert!((0..orbits.len()).any(|t| height(t) > 1.0));
         // Pointed at by more tables, a planet is larger.
         let size = |name: &str| orbits.size[schema.table(name).unwrap()];
         assert!(size("customer") > size("log"));

@@ -86,8 +86,8 @@ impl MapView {
                  Click a route for its way through; Ctrl-N for the database"
             }
             Self::Database => {
-                "The database: each table a planet, its columns its moons, on orbits by its \
-                 foreign keys, outside what it points at. Point at a table for its keys, click it \
+                "The database: each table a planet, its columns its moons, outside what it points \
+                 at. Drag to turn, scroll to come closer, point at a table for its keys, click it \
                  to go to it; 2D beside the title for cards; Ctrl-N for the files"
             }
         }
