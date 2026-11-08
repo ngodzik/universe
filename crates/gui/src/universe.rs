@@ -141,6 +141,8 @@ pub(crate) enum Space {
     Database,
     /// The plan: the project's parts as planets.
     Plan,
+    /// The services: as stars, who reaches whom.
+    Services,
 }
 
 impl Universe {

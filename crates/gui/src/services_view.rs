@@ -1,8 +1,9 @@
-//! The codebase's services (Ctrl-N, after the plan): one in the middle,
-//! those that reach it on the left, those it reaches on the right, a curve
-//! for each way, blue through an OpenAPI spec, violet over MCP, yellow by
-//! plain HTTP. A service shows what it serves and who reaches it; a link,
-//! the routes called or the tools offered, and every place it was read.
+//! The codebase's services (Ctrl-N, after the plan): all of them in space
+//! at first (`services_space`), or flat, one in the middle, those that
+//! reach it on the left, those it reaches on the right; a curve for each
+//! way, blue through an OpenAPI spec, violet over MCP, yellow by plain
+//! HTTP. A service shows what it serves and who reaches it; a link, the
+//! routes called or the tools offered, and every place it was read.
 //!
 //! Drawn from the plan's map, which reads the services with the rest:
 //! flat, painted by egui alone, nothing to wait for.
@@ -20,6 +21,7 @@ use universe_ui::{App, MapView};
 use crate::api_view::{self, ApiView};
 use crate::infra::Infra;
 use crate::plan::Plan;
+use crate::services_space::{self, ServicesSpace};
 use crate::theme::{
     self, ACCENT, CODE, CYAN, DIM, EDGE, LINK, MAGENTA, PANEL, RAISED, TEXT, YELLOW,
 };
@@ -70,10 +72,20 @@ pub(crate) struct ServicesView {
     pub(crate) element: Option<usize>,
     /// Whether the notes show.
     notes: bool,
+    /// Whether the links show flat, one service in the middle, rather than
+    /// all in space.
+    flat: bool,
+}
+
+impl ServicesView {
+    /// Whether the services show in space: who reaches whom, not flat.
+    pub(crate) fn in_space(&self) -> bool {
+        self.mode == Mode::Links && !self.flat
+    }
 }
 
 /// A way's colour and name.
-fn look(via: Via) -> (Color32, &'static str) {
+pub(crate) fn look(via: Via) -> (Color32, &'static str) {
     match via {
         Via::OpenApi => (LINK, "OpenAPI"),
         Via::Mcp => (MAGENTA, "MCP"),
@@ -83,7 +95,7 @@ fn look(via: Via) -> (Color32, &'static str) {
 }
 
 /// What a link's label says: what it carries.
-fn label(services: &Services, link: usize) -> String {
+pub(crate) fn label(services: &Services, link: usize) -> String {
     let l = &services.links[link];
     match l.via {
         Via::OpenApi => format!(
@@ -189,10 +201,11 @@ fn arrange(services: &Services, centre: usize, room: Rect) -> Vec<Option<Rect>> 
     cards
 }
 
-/// Draws the services in `ui`.
+/// Draws the services in `ui`, in space or flat.
 pub(crate) fn show(
     ui: &mut Ui,
     view: &mut ServicesView,
+    space: &mut ServicesSpace,
     plan: &Plan,
     infra: &mut Infra,
     api: &mut ApiView,
@@ -205,16 +218,25 @@ pub(crate) fn show(
         ui.ctx().request_repaint();
     }
     let rect = ui.max_rect();
-    let background = ui.allocate_rect(rect, Sense::click());
+    let background = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let corner = rect.left_top() + vec2(24.0, 22.0);
-    painter.text(
+    let title = painter.text(
         corner,
         Align2::LEFT_TOP,
         "Services",
         FontId::proportional(26.0),
         TEXT,
     );
+    if view.mode == Mode::Links {
+        crate::plan::toggle(
+            ui,
+            pos2(title.right() + 16.0, title.top() + 1.0),
+            &mut view.flat,
+            "All the services as stars in space, each outside what it reaches",
+            "One service in the middle, who reaches it and what it reaches",
+        );
+    }
     let Some(map) = plan.map() else {
         painter.text(
             rect.center(),
@@ -268,15 +290,35 @@ pub(crate) fn show(
         corner + vec2(0.0, 34.0),
         Align2::LEFT_TOP,
         format!(
-            "{} · {} services · {} links · {} in the middle",
+            "{} · {} services · {} links{}",
             app.project(),
             services.services.len(),
             services.links.len(),
-            services.services[centre].name
+            if view.flat {
+                format!(" · {} in the middle", services.services[centre].name)
+            } else {
+                String::new()
+            }
         ),
         FontId::proportional(13.0),
         DIM,
     );
+    if !view.flat {
+        in_space(
+            ui,
+            rect,
+            room_top,
+            &background,
+            view,
+            space,
+            map,
+            services,
+            infra,
+            api,
+            app,
+        );
+        return;
+    }
 
     // The details take their room on the right while three columns still
     // fit beside them; narrower, they go over the right column instead.
@@ -475,6 +517,99 @@ pub(crate) fn show(
     } else if background.clicked() {
         view.chosen = None;
     }
+    if let Some(chosen) = view.chosen {
+        details(ui, rect, view, map, services, infra, chosen, api, app);
+    }
+    crate::plan::switch(ui, rect, app);
+}
+
+/// The services in space in `rect`, under the bar ending at `top`, the
+/// mouse over them in `response`: pointing at a service, choosing it, or a
+/// link of the one chosen, putting one in the middle for the flat view;
+/// what is chosen shown whole, as flat.
+#[allow(clippy::too_many_arguments)]
+fn in_space(
+    ui: &mut Ui,
+    rect: Rect,
+    top: f32,
+    response: &egui::Response,
+    view: &mut ServicesView,
+    space: &mut ServicesSpace,
+    map: &CodeMap,
+    services: &Services,
+    infra: &Infra,
+    api: &mut ApiView,
+    app: &mut App,
+) {
+    space.take(services, map);
+    space.rig.follow(ui, response);
+    let hovered = response.hover_pos().and_then(|at| space.under(at));
+    let chosen_service = match view.chosen {
+        Some(Chosen::Service(s)) => Some(s),
+        Some(Chosen::Link(l)) => services.links.get(l).map(|link| link.from),
+        None => None,
+    };
+    space.light(hovered.or(chosen_service), chosen_service);
+    let painter = ui.painter_at(rect);
+    services_space::draw(&painter, rect, top + 20.0, space, services, map);
+
+    // What each link of the service pointed at carries, halfway along it,
+    // a click away.
+    let mut clicked_link = None;
+    let mut taken: Vec<Rect> = Vec::new();
+    for &(l, at) in space.links_on_screen() {
+        let at = pos2(at.x, at.y);
+        if at.y < top + 20.0 {
+            continue;
+        }
+        let (colour, _) = look(services.links[l].via);
+        let galley = painter.layout_no_wrap(label(services, l), FontId::proportional(11.5), colour);
+        let area = Rect::from_center_size(at, galley.size() + vec2(14.0, 6.0));
+        if taken.iter().any(|r| r.intersects(area)) {
+            continue;
+        }
+        taken.push(area);
+        let pill = ui
+            .interact(area, Id::new(("service-link", l)), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let chosen = view.chosen == Some(Chosen::Link(l));
+        painter.rect(
+            area,
+            CornerRadius::same(8),
+            theme::see(PANEL, 0.95),
+            Stroke::new(
+                1.0,
+                colour.gamma_multiply(if pill.hovered() || chosen { 1.0 } else { 0.6 }),
+            ),
+            StrokeKind::Inside,
+        );
+        painter.galley(area.min + vec2(7.0, 3.0), galley, colour);
+        if pill.clicked() {
+            clicked_link = Some(l);
+        }
+    }
+    if let Some(l) = clicked_link {
+        view.chosen = Some(Chosen::Link(l));
+    } else if response.double_clicked()
+        && let Some(s) = hovered
+    {
+        view.centre = Some(s);
+        view.chosen = Some(Chosen::Service(s));
+    } else if response.clicked() {
+        view.chosen = hovered.map(Chosen::Service);
+    }
+    space.rig.right = if view.chosen.is_some() {
+        (DETAILS_WIDTH + 24.0) / rect.width().max(1.0)
+    } else {
+        0.0
+    };
+    painter.text(
+        rect.left_bottom() + vec2(24.0, -18.0),
+        Align2::LEFT_BOTTOM,
+        "drag to turn · scroll to come closer · point at a service for its links and what it serves · click it, or a link's label, for what it holds · what reaches no other at the heart · blue OpenAPI · violet MCP · yellow HTTP · cyan cloud",
+        FontId::proportional(12.0),
+        DIM,
+    );
     if let Some(chosen) = view.chosen {
         details(ui, rect, view, map, services, infra, chosen, api, app);
     }

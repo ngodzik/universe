@@ -704,6 +704,8 @@ pub(crate) fn show(
             planet,
             &space.columns_on_screen,
             size + 3.0,
+            // The details cover the left.
+            view.chosen.is_some().then_some(false),
             |painter, at, leftwards, column| match column.and_then(|c| table.columns.get(c)) {
                 Some(column) => column_label(painter, at, leftwards, column, size),
                 None => shadowed(

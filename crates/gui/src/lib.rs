@@ -5,9 +5,9 @@
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
 //! - draws the state with egui on Bevy: the project's views (`universe`,
-//!   `plan` and `plan_space`, `services_view`, `api_view`, `database_view`
-//!   and `database_space`, `fleet_view`, the views in space sharing
-//!   `space`), its files and the file open.
+//!   `plan` and `plan_space`, `services_view` and `services_space`,
+//!   `api_view`, `database_view` and `database_space`, `fleet_view`, the
+//!   views in space sharing `space`), its files and the file open.
 //!
 //! Bevy owns the window and the frame loop, so that the views draw in 2D
 //! and 3D under the same panels.
@@ -27,6 +27,7 @@ mod keys;
 mod plan;
 mod plan_space;
 mod service_board;
+mod services_space;
 mod services_view;
 mod space;
 mod theme;
@@ -169,6 +170,7 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
         .insert_resource(fleet_view::FleetView::default())
         .insert_resource(database_space::DatabaseSpace::default())
         .insert_resource(plan_space::PlanSpace::default())
+        .insert_resource(services_space::ServicesSpace::default())
         .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
@@ -189,6 +191,8 @@ pub fn run(mut app: App, system: System) -> Result<(), GuiError> {
                 database_space::animate,
                 plan_space::spawn,
                 plan_space::animate,
+                services_space::spawn,
+                services_space::animate,
             )
                 .chain(),
         )
@@ -401,6 +405,7 @@ fn drive(
     let space = match shell.app.map_view() {
         Some(MapView::Database) if !shell.database.flat() => Some(Space::Database),
         Some(MapView::Plan) if !shell.plan.flat() => Some(Space::Plan),
+        Some(MapView::Services) if shell.services.in_space() => Some(Space::Services),
         _ => None,
     };
     if universe.space != space {
@@ -448,6 +453,7 @@ fn draw(
     mut fleet: ResMut<fleet_view::FleetView>,
     mut space: ResMut<database_space::DatabaseSpace>,
     mut plan_space: ResMut<plan_space::PlanSpace>,
+    mut services_space: ResMut<services_space::ServicesSpace>,
     mut styled: Local<bool>,
     mut followed: Local<f32>,
     window: Query<Entity, With<PrimaryWindow>>,
@@ -538,6 +544,7 @@ fn draw(
         fleet.covered = universe.covered;
         space.rig.covered = universe.covered;
         plan_space.rig.covered = universe.covered;
+        services_space.rig.covered = universe.covered;
         let in_space = universe.in_space();
         egui::CentralPanel::default()
             .frame(if in_space {
@@ -567,6 +574,7 @@ fn draw(
                 MapView::Services => services_view::show(
                     ui,
                     &mut shell.services,
+                    &mut services_space,
                     &shell.plan,
                     &mut shell.infra,
                     &mut shell.api,

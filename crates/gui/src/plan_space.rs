@@ -655,6 +655,8 @@ pub(crate) fn draw(
             planet,
             &space.moons_on_screen,
             size + 3.0,
+            // The files listed cover the left.
+            space.chosen.is_some().then_some(false),
             |painter, at, leftwards, file| match file.and_then(|n| map.nodes.get(n)) {
                 Some(node) => {
                     let shown = node
@@ -668,7 +670,7 @@ pub(crate) fn draw(
                         at,
                         leftwards,
                         &[
-                            (shown, FontId::monospace(size), TEXT),
+                            (&space::shorten(shown, 46), FontId::monospace(size), TEXT),
                             (&count, FontId::monospace(size * 0.9), DIM),
                         ],
                     );

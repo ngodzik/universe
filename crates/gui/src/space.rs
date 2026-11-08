@@ -75,6 +75,63 @@ pub(crate) fn arc(a: Vec3, b: Vec3, centre: Vec3, size: f32, itself: bool) -> [V
     }
 }
 
+/// Each body's layer, of `count` joined by `joins`, each going from a body
+/// to one it rests on: 0 for one that rests on none, one above the highest
+/// of those it rests on otherwise; bodies resting on each other, directly
+/// or around a loop, share a layer.
+pub(crate) fn layers(count: usize, joins: &[(usize, usize)]) -> Vec<usize> {
+    let edges: Vec<(usize, usize)> = joins
+        .iter()
+        .copied()
+        .filter(|(a, b)| a != b && *a < count && *b < count)
+        .collect();
+    let mut next = vec![Vec::new(); count];
+    for &(a, b) in &edges {
+        next[a].push(b);
+    }
+    // What each body reaches, itself included.
+    let reaches: Vec<Vec<bool>> = (0..count)
+        .map(|start| {
+            let mut seen = vec![false; count];
+            seen[start] = true;
+            let mut stack = vec![start];
+            while let Some(at) = stack.pop() {
+                for &n in &next[at] {
+                    if !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
+                }
+            }
+            seen
+        })
+        .collect();
+    // A loop stands for its bodies: the first that reaches each and that
+    // each reaches.
+    let loop_of: Vec<usize> = (0..count)
+        .map(|a| {
+            (0..count)
+                .find(|&b| reaches[a][b] && reaches[b][a])
+                .unwrap_or(a)
+        })
+        .collect();
+    let mut layer = vec![0; count];
+    for _ in 0..count {
+        let mut moved = false;
+        for &(a, b) in &edges {
+            let (a, b) = (loop_of[a], loop_of[b]);
+            if a != b && layer[a] < layer[b] + 1 {
+                layer[a] = layer[b] + 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    (0..count).map(|t| layer[loop_of[t]]).collect()
+}
+
 /// How body `t`'s rings are tilted: each about an axis of its own, for no
 /// two neighbours to show theirs the same way.
 pub(crate) fn tilt(t: usize) -> Quat {
@@ -343,9 +400,10 @@ pub(crate) struct Rig {
     pub(crate) drag: Vec2,
     pub(crate) zoom: f32,
     /// How much of the window's width the panels cover on the right, and
-    /// the details on the left.
+    /// the details on the left, or on the right.
     pub(crate) covered: f32,
     pub(crate) left: f32,
+    pub(crate) right: f32,
 }
 
 impl Default for Rig {
@@ -361,6 +419,7 @@ impl Default for Rig {
             zoom: 0.0,
             covered: 0.0,
             left: 0.0,
+            right: 0.0,
         }
     }
 }
@@ -441,7 +500,7 @@ impl Rig {
             .logical_viewport_size()
             .map_or(1.6, |size| size.x / size.y.max(1.0));
         let half_width = self.distance * std::f32::consts::FRAC_PI_8.tan() * aspect;
-        let shift = looking.right() * ((self.covered - self.left) * half_width);
+        let shift = looking.right() * ((self.covered + self.right - self.left) * half_width);
         *transform = looking.with_translation(looking.translation + shift);
         View {
             eye: transform.translation,
@@ -579,13 +638,15 @@ pub(crate) fn names<'a>(
 
 /// Names of what turns around `body`, once it is large enough to tell them
 /// apart: those on its right in a column right of it, the others left of
-/// it, each tied by a line to where it is, at `at`; each drawn by `label`
-/// from where its column starts, the left column's ending there.
+/// it, or all on the side `only` says, `true` for the left, when the other
+/// is covered; each tied by a line to where it is, at `at`, and drawn by
+/// `label` from where its column starts, the left column's ending there.
 pub(crate) fn beside<T: Copy>(
     canvas: &Painter,
     body: OnScreen,
     items: &[(T, Vec2)],
     gap: f32,
+    only: Option<bool>,
     mut label: impl FnMut(&Painter, egui::Pos2, bool, T),
 ) {
     if body.reach < 24.0 {
@@ -596,7 +657,7 @@ pub(crate) fn beside<T: Copy>(
         let mut side: Vec<(T, Vec2)> = items
             .iter()
             .copied()
-            .filter(|(_, at)| (at.x < body.centre.x) == leftwards)
+            .filter(|(_, at)| only.unwrap_or(at.x < body.centre.x) == leftwards)
             .collect();
         side.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
         let ys: Vec<f32> = side.iter().map(|(_, at)| at.y).collect();
@@ -613,6 +674,20 @@ pub(crate) fn beside<T: Copy>(
             label(canvas, start, leftwards, item);
         }
     }
+}
+
+/// `text` cut in the middle to `most` characters, an ellipsis where it was
+/// cut: a long path keeps where it starts and the end that names it.
+pub(crate) fn shorten(text: &str, most: usize) -> String {
+    let count = text.chars().count();
+    if count <= most {
+        return text.to_owned();
+    }
+    let head = most * 2 / 5;
+    let tail = most.saturating_sub(head + 1);
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
 }
 
 /// A label made of `parts`, each in its font and colour, from `at`
@@ -696,6 +771,14 @@ mod tests {
     }
 
     #[test]
+    fn a_body_lies_a_layer_above_what_it_rests_on_and_a_loop_shares_one() {
+        // 3 rests on 1, which rests on 0; 2 rests on itself only; 4 and 5
+        // rest on each other, 5 on 0 too, and 6 on 4.
+        let joins = [(3, 1), (1, 0), (2, 2), (4, 5), (5, 4), (5, 0), (6, 4)];
+        assert_eq!(layers(7, &joins), [0, 1, 0, 2, 1, 1, 2]);
+    }
+
+    #[test]
     fn the_body_pointed_at_is_the_nearest_under_the_pointer_or_whose_reach_it_is_in() {
         let body = |x: f32, depth: f32| {
             Some(OnScreen {
@@ -724,5 +807,10 @@ mod tests {
         assert!((middle(&placed) - middle(&wanted)).abs() < 1e-3);
         // Far enough apart, labels stay where they were wanted.
         assert_eq!(spread(&[10.0, 40.0], 15.0), vec![10.0, 40.0]);
+        // A long name keeps its start and its end.
+        assert_eq!(shorten("short", 10), "short");
+        let cut = shorten("/api/v2/dags/{dag_id}/runs/{run_id}", 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.starts_with("/api/v2") && cut.ends_with("{run_id}"));
     }
 }

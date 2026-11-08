@@ -79,8 +79,9 @@ impl MapView {
                  beside the title for cards; Ctrl-N for the services"
             }
             Self::Services => {
-                "The services: who calls the one in the middle on the left, what it calls on \
-                 the right. Click a service or a link for what it holds; Ctrl-N for the API"
+                "The services: each a star, outside what it reaches, comets running along each \
+                 link. Point at a service for its links, click it or a link for what it holds; \
+                 2D beside the title for one in the middle; Ctrl-N for the API"
             }
             Self::Api => {
                 "The API: each route of the OpenAPI specs, what serves it and what calls it. \
