@@ -1,0 +1,77 @@
+name: Release
+
+# A tag such as v0.1.0 makes a release: its notes are that version's section
+# of CHANGELOG.md, and it carries the binary built for Linux and macOS. Not
+# Windows: nothing has been tried there. It is a full release, not a
+# pre-release, so that GitHub shows it as the latest on the repository's page;
+# the 0.x version and the notes already say the project is experimental.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create:
+    name: Create the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The tag and the manifest state the version in two places, and two
+      # places drift: a binary would say one version and its release another.
+      - name: The tag is the manifest's version
+        run: |
+          declared=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml says $declared, the tag is $GITHUB_REF_NAME"
+          if [ "v$declared" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME is not the version Cargo.toml declares, $declared"
+            exit 1
+          fi
+      - name: Notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## /{p = ($2 == v)} p' CHANGELOG.md | tail -n +2 > notes.md
+          test -s notes.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" --title "universe $GITHUB_REF_NAME" --notes-file notes.md --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu GitHub still runs, rather than the latest: a
+          # binary needs at least the glibc it was linked against, and 22.04's
+          # is old enough for most distributions in use.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The window links Wayland's client library, found with pkg-config.
+      - name: Wayland headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="universe-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/universe README.md LICENSE CHANGELOG.md "$name"/
+          tar czf "$name.tar.gz" "$name"
+      - name: Attach to the release
+        run: gh release upload "$GITHUB_REF_NAME" "universe-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+        env:
+          GH_TOKEN: ${{ github.token }}
