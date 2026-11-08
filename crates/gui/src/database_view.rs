@@ -141,7 +141,7 @@ fn read(repos: &Repos, paths: &[String]) -> Schema {
     universe_codemap::schema(&files)
 }
 
-/// The columns a card lists, or a tower stacks, by their place in the
+/// The columns a card lists, or a planet's moons show, by their place in the
 /// table: the primary key first, then the foreign keys, then the rest,
 /// `most` at most.
 pub(crate) fn listed(table: &Table, most: usize) -> Vec<usize> {
@@ -412,7 +412,7 @@ fn toggle(ui: &mut Ui, at: Pos2, view: &mut DatabaseView) {
                 (
                     "3D",
                     false,
-                    "The tables as towers in space, on floors by their keys",
+                    "The tables as planets in space, each outside what it points at",
                 ),
                 ("2D", true, "The tables as cards, flat"),
             ];
