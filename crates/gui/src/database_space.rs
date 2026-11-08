@@ -1,23 +1,25 @@
 //! The database in space, as the database view first shows it: each table
-//! a tower of plates, one per column, its keys at the base, wider the more
-//! tables point at it; the towers on floors by their foreign keys, those
-//! that point at no table on the lowest, each above what it points at and
-//! near it, and near its file's other tables, which share its colour; each
-//! foreign key an arc from the plate of its column down to the one it
-//! points at. The scene shares the universe's camera and sky: the camera
-//! drifts, turns on a drag and comes closer with the wheel.
+//! a planet in its file's colour, larger the more tables point at it, its
+//! keys moons on a ring close around it and its other columns on a ring
+//! beyond; the tables that point at none at the core, the others on orbits
+//! around it by their foreign keys, each outside what it points at and near
+//! it, and near its file's other tables; each foreign key an arc from the
+//! moon of its column in to the one it points at. The scene shares the
+//! universe's camera and sky: the camera drifts, turns on a drag and comes
+//! closer with the wheel, and the moons turn while nothing is pointed at.
 //!
 //! A table pointed at lights its keys, the tables they join and its
 //! columns' names; a click glides to it and shows it whole, a double click
 //! opens its model.
 
 use std::collections::HashMap;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy_egui::egui::{self, Align2, FontId, Rect, Response, Stroke, Ui};
-use universe_codemap::{ForeignKey, Schema};
+use bevy_egui::egui::{self, Align2, Color32, FontId, Rect, Response, Stroke, Ui};
+use universe_codemap::{Column, ForeignKey, Schema, Table};
 use universe_ui::App;
 
 use crate::database_view::{self, DETAILS_WIDTH, DatabaseView};
@@ -25,42 +27,51 @@ use crate::theme::{CYAN, DIM, TEXT, YELLOW};
 use crate::universe::{PALETTE, Universe, UniverseCamera};
 use crate::universe_view::shadowed;
 
-/// The most columns a tower stacks; the rest make one plate more, its cap.
-const MAX_PLATES: usize = 16;
+/// The most columns a planet's moons show; the rest make one moon more.
+const MAX_MOONS: usize = 16;
 
-/// A plate's thickness, and the room between two.
-const PLATE: f32 = 0.2;
-const PLATE_GAP: f32 = 0.08;
+/// A planet's radius: the smallest, how much larger the tables pointing at
+/// it make it, and the largest.
+const SMALLEST: f32 = 0.55;
+const LARGER: f32 = 0.16;
+const LARGEST: f32 = 1.4;
 
-/// The height from one floor to the next: more than the tallest tower, for
-/// the keys between them to show.
-const FLOOR: f32 = 7.5;
+/// How far out from a planet's surface its rings of moons turn: the keys',
+/// then the other columns'.
+const INNER: f32 = 0.5;
+const OUTER: f32 = 1.0;
 
-/// A tower's width: the narrowest, how much wider the tables pointing at it
-/// make it, and the widest.
-const NARROWEST: f32 = 1.4;
-const WIDER: f32 = 0.3;
-const WIDEST: f32 = 3.2;
+/// A moon's radius: a key's, and another column's.
+const KEY_MOON: f32 = 0.15;
+const MOON: f32 = 0.11;
 
-/// The room kept between two towers on a floor.
-const ROOM: f32 = 1.3;
+/// How fast the rings turn, in radians a second: the keys', and the
+/// others'.
+const INNER_SPIN: f32 = 0.35;
+const OUTER_SPIN: f32 = 0.2;
 
-/// How the towers find their places: how hard towers push each other away,
-/// a foreign key pulls its tables together, a file gathers its tables, and
-/// the middle holds them all.
+/// The room kept between two planets' outer rings, between two orbits, and
+/// how much more room an orbit takes than its planets would packed tight.
+const ROOM: f32 = 1.2;
+const GAP: f32 = 3.0;
+const PACK: f32 = 1.7;
+
+/// How the planets find their places: how hard planets push each other
+/// away, a foreign key pulls its tables together, a file gathers its
+/// tables, and an orbit holds its planets to its middle.
 const PUSH: f32 = 0.35;
 const JOIN: f32 = 0.06;
 const KIN: f32 = 0.025;
-const GRAVITY: f32 = 0.008;
+const HOLD: f32 = 0.02;
 
-/// How far a tower may move in a step at first, how much less each step,
+/// How far a planet may move in a step at first, how much less each step,
 /// and below what it has settled.
 const HEAT: f32 = 1.5;
 const COOLING: f32 = 0.985;
 const SETTLED: f32 = 0.01;
 
-/// The pairs of towers a frame's steps may weigh: fewer steps a frame for a
-/// larger schema, for the window to stay smooth while it settles.
+/// The pairs of planets a frame's steps may weigh: fewer steps a frame for
+/// a larger schema, for the window to stay smooth while it settles.
 const PAIRS_PER_FRAME: usize = 240_000;
 
 /// The camera's nearest, and the farthest it frames the whole from.
@@ -68,7 +79,7 @@ const NEAREST: f32 = 4.0;
 const FARTHEST: f32 = 420.0;
 
 /// The colours of the keys, as directions in HDR: primary keys gold,
-/// foreign keys cyan, the cap of the columns left out grey.
+/// foreign keys cyan, the moon of the columns left out grey.
 const GOLD: [f32; 3] = [1.0, 0.7, 0.2];
 const TEAL: [f32; 3] = [0.2, 0.8, 1.0];
 const GREY: [f32; 3] = [0.4, 0.44, 0.55];
@@ -76,52 +87,38 @@ const GREY: [f32; 3] = [0.4, 0.44, 0.55];
 /// accent, as a direction in HDR.
 const ORANGE: [f32; 3] = [1.0, 0.45, 0.25];
 
-/// Where the towers stand: each on the floor of its layer, and on it near
+/// Where the planets are: each on the orbit of its layer, and on it near
 /// the tables it is joined to by a foreign key and its file's others.
 #[derive(Debug, Clone)]
-pub(crate) struct Towers {
-    /// Each tower's floor, from the lowest.
-    floor: Vec<usize>,
-    /// Where each stands on its floor.
+pub(crate) struct Orbits {
+    /// Each planet's orbit, from the core.
+    orbit: Vec<usize>,
+    /// Where each is in the plane of the orbits.
     spots: Vec<Vec2>,
-    /// Each one's width and its number of plates.
-    width: Vec<f32>,
-    rows: Vec<usize>,
+    /// Each one's radius, and how far out its outer ring reaches.
+    size: Vec<f32>,
+    reach: Vec<f32>,
     /// Each one's file, by its place among the files.
     file: Vec<usize>,
     files: usize,
     /// The pairs of tables a foreign key joins, once each, the lower
     /// first, a table never with itself.
     joins: Vec<(usize, usize)>,
-    /// How far a tower may move in the next step.
+    /// Each orbit's band, from how far from the middle to how far: the
+    /// core's from the middle itself, each other's beyond the one inside.
+    bands: Vec<(f32, f32)>,
+    /// How far a planet may move in the next step.
     heat: f32,
 }
 
-/// The `i`th of `n` points spread evenly over a disc of radius 1.
-fn sunflower(i: usize, n: usize) -> Vec2 {
-    let r = ((i as f32 + 0.5) / n.max(1) as f32).sqrt();
-    Vec2::from_angle(i as f32 * 2.399_963) * r
-}
-
-/// The height of a stack of `rows` plates.
-fn stack(rows: usize) -> f32 {
-    rows as f32 * (PLATE + PLATE_GAP) - PLATE_GAP
-}
-
-/// The middle of plate `row`, from the base of its tower.
-fn plate_y(row: usize) -> f32 {
-    row as f32 * (PLATE + PLATE_GAP) + PLATE * 0.5
-}
-
-impl Towers {
-    /// The towers of `schema`, each stacking its `plates`, in their first
-    /// places: each file's tables together, the files around the middle.
-    pub(crate) fn new(schema: &Schema, plates: &[Vec<usize>]) -> Self {
+impl Orbits {
+    /// The orbits of `schema`, in their first places: each file's tables
+    /// at an angle of their own, on the orbit of their layer.
+    pub(crate) fn new(schema: &Schema) -> Self {
         let count = schema.tables.len();
-        let keys = schema.foreign_keys();
         let mut joins: Vec<(usize, usize)> = Vec::new();
         let mut pointers: Vec<Vec<usize>> = vec![Vec::new(); count];
-        for key in keys.iter().filter(|k| k.from != k.to) {
+        for key in schema.foreign_keys().iter().filter(|k| k.from != k.to) {
             let pair = (key.from.min(key.to), key.from.max(key.to));
             if !joins.contains(&pair) {
                 joins.push(pair);
@@ -130,18 +127,11 @@ impl Towers {
                 pointers[key.to].push(key.from);
             }
         }
-        let width = pointers
+        let size: Vec<f32> = pointers
             .iter()
-            .map(|p| (NARROWEST + WIDER * (p.len() as f32).sqrt()).min(WIDEST))
+            .map(|p| (SMALLEST + LARGER * (p.len() as f32).sqrt()).min(LARGEST))
             .collect();
-        let rows = schema
-            .tables
-            .iter()
-            .zip(plates)
-            .map(|(table, plates)| {
-                (plates.len() + usize::from(table.columns.len() > plates.len())).max(1)
-            })
-            .collect();
+        let reach: Vec<f32> = size.iter().map(|s| s + OUTER + MOON).collect();
         let mut paths: Vec<&str> = schema.tables.iter().map(|t| t.path.as_str()).collect();
         paths.sort_unstable();
         paths.dedup();
@@ -150,46 +140,66 @@ impl Towers {
             .iter()
             .map(|t| paths.binary_search(&t.path.as_str()).unwrap_or(0))
             .collect();
-        // Each file a patch of the disc, its tables spread within it.
-        let spread = (count as f32).sqrt() * 2.6;
-        let mut placed = vec![0_usize; paths.len()];
-        let members: Vec<usize> = (0..paths.len())
-            .map(|f| file.iter().filter(|g| **g == f).count())
-            .collect();
-        let spots = file
-            .iter()
-            .map(|&f| {
-                let i = placed[f];
-                placed[f] += 1;
-                sunflower(f, paths.len()) * spread
-                    + sunflower(i, members[f]) * (members[f] as f32).sqrt() * 1.8
+        let orbit = database_view::layers(schema);
+        // Each orbit as wide as its planets need, around the one inside.
+        let orbits = orbit.iter().copied().max().map_or(0, |o| o + 1);
+        let mut bands = Vec::with_capacity(orbits);
+        let mut inside = 0.0_f32;
+        for o in 0..orbits {
+            let cells: Vec<f32> = (0..count)
+                .filter(|t| orbit[*t] == o)
+                .map(|t| 2.0 * reach[t] + ROOM)
+                .collect();
+            let area: f32 = cells.iter().map(|c| c * c).sum();
+            let widest = cells.iter().copied().fold(0.0_f32, f32::max);
+            let start = if o == 0 { 0.0 } else { inside + GAP };
+            let end = (start * start + area * PACK / PI)
+                .sqrt()
+                .max(start + widest);
+            bands.push((start, end));
+            inside = end;
+        }
+        let files = paths.len().max(1);
+        let spots = (0..count)
+            .map(|t| {
+                let (start, end) = bands[orbit[t]];
+                // A small turn each, for no two to start on one spot.
+                let angle = file[t] as f32 * TAU / files as f32 + t as f32 * 0.11;
+                let radius = if orbit[t] == 0 {
+                    end * 0.5
+                } else {
+                    (start + end) * 0.5
+                };
+                Vec2::from_angle(angle) * radius
             })
             .collect();
         Self {
-            floor: database_view::layers(schema),
+            orbit,
             spots,
-            width,
-            rows,
+            size,
+            reach,
             file,
-            files: paths.len(),
+            files,
             joins,
+            bands,
             heat: HEAT,
         }
     }
 
-    /// How many towers.
+    /// How many planets.
     fn len(&self) -> usize {
         self.spots.len()
     }
 
-    /// Whether the towers have found their places.
+    /// Whether the planets have found their places.
     pub(crate) fn settled(&self) -> bool {
         self.heat < SETTLED
     }
 
-    /// Moves each tower a step toward its place: away from the others, the
-    /// more so on its own floor, where they would stand in each other;
-    /// toward those it is joined to, the rest of its file, and the middle.
+    /// Moves each planet a step toward its place: away from the others on
+    /// its orbit, where they would stand in each other, and a little from
+    /// the rest; toward those it is joined to, the rest of its file and the
+    /// middle of its orbit; never out of its orbit's band.
     pub(crate) fn step(&mut self) {
         let count = self.len();
         let mut push = vec![Vec2::ZERO; count];
@@ -197,23 +207,18 @@ impl Towers {
             for b in a + 1..count {
                 let apart = self.spots[a] - self.spots[b];
                 let distance = apart.length();
-                // Two towers on one spot part along a way of their own.
+                // Two planets on one spot part along a way of their own.
                 let direction = if distance < 1e-3 {
                     Vec2::from_angle(a as f32 * 2.399_963 + b as f32)
                 } else {
                     apart / distance
                 };
                 let distance = distance.max(0.05);
-                let weight = match self.floor[a].abs_diff(self.floor[b]) {
-                    0 => 1.0,
-                    1 => 0.25,
-                    _ => 0.06,
-                };
-                // Centre to centre, as far as two squares turned any way
-                // need not to touch, and the room between them.
-                let room = (self.width[a] + self.width[b]) * 0.71 + ROOM;
+                let near = self.orbit[a] == self.orbit[b];
+                let weight = if near { 1.0 } else { 0.06 };
+                let room = self.reach[a] + self.reach[b] + ROOM;
                 let mut force = weight * PUSH * room * room / (distance * distance);
-                if weight >= 1.0 && distance < room {
+                if near && distance < room {
                     force += (room - distance) * 0.5;
                 }
                 push[a] += direction * force;
@@ -233,23 +238,37 @@ impl Towers {
         for (t, push) in push.iter_mut().enumerate() {
             let (sum, members) = middles[self.file[t]];
             let middle = sum / members.max(1) as f32;
-            *push += (middle - self.spots[t]) * KIN - self.spots[t] * GRAVITY;
+            let (start, end) = self.bands[self.orbit[t]];
+            let held = if self.orbit[t] == 0 {
+                0.0
+            } else {
+                (start + end) * 0.5
+            };
+            let spot = self.spots[t];
+            let out = spot.try_normalize().unwrap_or(Vec2::X);
+            *push += (middle - spot) * KIN + out * (held - spot.length()) * HOLD;
         }
-        for (spot, push) in self.spots.iter_mut().zip(push) {
-            *spot += push.clamp_length_max(self.heat);
+        for (t, push) in push.into_iter().enumerate() {
+            let spot = self.spots[t] + push.clamp_length_max(self.heat);
+            let (start, end) = self.bands[self.orbit[t]];
+            let lowest = if self.orbit[t] == 0 {
+                0.0
+            } else {
+                start + self.reach[t]
+            };
+            let highest = (end - self.reach[t]).max(lowest);
+            let out = spot
+                .try_normalize()
+                .unwrap_or_else(|| Vec2::from_angle(t as f32 * 2.399_963));
+            self.spots[t] = out * spot.length().clamp(lowest, highest);
         }
         self.heat *= COOLING;
     }
 
-    /// Where tower `t` stands: the middle of its base.
-    pub(crate) fn base(&self, t: usize) -> Vec3 {
+    /// The centre of planet `t`.
+    pub(crate) fn centre(&self, t: usize) -> Vec3 {
         let spot = self.spots[t];
-        Vec3::new(spot.x, self.floor[t] as f32 * FLOOR, spot.y)
-    }
-
-    /// Tower `t`'s height.
-    fn height(&self, t: usize) -> f32 {
-        stack(self.rows[t])
+        Vec3::new(spot.x, 0.0, spot.y)
     }
 
     /// Whether tables `a` and `b` are joined by a foreign key.
@@ -257,60 +276,83 @@ impl Towers {
         self.joins.contains(&(a.min(b), a.max(b)))
     }
 
-    /// The floors, each with the middle of its towers' bases and how far
-    /// from it the farthest of their edges is.
-    fn floors(&self) -> Vec<(Vec3, f32)> {
-        let floors = self.floor.iter().copied().max().map_or(0, |f| f + 1);
-        (0..floors)
-            .map(|f| {
-                let members: Vec<usize> = (0..self.len()).filter(|t| self.floor[*t] == f).collect();
-                let middle = members.iter().map(|t| self.spots[*t]).sum::<Vec2>()
-                    / members.len().max(1) as f32;
-                let reach = members
-                    .iter()
-                    .map(|t| self.spots[*t].distance(middle) + self.width[*t] * 0.71)
-                    .fold(0.0_f32, f32::max);
-                (
-                    Vec3::new(middle.x, f as f32 * FLOOR, middle.y),
-                    reach + ROOM,
-                )
-            })
+    /// The circle each orbit is drawn as: the core's edge, the middle of
+    /// each other's band.
+    fn rings(&self) -> Vec<f32> {
+        self.bands
+            .iter()
+            .enumerate()
+            .map(|(o, (start, end))| if o == 0 { *end } else { (start + end) * 0.5 })
             .collect()
     }
 
-    /// The middle of the whole, and how far from it its farthest point is:
-    /// the farthest edge of a floor's ring, or the top of its towers.
-    fn extent(&self) -> (Vec3, f32) {
-        let floors = self.floors();
-        if floors.is_empty() {
-            return (Vec3::ZERO, 0.0);
-        }
-        let tallest = (0..self.len()).map(|t| self.height(t)).fold(0.0, f32::max);
-        let middle = floors.iter().map(|(m, _)| *m).sum::<Vec3>() / floors.len() as f32;
-        let reach = floors
-            .iter()
-            .map(|(m, r)| {
-                let across = Vec2::new(m.x - middle.x, m.z - middle.z).length() + r;
-                let up = (m.y - middle.y).abs() + tallest * 0.5;
-                across.hypot(up)
-            })
-            .fold(0.0_f32, f32::max);
-        (middle, reach)
+    /// How far from the middle the farthest planet's outer ring may reach.
+    fn extent(&self) -> f32 {
+        self.bands.last().map_or(0.0, |(_, end)| *end)
     }
 }
 
-/// What colours a plate.
+/// Where a moon turns: its column, `None` for the one of the columns left
+/// out; whether on the ring of the keys; at what angle on its ring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MoonAt {
+    column: Option<usize>,
+    inner: bool,
+    angle: f32,
+}
+
+/// The moons of `table`: its keys on the inner ring, the primary first,
+/// its other columns on the outer one, and one more there for those left
+/// out; each ring's moons evenly around it.
+fn moons(table: &Table) -> Vec<MoonAt> {
+    let (keys, rest): (Vec<usize>, Vec<usize>) = database_view::listed(table, MAX_MOONS)
+        .into_iter()
+        .partition(|c| {
+            let column = &table.columns[*c];
+            column.primary || column.references.is_some()
+        });
+    let mut rest: Vec<Option<usize>> = rest.into_iter().map(Some).collect();
+    if table.columns.len() > MAX_MOONS {
+        rest.push(None);
+    }
+    let ring = |columns: Vec<Option<usize>>, inner: bool| {
+        let count = columns.len().max(1) as f32;
+        columns
+            .into_iter()
+            .enumerate()
+            .map(move |(i, column)| MoonAt {
+                column,
+                inner,
+                angle: i as f32 * TAU / count,
+            })
+    };
+    ring(keys.into_iter().map(Some).collect(), true)
+        .chain(ring(rest, false))
+        .collect()
+}
+
+/// The moon of `column` among `moons`, or that of the columns left out.
+fn moon_of(moons: &[MoonAt], column: usize) -> Option<&MoonAt> {
+    moons
+        .iter()
+        .find(|m| m.column == Some(column))
+        .or_else(|| moons.iter().find(|m| m.column.is_none()))
+}
+
+/// What colours a mesh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Tone {
+    /// A planet, in its file's colour.
+    Body(usize),
     Primary,
     Foreign,
-    /// Another column, in its file's colour.
-    File(usize),
-    /// The cap of the columns left out.
+    /// Another column's moon, in its file's colour.
+    Column(usize),
+    /// The moon of the columns left out.
     Rest,
 }
 
-/// How a tower is lit.
+/// How a planet and its moons are lit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Shade {
     Lit,
@@ -322,20 +364,23 @@ enum Shade {
     Faded,
 }
 
-/// The material of a plate of `tone` shaded `shade`: its colour on the
-/// faces the light reaches, and its own glow, the keys' brighter, to bloom.
+/// The material of a mesh of `tone` shaded `shade`: its colour on the side
+/// the light reaches, and its own glow, the keys' brighter, to bloom.
 fn material(tone: Tone, shade: Shade) -> StandardMaterial {
     let [r, g, b] = match tone {
+        Tone::Body(file) | Tone::Column(file) => PALETTE[file % PALETTE.len()],
         Tone::Primary => GOLD,
         Tone::Foreign => TEAL,
-        Tone::File(file) => PALETTE[file % PALETTE.len()],
         Tone::Rest => GREY,
     };
     let key = matches!(tone, Tone::Primary | Tone::Foreign);
+    let body = matches!(tone, Tone::Body(_));
     let (base, glow) = match shade {
         Shade::Picked if key => (0.4, 3.4),
+        Shade::Picked if body => (0.5, 1.2),
         Shade::Picked => (0.4, 0.9),
         Shade::Lit if key => (0.3, 1.6),
+        Shade::Lit if body => (0.45, 0.4),
         Shade::Lit => (0.3, 0.32),
         Shade::Dim => (0.06, 0.05),
         Shade::Faded => (0.025, 0.015),
@@ -343,7 +388,7 @@ fn material(tone: Tone, shade: Shade) -> StandardMaterial {
     StandardMaterial {
         base_color: Color::linear_rgb(r * base, g * base, b * base),
         emissive: LinearRgba::rgb(r * glow, g * glow, b * glow),
-        perceptual_roughness: 0.6,
+        perceptual_roughness: 0.7,
         ..default()
     }
 }
@@ -362,56 +407,82 @@ fn bezier(points: [Vec3; 4], t: f32) -> Vec3 {
         + points[3] * (t * t * t)
 }
 
-/// Where a tower is on screen, in logical pixels: the middles of its base
-/// and its top, half its width there, where its name goes, and how far it
-/// is from the camera.
+/// Where a planet is on screen, in logical pixels: its centre, its radius
+/// and how far its outer ring reaches there, where its name goes, and how
+/// far it is from the camera.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OnScreen {
-    base: Vec2,
-    top: Vec2,
-    half: f32,
+    centre: Vec2,
+    radius: f32,
+    reach: f32,
     label: Vec2,
     depth: f32,
 }
 
-/// How far `at` is from the segment from `a` to `b`.
-fn from_segment(at: Vec2, a: Vec2, b: Vec2) -> f32 {
-    let along = b - a;
-    let t = if along.length_squared() < 1e-6 {
-        0.0
-    } else {
-        ((at - a).dot(along) / along.length_squared()).clamp(0.0, 1.0)
+/// The planet under `at`: of those it falls on, the nearest the camera;
+/// else, of the rings it falls in, the one it is the nearest the middle of.
+fn pick(on_screen: &[Option<OnScreen>], at: Vec2) -> Option<usize> {
+    let placed = || {
+        on_screen
+            .iter()
+            .enumerate()
+            .filter_map(|(t, s)| Some((t, s.as_ref()?)))
     };
-    at.distance(a + along * t)
+    placed()
+        .filter(|(_, s)| s.centre.distance(at) <= s.radius.max(6.0) + 3.0)
+        .min_by(|a, b| a.1.depth.total_cmp(&b.1.depth))
+        .or_else(|| {
+            placed()
+                .map(|(t, s)| (t, s, s.centre.distance(at) / s.reach.max(1.0)))
+                .filter(|(_, _, near)| *near <= 1.0)
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(t, s, _)| (t, s))
+        })
+        .map(|(t, _)| t)
 }
 
-/// The tower under `at`: of those it falls on, the nearest the camera.
-fn pick(on_screen: &[Option<OnScreen>], at: Vec2) -> Option<usize> {
-    on_screen
-        .iter()
-        .enumerate()
-        .filter_map(|(t, s)| {
-            let s = s.as_ref()?;
-            (from_segment(at, s.base, s.top) <= s.half + 3.0).then_some((t, s.depth))
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(t, _)| t)
+/// Heights for labels wanted at `ys`, from the highest: in the same order,
+/// each at least `gap` below the one before, and the whole moved back for
+/// its middle to stay where it was wanted.
+fn spread(ys: &[f32], gap: f32) -> Vec<f32> {
+    let mut spread: Vec<f32> = Vec::with_capacity(ys.len());
+    for &y in ys {
+        let y = spread.last().map_or(y, |above| y.max(above + gap));
+        spread.push(y);
+    }
+    let back = (ys.iter().sum::<f32>() - spread.iter().sum::<f32>()) / ys.len().max(1) as f32;
+    spread.iter().map(|y| y + back).collect()
 }
 
 /// Marks what belongs to the database's scene.
 #[derive(Component)]
 pub(crate) struct InSchema;
 
-/// A tower, by its table's place in the schema.
+/// A planet with its rings, by its table's place in the schema.
 #[derive(Component)]
-pub(crate) struct Tower(usize);
+pub(crate) struct Planet(usize);
 
-/// A plate: its table, and its column, `None` for the cap of those left
-/// out.
+/// A ring of moons around planet `table`: the keys', or the others'.
 #[derive(Component)]
-pub(crate) struct Plate {
+pub(crate) struct Ring {
     table: usize,
-    column: Option<usize>,
+    inner: bool,
+}
+
+/// What a mesh shows of a table: the planet itself, or a moon, of a column
+/// or, `None`, of those left out.
+#[derive(Component, Clone, Copy)]
+pub(crate) enum Piece {
+    Body(usize),
+    Moon { table: usize, column: Option<usize> },
+}
+
+impl Piece {
+    fn table(self) -> usize {
+        match self {
+            Self::Body(table) | Self::Moon { table, .. } => table,
+        }
+    }
 }
 
 /// The database in space, as the panels and the systems share it.
@@ -419,18 +490,18 @@ pub(crate) struct Plate {
 pub(crate) struct DatabaseSpace {
     schema: Option<Arc<Schema>>,
     keys: Vec<ForeignKey>,
-    towers: Option<Towers>,
-    /// The columns each tower stacks, from its base.
-    plates: Vec<Vec<usize>>,
+    orbits: Option<Orbits>,
+    /// Each planet's moons.
+    moons: Vec<Vec<MoonAt>>,
     /// Whether the scene stands, and must stand anew.
     spawned: bool,
     respawn: bool,
-    /// Each tower's entity, in the schema's order.
-    entities: Vec<Entity>,
-    /// The materials made so far, shared by the plates of a tone and shade.
+    /// The materials made so far, shared by the meshes of a tone and shade.
     materials: HashMap<(Tone, Shade), Handle<StandardMaterial>>,
-    /// The plates must take their shades again.
+    /// The meshes must take their shades again.
     reshade: bool,
+    /// How far the rings have turned, in seconds of turning.
+    spin: f32,
     /// What the search keeps, the table pointed at or chosen, and the one
     /// chosen, for the camera.
     kept: Vec<bool>,
@@ -452,11 +523,11 @@ pub(crate) struct DatabaseSpace {
     /// the details on the left.
     pub(crate) covered: f32,
     left: f32,
-    /// Where each tower is on screen, the names of the columns of the one
-    /// pointed at with their plates' height there, and each floor's name.
+    /// Where each planet is on screen, the moons of the one pointed at
+    /// with their columns, and each orbit's name.
     on_screen: Vec<Option<OnScreen>>,
-    columns_on_screen: Vec<(Option<usize>, Vec2, f32)>,
-    floors_on_screen: Vec<Option<Vec2>>,
+    columns_on_screen: Vec<(Option<usize>, Vec2)>,
+    orbits_on_screen: Vec<Option<Vec2>>,
 }
 
 impl Default for DatabaseSpace {
@@ -464,19 +535,19 @@ impl Default for DatabaseSpace {
         Self {
             schema: None,
             keys: Vec::new(),
-            towers: None,
-            plates: Vec::new(),
+            orbits: None,
+            moons: Vec::new(),
             spawned: false,
             respawn: false,
-            entities: Vec::new(),
             materials: HashMap::new(),
             reshade: false,
+            spin: 0.0,
             kept: Vec::new(),
             focus: None,
             chosen: None,
             centre: Vec3::ZERO,
             yaw: 0.7,
-            pitch: 0.42,
+            pitch: 0.6,
             distance: 260.0,
             target_distance: 260.0,
             zoomed: false,
@@ -486,7 +557,7 @@ impl Default for DatabaseSpace {
             left: 0.0,
             on_screen: Vec::new(),
             columns_on_screen: Vec::new(),
-            floors_on_screen: Vec::new(),
+            orbits_on_screen: Vec::new(),
         }
     }
 }
@@ -497,12 +568,8 @@ impl DatabaseSpace {
         if self.schema.as_ref().is_some_and(|s| Arc::ptr_eq(s, schema)) {
             return;
         }
-        self.plates = schema
-            .tables
-            .iter()
-            .map(|t| database_view::listed(t, MAX_PLATES))
-            .collect();
-        self.towers = Some(Towers::new(schema, &self.plates));
+        self.moons = schema.tables.iter().map(moons).collect();
+        self.orbits = Some(Orbits::new(schema));
         self.keys = schema.foreign_keys();
         self.schema = Some(Arc::clone(schema));
         self.respawn = true;
@@ -528,30 +595,34 @@ impl DatabaseSpace {
         }
     }
 
-    /// How tower `t` is lit.
+    /// How planet `t` and its moons are lit.
     fn shade(&self, t: usize) -> Shade {
         if !self.kept.get(t).copied().unwrap_or(true) {
             return Shade::Faded;
         }
-        match (self.focus, &self.towers) {
+        match (self.focus, &self.orbits) {
             (Some(f), _) if f == t => Shade::Picked,
-            (Some(f), Some(towers)) if towers.joined(f, t) => Shade::Lit,
+            (Some(f), Some(orbits)) if orbits.joined(f, t) => Shade::Lit,
             (Some(_), _) => Shade::Dim,
             (None, _) => Shade::Lit,
         }
     }
 
-    /// What colours `plate`.
-    fn tone(&self, plate: &Plate) -> Tone {
-        let column = plate.column.and_then(|c| {
-            let table = self.schema.as_ref()?.tables.get(plate.table)?;
-            table.columns.get(c)
-        });
+    /// What colours `piece`.
+    fn tone(&self, piece: Piece) -> Tone {
+        let file = self.orbits.as_ref().map_or(0, |o| o.file[piece.table()]);
+        let column = match piece {
+            Piece::Body(_) => return Tone::Body(file),
+            Piece::Moon { table, column } => column.and_then(|c| {
+                let table = self.schema.as_ref()?.tables.get(table)?;
+                table.columns.get(c)
+            }),
+        };
         match column {
             None => Tone::Rest,
             Some(c) if c.primary => Tone::Primary,
             Some(c) if c.references.is_some() => Tone::Foreign,
-            Some(_) => Tone::File(self.towers.as_ref().map_or(0, |t| t.file[plate.table])),
+            Some(_) => Tone::Column(file),
         }
     }
 
@@ -568,17 +639,36 @@ impl DatabaseSpace {
             .clone()
     }
 
-    /// The plate of `column` in tower `t`, the cap when it is left out, the
-    /// base when none is said.
-    fn row(&self, t: usize, column: Option<usize>) -> usize {
-        let Some(column) = column else {
-            return 0;
-        };
-        let plates = &self.plates[t];
-        plates
-            .iter()
-            .position(|c| *c == column)
-            .unwrap_or(plates.len())
+    /// How far planet `t`'s ring has turned: each planet's from an angle of
+    /// its own, the keys' faster.
+    fn turn(&self, t: usize, inner: bool) -> f32 {
+        let phase = t as f32 * 2.399_963;
+        if inner {
+            self.spin * INNER_SPIN + phase
+        } else {
+            self.spin * OUTER_SPIN - phase
+        }
+    }
+
+    /// Where `moon` of planet `t` is, from its centre.
+    fn moon_offset(&self, orbits: &Orbits, t: usize, moon: &MoonAt) -> Vec3 {
+        let radius = orbits.size[t] + if moon.inner { INNER } else { OUTER };
+        let local = Vec3::new(moon.angle.cos(), 0.0, moon.angle.sin()) * radius;
+        Quat::from_rotation_y(self.turn(t, moon.inner)) * local
+    }
+
+    /// Where the moon of `column` of planet `t` is, that of the columns left
+    /// out when it is one; on the planet's surface facing `toward` when no
+    /// column is said or none has a moon.
+    fn moon_at(&self, orbits: &Orbits, t: usize, column: Option<usize>, toward: Vec3) -> Vec3 {
+        let centre = orbits.centre(t);
+        match column.and_then(|c| moon_of(&self.moons[t], c)) {
+            Some(moon) => centre + self.moon_offset(orbits, t, moon),
+            None => {
+                let way = (toward - centre).try_normalize().unwrap_or(Vec3::Y);
+                centre + way * orbits.size[t]
+            }
+        }
     }
 }
 
@@ -590,29 +680,28 @@ pub(crate) fn spawn(
     mut meshes: ResMut<Assets<Mesh>>,
     mut assets: ResMut<Assets<StandardMaterial>>,
     existing: Query<Entity, With<InSchema>>,
-    mut cube: Local<Option<Handle<Mesh>>>,
+    mut sphere: Local<Option<Handle<Mesh>>>,
 ) {
-    let wanted = universe.schema && space.towers.is_some();
+    let wanted = universe.schema && space.orbits.is_some();
     if (!wanted || space.respawn) && space.spawned {
         for entity in &existing {
             commands.entity(entity).despawn();
         }
-        space.entities.clear();
         space.spawned = false;
     }
     if !wanted || space.spawned {
         return;
     }
-    let (Some(towers), Some(schema)) = (space.towers.clone(), space.schema.clone()) else {
+    let Some(orbits) = space.orbits.clone() else {
         return;
     };
     space.respawn = false;
     space.spawned = true;
     space.reshade = true;
-    let cube = cube
-        .get_or_insert_with(|| meshes.add(Cuboid::new(1.0, 1.0, 1.0)))
+    let sphere = sphere
+        .get_or_insert_with(|| meshes.add(Sphere::new(1.0).mesh().uv(32, 18)))
         .clone();
-    // Lit from above and aside, for the faces of a plate to read apart.
+    // Lit from above and aside, for each planet to show a day and a night.
     commands.spawn((
         DirectionalLight {
             illuminance: 3_000.0,
@@ -622,35 +711,50 @@ pub(crate) fn spawn(
         InSchema,
     ));
     let lit = space.material(Tone::Rest, Shade::Lit, &mut assets);
-    let mut entities = Vec::with_capacity(towers.len());
-    for (t, table) in schema.tables.iter().enumerate() {
-        let width = towers.width[t];
-        let mut columns: Vec<Option<usize>> = space.plates[t].iter().copied().map(Some).collect();
-        if table.columns.len() > columns.len() || columns.is_empty() {
-            columns.push(None);
-        }
-        let entity = commands
+    for t in 0..orbits.len() {
+        let size = orbits.size[t];
+        let moons = space.moons[t].clone();
+        commands
             .spawn((
-                Transform::from_translation(towers.base(t)),
+                Transform::from_translation(orbits.centre(t)),
                 Visibility::Visible,
-                Tower(t),
+                Planet(t),
                 InSchema,
             ))
-            .with_children(|tower| {
-                for (row, column) in columns.into_iter().enumerate() {
-                    tower.spawn((
-                        Mesh3d(cube.clone()),
-                        MeshMaterial3d(lit.clone()),
-                        Transform::from_xyz(0.0, plate_y(row), 0.0)
-                            .with_scale(Vec3::new(width, PLATE, width)),
-                        Plate { table: t, column },
-                    ));
+            .with_children(|planet| {
+                planet.spawn((
+                    Mesh3d(sphere.clone()),
+                    MeshMaterial3d(lit.clone()),
+                    Transform::from_scale(Vec3::splat(size)),
+                    Piece::Body(t),
+                ));
+                for inner in [true, false] {
+                    let radius = size + if inner { INNER } else { OUTER };
+                    let scale = if inner { KEY_MOON } else { MOON };
+                    planet
+                        .spawn((
+                            Transform::default(),
+                            Visibility::Inherited,
+                            Ring { table: t, inner },
+                        ))
+                        .with_children(|ring| {
+                            for moon in moons.iter().filter(|m| m.inner == inner) {
+                                let at =
+                                    Vec3::new(moon.angle.cos(), 0.0, moon.angle.sin()) * radius;
+                                ring.spawn((
+                                    Mesh3d(sphere.clone()),
+                                    MeshMaterial3d(lit.clone()),
+                                    Transform::from_translation(at).with_scale(Vec3::splat(scale)),
+                                    Piece::Moon {
+                                        table: t,
+                                        column: moon.column,
+                                    },
+                                ));
+                            }
+                        });
                 }
-            })
-            .id();
-        entities.push(entity);
+            });
     }
-    space.entities = entities;
 }
 
 /// What the camera's query reads and moves.
@@ -660,17 +764,24 @@ type CameraParts = (
     &'static GlobalTransform,
 );
 
-/// Each frame while shown: the towers' next steps, their shades, the floors
-/// and the keys, the camera, and where the names go.
+/// What keeps the planets, their rings and the camera apart, for one
+/// system to move all three.
+type PlanetsOnly = (Without<UniverseCamera>, Without<Ring>);
+type RingsOnly = (Without<UniverseCamera>, Without<Planet>);
+type CameraOnly = (With<UniverseCamera>, Without<Planet>, Without<Ring>);
+
+/// Each frame while shown: the planets' next steps, the rings' turns, the
+/// shades, the orbits and the keys, the camera, and where the names go.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn animate(
     mut space: ResMut<DatabaseSpace>,
     universe: Res<Universe>,
     time: Res<Time>,
     mut assets: ResMut<Assets<StandardMaterial>>,
-    mut towers: Query<(&Tower, &mut Transform), Without<UniverseCamera>>,
-    mut plates: Query<(&Plate, &mut MeshMaterial3d<StandardMaterial>)>,
-    mut camera: Query<CameraParts, (With<UniverseCamera>, Without<Tower>)>,
+    mut planets: Query<(&Planet, &mut Transform), PlanetsOnly>,
+    mut rings: Query<(&Ring, &mut Transform), RingsOnly>,
+    mut pieces: Query<(&Piece, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut camera: Query<CameraParts, CameraOnly>,
     mut gizmos: Gizmos,
 ) {
     if !universe.schema || !space.spawned {
@@ -678,71 +789,94 @@ pub(crate) fn animate(
     }
     let dt = time.delta_secs().min(0.1);
     let t_now = time.elapsed_secs_wrapped();
-    if let Some(layout) = space.towers.as_mut()
+    if let Some(layout) = space.orbits.as_mut()
         && !layout.settled()
     {
         let pairs = (layout.len() * layout.len() / 2).max(1);
         for _ in 0..(PAIRS_PER_FRAME / pairs).clamp(1, 4) {
             layout.step();
         }
-        for (tower, mut transform) in &mut towers {
-            transform.translation = layout.base(tower.0);
+        for (planet, mut transform) in &mut planets {
+            transform.translation = layout.centre(planet.0);
         }
     }
+    // The rings turn while nothing is pointed at, for each moon to stay by
+    // its column's name.
+    if space.focus.is_none() {
+        space.spin += dt;
+    }
+    for (ring, mut transform) in &mut rings {
+        transform.rotation = Quat::from_rotation_y(space.turn(ring.table, ring.inner));
+    }
     if std::mem::take(&mut space.reshade) {
-        let count = space.towers.as_ref().map_or(0, Towers::len);
+        let count = space.orbits.as_ref().map_or(0, Orbits::len);
         let shades: Vec<Shade> = (0..count).map(|t| space.shade(t)).collect();
-        for (plate, mut material) in &mut plates {
-            let tone = space.tone(plate);
-            let shade = shades.get(plate.table).copied().unwrap_or(Shade::Lit);
+        for (piece, mut material) in &mut pieces {
+            let tone = space.tone(*piece);
+            let shade = shades.get(piece.table()).copied().unwrap_or(Shade::Lit);
             let handle = space.material(tone, shade, &mut assets);
             if material.0 != handle {
                 material.0 = handle;
             }
         }
     }
-    let Some(layout) = space.towers.as_ref() else {
+    let Some(layout) = space.orbits.as_ref() else {
         return;
     };
+    let flat = Quat::from_rotation_x(FRAC_PI_2);
 
-    // The floors, faint rings under their towers.
-    let floors = layout.floors();
-    for (middle, reach) in &floors {
+    // The orbits, faint circles around the middle.
+    let orbit_rings = layout.rings();
+    for radius in &orbit_rings {
         gizmos
             .circle(
-                Isometry3d::new(
-                    *middle - Vec3::Y * 0.05,
-                    Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
-                ),
-                *reach,
-                Color::from(LinearRgba::new(0.35, 0.4, 0.8, 0.22)),
+                Isometry3d::new(Vec3::ZERO, flat),
+                *radius,
+                Color::from(LinearRgba::new(0.35, 0.4, 0.8, 0.2)),
             )
-            .resolution(96);
+            .resolution(160);
     }
 
-    // The keys: from the plate of the column that points, out of its side
-    // facing what it points at, down to the plate pointed at. Those of the
-    // table pointed at lit, a spark running along each from the table that
-    // points to the one pointed at; the others faint.
+    // Each planet's rings, the faint paths its moons turn on.
+    for t in 0..layout.len() {
+        let alpha = match space.shade(t) {
+            Shade::Picked => 0.5,
+            Shade::Lit => 0.16,
+            Shade::Dim => 0.04,
+            Shade::Faded => 0.015,
+        };
+        let around = Isometry3d::new(layout.centre(t), flat);
+        let own = PALETTE[layout.file[t] % PALETTE.len()];
+        for (out, colour) in [(INNER, GOLD), (OUTER, own)] {
+            gizmos
+                .circle(
+                    around,
+                    layout.size[t] + out,
+                    Color::from(hdr(colour, 1.0, alpha)),
+                )
+                .resolution(48);
+        }
+    }
+
+    // The keys: from the moon of the column that points, arcing over the
+    // plane, in to the moon of the column pointed at. Those of the table
+    // pointed at lit, a spark running along each from the table that points
+    // to the one pointed at; the others faint.
     for (i, key) in space.keys.iter().enumerate() {
         let lit = |t: usize| space.kept.get(t).copied().unwrap_or(true);
-        let a =
-            layout.base(key.from) + Vec3::Y * plate_y(space.row(key.from, Some(key.from_column)));
-        let b = layout.base(key.to) + Vec3::Y * plate_y(space.row(key.to, key.to_column));
+        let (from, to) = (layout.centre(key.from), layout.centre(key.to));
+        let a = space.moon_at(layout, key.from, Some(key.from_column), to);
+        let b = space.moon_at(layout, key.to, key.to_column, from);
         let points = if key.from == key.to {
-            // A table pointing at itself: a loop out of its side.
-            let side = Vec3::X * (layout.width[key.from] * 0.5);
-            let out = Vec3::X * 1.8;
-            [a + side, a + side + out, b + side + out, b + side]
+            // A table pointing at itself: a loop over it.
+            let up = Vec3::Y * (layout.size[key.from] + 2.0);
+            [a, a + up, b + up, b]
         } else {
-            let flat = Vec3::new(b.x - a.x, 0.0, b.z - a.z);
-            let way = flat.try_normalize().unwrap_or(Vec3::X);
-            let start = a + way * (layout.width[key.from] * 0.5);
-            let end = b - way * (layout.width[key.to] * 0.5);
-            let reach = (flat.length() * 0.4).max(1.5);
-            [start, start + way * reach, end - way * reach, end]
+            let lift = Vec3::Y * (a.distance(b) * 0.22).max(1.0);
+            let way = (b - a) * 0.2;
+            [a, a + lift + way, b + lift - way, b]
         };
-        let (from, to, alpha, spark) = match space.focus {
+        let (start, end, alpha, spark) = match space.focus {
             Some(f) if f == key.from => (ORANGE, ORANGE, 0.95, Some(ORANGE)),
             Some(f) if f == key.to => (TEAL, TEAL, 0.95, Some(TEAL)),
             Some(_) => (TEAL, GOLD, 0.05, None),
@@ -750,9 +884,9 @@ pub(crate) fn animate(
             None => (TEAL, GOLD, 0.05, None),
         };
         let bright = if spark.is_some() { 2.4 } else { 1.0 };
-        gizmos.linestrip_gradient((0..=20).map(|s| {
-            let t = s as f32 / 20.0;
-            let colour = hdr(from, bright, alpha).mix(&hdr(to, bright, alpha), t);
+        gizmos.linestrip_gradient((0..=24).map(|s| {
+            let t = s as f32 / 24.0;
+            let colour = hdr(start, bright, alpha).mix(&hdr(end, bright, alpha), t);
             (bezier(points, t), Color::from(colour))
         }));
         if let Some(colour) = spark {
@@ -767,19 +901,21 @@ pub(crate) fn animate(
 
     // The camera: drifting while nothing is pointed at, turned by a drag,
     // gliding to frame the whole, or the table chosen.
-    let (middle, extent) = layout.extent();
-    let whole = (extent * 2.2).clamp(12.0, FARTHEST);
+    let whole = (layout.extent() * 2.2).clamp(12.0, FARTHEST);
     let goal = match space.chosen.filter(|c| *c < layout.len()) {
-        Some(c) => (
-            layout.base(c) + Vec3::Y * layout.height(c) * 0.5,
-            (layout.width[c] * 8.0).max(20.0),
-        ),
-        None => (middle, whole),
+        Some(c) => (layout.centre(c), (layout.reach[c] * 7.0).max(14.0)),
+        None => (Vec3::ZERO, whole),
     };
-    let base_of: Vec<(Vec3, f32, f32)> = (0..layout.len())
-        .map(|t| (layout.base(t), layout.height(t), layout.width[t]))
+    let planets_at: Vec<(Vec3, f32, f32)> = (0..layout.len())
+        .map(|t| (layout.centre(t), layout.size[t], layout.reach[t]))
         .collect();
-    let floor_rings = floors;
+    let moons_at: Vec<(Option<usize>, Vec3)> = match space.focus.filter(|f| *f < layout.len()) {
+        Some(f) => space.moons[f]
+            .iter()
+            .map(|m| (m.column, layout.centre(f) + space.moon_offset(layout, f, m)))
+            .collect(),
+        None => Vec::new(),
+    };
     let drag = std::mem::take(&mut space.drag);
     let zoom = std::mem::take(&mut space.zoom);
     if drag == Vec2::ZERO && space.focus.is_none() {
@@ -818,58 +954,91 @@ pub(crate) fn animate(
     *transform = looking.with_translation(looking.translation + shift);
     let eye = transform.translation;
     let right = *looking.right();
+    let up = *looking.up();
     let on_screen = |p: Vec3| camera.world_to_viewport(global, p).ok();
-    space.on_screen = base_of
+    space.on_screen = planets_at
         .iter()
-        .map(|(base, height, width)| {
-            let middle = *base + Vec3::Y * (height * 0.5);
-            let centre = on_screen(middle)?;
+        .map(|(centre, size, reach)| {
+            let middle = on_screen(*centre)?;
             Some(OnScreen {
-                base: on_screen(*base)?,
-                top: on_screen(*base + Vec3::Y * *height)?,
-                half: centre.distance(on_screen(middle + right * (width * 0.5))?),
-                label: on_screen(*base + Vec3::Y * (height + 0.5))?,
-                depth: eye.distance(middle),
+                centre: middle,
+                radius: middle.distance(on_screen(*centre + right * *size)?),
+                reach: middle.distance(on_screen(*centre + right * *reach)?),
+                label: on_screen(*centre + up * (size + 0.35))?,
+                depth: eye.distance(*centre),
             })
         })
         .collect();
-    space.columns_on_screen = match space.focus.filter(|f| *f < base_of.len()) {
-        Some(f) => {
-            let (base, _, width) = base_of[f];
-            let mut columns: Vec<Option<usize>> =
-                space.plates[f].iter().copied().map(Some).collect();
-            let more = space
-                .schema
-                .as_ref()
-                .and_then(|s| s.tables.get(f))
-                .is_some_and(|t| t.columns.len() > columns.len());
-            if more {
-                columns.push(None);
-            }
-            columns
-                .into_iter()
-                .enumerate()
-                .filter_map(|(row, column)| {
-                    // Clear of the tower's corner, however it is turned.
-                    let at = base + Vec3::Y * plate_y(row) + right * (width * 0.71 + 0.15);
-                    let here = on_screen(at)?;
-                    let next = on_screen(at + Vec3::Y * (PLATE + PLATE_GAP))?;
-                    Some((column, here, here.distance(next)))
-                })
-                .collect()
-        }
-        None => Vec::new(),
-    };
-    space.floors_on_screen = floor_rings
+    space.columns_on_screen = moons_at
+        .into_iter()
+        .filter_map(|(column, at)| Some((column, on_screen(at)?)))
+        .collect();
+    // Each orbit's name on its circle between its right and the camera,
+    // where the circles stand apart the most on screen.
+    let toward = Vec3::new(offset.x, 0.0, offset.z).normalize_or(Vec3::Z);
+    let named = (right + toward).normalize_or(right);
+    space.orbits_on_screen = orbit_rings
         .iter()
-        .map(|(middle, reach)| on_screen(*middle + right * *reach))
+        .map(|radius| on_screen(named * *radius))
         .collect();
 }
 
-/// The database in space, drawn over its towers in `rect` under the title
+/// A column's name beside its moon, in `size`: its mark, its name, its
+/// type; from `at` rightwards, or, `leftwards`, up to it.
+fn column_label(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    leftwards: bool,
+    column: &Column,
+    size: f32,
+) {
+    let (mark, mark_colour) = if column.primary {
+        ("◆", YELLOW)
+    } else if column.references.is_some() {
+        ("→", CYAN)
+    } else {
+        ("·", DIM)
+    };
+    let kind = database_view::short_type(&column.kind);
+    let kind = if kind.is_empty() {
+        String::new()
+    } else {
+        format!("{kind}{}", if column.nullable { "?" } else { "" })
+    };
+    let name = TEXT.gamma_multiply(if column.nullable { 0.75 } else { 1.0 });
+    let parts: [(&str, FontId, Color32); 3] = [
+        (mark, FontId::monospace(size), mark_colour),
+        (&column.name, FontId::monospace(size), name),
+        (&kind, FontId::monospace(size * 0.9), DIM),
+    ];
+    let widths: Vec<f32> = parts
+        .iter()
+        .map(|(text, font, colour)| {
+            painter
+                .layout_no_wrap((*text).to_owned(), font.clone(), *colour)
+                .size()
+                .x
+        })
+        .collect();
+    let width = widths.iter().sum::<f32>() + 5.0 * (parts.len() - 1) as f32;
+    let mut x = if leftwards { at.x - width } else { at.x };
+    for ((text, font, colour), width) in parts.into_iter().zip(widths) {
+        shadowed(
+            painter,
+            egui::pos2(x, at.y),
+            Align2::LEFT_CENTER,
+            text,
+            font,
+            colour,
+        );
+        x += width + 5.0;
+    }
+}
+
+/// The database in space, drawn over its planets in `rect` under the title
 /// the view draws: the mouse for the camera, the tables' names, the columns
-/// of the table pointed at, the floors. Returns whether a model was
-/// opened, which leaves the view.
+/// of the table pointed at, the orbits. Returns whether a model was opened,
+/// which leaves the view.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
     ui: &mut Ui,
@@ -917,30 +1086,12 @@ pub(crate) fn show(
     ));
     let pos = |v: Vec2| egui::pos2(v.x, v.y);
 
-    // The floors' names, at their rings' right.
-    for (floor, at) in space.floors_on_screen.iter().enumerate() {
-        let Some(at) = at else { continue };
-        let name = if floor == 0 {
-            "floor 0 · points at no table".to_owned()
-        } else {
-            format!("floor {floor}")
-        };
-        shadowed(
-            &canvas,
-            pos(*at) + egui::vec2(8.0, 0.0),
-            Align2::LEFT_CENTER,
-            &name,
-            FontId::proportional(11.5),
-            DIM,
-        );
-    }
-
-    // The tables' names, above their towers: that of the table pointed at
+    // The tables' names, above their planets: that of the table pointed at
     // and those it is joined to first, then the nearest; a name is left out
-    // where it would cover another, or its tower is too small to read.
+    // where it would cover another, or its planet is too small to read.
     let focus = space.focus;
     let related =
-        |t: usize| focus.is_some_and(|f| space.towers.as_ref().is_some_and(|l| l.joined(f, t)));
+        |t: usize| focus.is_some_and(|f| space.orbits.as_ref().is_some_and(|o| o.joined(f, t)));
     let few = schema.tables.len() <= 40;
     let mut order: Vec<(usize, OnScreen)> = space
         .on_screen
@@ -956,9 +1107,9 @@ pub(crate) fn show(
     let mut taken: Vec<Rect> = Vec::new();
     for (t, s) in order {
         let picked = focus == Some(t);
-        let tall = s.base.distance(s.top) > 30.0;
+        let large = s.radius > 4.0;
         let lit = kept.get(t).copied().unwrap_or(true);
-        if !(picked || related(t) || ((tall || few) && lit && focus.is_none())) {
+        if !(picked || related(t) || ((large || few) && lit && focus.is_none())) {
             continue;
         }
         let font = FontId::proportional(if picked { 16.0 } else { 12.5 });
@@ -989,82 +1140,71 @@ pub(crate) fn show(
         );
     }
 
-    // The columns of the table pointed at, once their plates are far enough
-    // apart to read: in a column of their own right of the tower, which
-    // perspective slants, each tied to its plate by a line.
+    // The orbits' names, on their circles, but where they would cover a
+    // table's.
+    for (orbit, at) in space.orbits_on_screen.iter().enumerate() {
+        let Some(at) = at else { continue };
+        let name = if orbit == 0 {
+            "the core · points at no table".to_owned()
+        } else {
+            format!("orbit {orbit}")
+        };
+        let font = FontId::proportional(11.5);
+        let at = pos(*at) + egui::vec2(8.0, 0.0);
+        let size = painter
+            .layout_no_wrap(name.clone(), font.clone(), DIM)
+            .size();
+        let area = Rect::from_min_size(at - egui::vec2(0.0, size.y / 2.0), size);
+        if taken.iter().any(|r| r.intersects(area)) {
+            continue;
+        }
+        shadowed(&canvas, at, Align2::LEFT_CENTER, &name, font, DIM);
+    }
+
+    // The columns of the table pointed at, once its rings are large enough
+    // to tell their moons apart: those on the planet's right in a column
+    // right of its rings, the others left of them, each tied to its moon by
+    // a line.
     if let Some(f) = focus
         && let Some(table) = schema.tables.get(f)
+        && let Some(planet) = space.on_screen.get(f).copied().flatten()
+        && planet.reach >= 24.0
     {
-        let spacing = space
-            .columns_on_screen
-            .iter()
-            .map(|(_, _, h)| *h)
-            .fold(f32::MAX, f32::min);
-        let size = (spacing * 0.9).clamp(10.0, 13.0);
-        let left = space
-            .columns_on_screen
-            .iter()
-            .map(|(_, at, _)| at.x)
-            .fold(f32::MIN, f32::max)
-            + 14.0;
-        for (column, edge, _) in space.columns_on_screen.iter().filter(|_| spacing >= 8.0) {
-            let at = egui::pos2(left, edge.y);
-            canvas.line_segment(
-                [pos(*edge), at - egui::vec2(4.0, 0.0)],
-                Stroke::new(1.0, DIM.gamma_multiply(0.6)),
-            );
-            let Some(column) = column.and_then(|c| table.columns.get(c)) else {
-                shadowed(
-                    &canvas,
-                    at,
-                    Align2::LEFT_CENTER,
-                    &format!(
-                        "and {} more",
-                        table.columns.len().saturating_sub(MAX_PLATES)
-                    ),
-                    FontId::proportional(size),
-                    DIM,
-                );
-                continue;
-            };
-            let (mark, mark_colour) = if column.primary {
-                ("◆", YELLOW)
-            } else if column.references.is_some() {
-                ("→", CYAN)
+        let size = 12.0;
+        for leftwards in [false, true] {
+            let mut side: Vec<(Option<usize>, Vec2)> = space
+                .columns_on_screen
+                .iter()
+                .copied()
+                .filter(|(_, at)| (at.x < planet.centre.x) == leftwards)
+                .collect();
+            side.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            let ys: Vec<f32> = side.iter().map(|(_, at)| at.y).collect();
+            let edge = planet.reach + 28.0;
+            let x = if leftwards {
+                planet.centre.x - edge
             } else {
-                ("·", DIM)
+                planet.centre.x + edge
             };
-            let glyph = size * 0.6;
-            shadowed(
-                &canvas,
-                at,
-                Align2::LEFT_CENTER,
-                mark,
-                FontId::monospace(size),
-                mark_colour,
-            );
-            let name_at = egui::pos2(at.x + glyph + 5.0, at.y);
-            shadowed(
-                &canvas,
-                name_at,
-                Align2::LEFT_CENTER,
-                &column.name,
-                FontId::monospace(size),
-                TEXT.gamma_multiply(if column.nullable { 0.75 } else { 1.0 }),
-            );
-            let kind = database_view::short_type(&column.kind);
-            if !kind.is_empty() {
-                shadowed(
-                    &canvas,
-                    egui::pos2(
-                        name_at.x + column.name.chars().count() as f32 * glyph + 8.0,
-                        at.y,
+            for ((column, moon), y) in side.into_iter().zip(spread(&ys, size + 3.0)) {
+                let at = egui::pos2(x, y);
+                let end = at + egui::vec2(if leftwards { 4.0 } else { -4.0 }, 0.0);
+                canvas.line_segment([pos(moon), end], Stroke::new(1.0, DIM.gamma_multiply(0.6)));
+                match column.and_then(|c| table.columns.get(c)) {
+                    Some(column) => column_label(&canvas, at, leftwards, column, size),
+                    None => shadowed(
+                        &canvas,
+                        at,
+                        if leftwards {
+                            Align2::RIGHT_CENTER
+                        } else {
+                            Align2::LEFT_CENTER
+                        },
+                        &format!("and {} more", table.columns.len().saturating_sub(MAX_MOONS)),
+                        FontId::proportional(size),
+                        DIM,
                     ),
-                    Align2::LEFT_CENTER,
-                    &format!("{kind}{}", if column.nullable { "?" } else { "" }),
-                    FontId::monospace(size * 0.9),
-                    DIM,
-                );
+                }
             }
         }
     }
@@ -1073,7 +1213,7 @@ pub(crate) fn show(
         &painter,
         rect.left_bottom() + egui::vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
-        "drag to turn · scroll to come closer · point at a table for its keys and columns · click it to go to it · double-click to open its model · each floor points at those below · ◆ primary key · → foreign key",
+        "drag to turn · scroll to come closer · point at a table for its keys and columns · click it to go to it · double-click to open its model · each orbit points at those inside it · ◆ primary key · → foreign key",
         FontId::proportional(12.0),
         DIM,
     );
@@ -1088,21 +1228,16 @@ mod tests {
         universe_codemap::schema(&[("models.py".to_owned(), text.to_owned())])
     }
 
-    fn settled(schema: &Schema) -> Towers {
-        let plates: Vec<Vec<usize>> = schema
-            .tables
-            .iter()
-            .map(|t| database_view::listed(t, MAX_PLATES))
-            .collect();
-        let mut towers = Towers::new(schema, &plates);
+    fn settled(schema: &Schema) -> Orbits {
+        let mut orbits = Orbits::new(schema);
         for _ in 0..2_000 {
-            if towers.settled() {
+            if orbits.settled() {
                 break;
             }
-            towers.step();
+            orbits.step();
         }
-        assert!(towers.settled());
-        towers
+        assert!(orbits.settled());
+        orbits
     }
 
     const SHOP: &str = r#"
@@ -1141,66 +1276,69 @@ class Setting(Base):
 "#;
 
     #[test]
-    fn a_table_stands_above_what_it_points_at_and_no_tower_stands_in_another() {
+    fn a_table_orbits_outside_what_it_points_at_and_no_planet_stands_in_another() {
         let schema = schema(SHOP);
-        let towers = settled(&schema);
+        let orbits = settled(&schema);
+        let from_middle = |t: usize| orbits.centre(t).length();
         for key in schema.foreign_keys() {
             assert!(
-                towers.base(key.from).y > towers.base(key.to).y,
-                "{} above {}",
+                from_middle(key.from) > from_middle(key.to) + orbits.reach[key.from],
+                "{} outside {}",
                 schema.tables[key.from].name,
                 schema.tables[key.to].name
             );
         }
-        for a in 0..towers.len() {
-            for b in a + 1..towers.len() {
-                if towers.floor[a] != towers.floor[b] {
-                    continue;
-                }
-                let apart = (towers.base(a) - towers.base(b)).abs();
-                let room = (towers.width[a] + towers.width[b]) / 2.0;
+        for a in 0..orbits.len() {
+            for b in a + 1..orbits.len() {
                 assert!(
-                    apart.x >= room || apart.z >= room,
+                    orbits.centre(a).distance(orbits.centre(b))
+                        >= orbits.reach[a] + orbits.reach[b],
                     "{} and {} stand in each other",
                     schema.tables[a].name,
                     schema.tables[b].name
                 );
             }
         }
-        // Pointed at by more tables, a tower is wider.
-        let width = |name: &str| towers.width[schema.table(name).unwrap()];
-        assert!(width("customer") > width("log"));
-        // A table stands nearer what it points at than a table it has
-        // nothing to do with.
-        let across = |a: &str, b: &str| {
+        // All in the plane of the orbits.
+        assert!((0..orbits.len()).all(|t| orbits.centre(t).y == 0.0));
+        // Pointed at by more tables, a planet is larger.
+        let size = |name: &str| orbits.size[schema.table(name).unwrap()];
+        assert!(size("customer") > size("log"));
+        // A table is nearer what it points at than a table it has nothing
+        // to do with.
+        let apart = |a: &str, b: &str| {
             let (a, b) = (schema.table(a).unwrap(), schema.table(b).unwrap());
-            let (a, b) = (towers.base(a), towers.base(b));
-            Vec2::new(a.x - b.x, a.z - b.z).length()
+            orbits.centre(a).distance(orbits.centre(b))
         };
-        assert!(across("orders", "customer") < across("orders", "setting"));
+        assert!(apart("orders", "customer") < apart("orders", "setting"));
     }
 
     #[test]
-    fn the_tower_pointed_at_is_the_nearest_under_the_pointer() {
-        let tower = |x: f32, depth: f32| {
+    fn the_planet_pointed_at_is_the_nearest_under_the_pointer_or_whose_rings_it_is_in() {
+        let planet = |x: f32, depth: f32| {
             Some(OnScreen {
-                base: Vec2::new(x, 200.0),
-                top: Vec2::new(x, 100.0),
-                half: 20.0,
-                label: Vec2::new(x, 90.0),
+                centre: Vec2::new(x, 100.0),
+                radius: 20.0,
+                reach: 50.0,
+                label: Vec2::new(x, 75.0),
                 depth,
             })
         };
-        let on_screen = [tower(100.0, 50.0), tower(110.0, 30.0), tower(400.0, 10.0)];
-        assert_eq!(pick(&on_screen, Vec2::new(105.0, 150.0)), Some(1));
-        assert_eq!(pick(&on_screen, Vec2::new(85.0, 150.0)), Some(0));
-        assert_eq!(pick(&on_screen, Vec2::new(250.0, 150.0)), None);
-        // Past its top, a tower is not under the pointer.
-        assert_eq!(pick(&on_screen, Vec2::new(400.0, 40.0)), None);
+        let on_screen = [
+            planet(100.0, 50.0),
+            planet(110.0, 30.0),
+            planet(400.0, 10.0),
+        ];
+        // On two planets: the nearer the camera.
+        assert_eq!(pick(&on_screen, Vec2::new(105.0, 100.0)), Some(1));
+        assert_eq!(pick(&on_screen, Vec2::new(85.0, 100.0)), Some(0));
+        // In a planet's rings only: that planet.
+        assert_eq!(pick(&on_screen, Vec2::new(360.0, 100.0)), Some(2));
+        assert_eq!(pick(&on_screen, Vec2::new(250.0, 100.0)), None);
     }
 
     #[test]
-    fn a_tower_stacks_its_keys_first_and_caps_what_it_leaves_out() {
+    fn a_planet_rings_its_keys_inside_and_gives_one_moon_to_what_it_leaves_out() {
         let mut columns = String::new();
         for i in 0..20 {
             columns.push_str(&format!("    c{i} = Column(Integer)\n"));
@@ -1209,14 +1347,24 @@ class Setting(Base):
             "class Big(Base):\n    __tablename__ = \"big\"\n{columns}    id = Column(Integer, primary_key=True)\n"
         );
         let schema = schema(&text);
-        let mut space = DatabaseSpace::default();
-        space.take(&Arc::new(schema));
-        assert_eq!(space.plates[0].len(), MAX_PLATES);
-        let towers = space.towers.as_ref().unwrap();
-        assert_eq!(towers.rows[0], MAX_PLATES + 1);
-        // The primary key at the base; a column left out on the cap.
-        assert_eq!(space.row(0, Some(20)), 0);
-        assert_eq!(space.row(0, Some(19)), MAX_PLATES);
-        assert!(towers.height(0) < FLOOR);
+        let moons = moons(&schema.tables[0]);
+        assert_eq!(moons.len(), MAX_MOONS + 1);
+        // The primary key alone on the inner ring.
+        assert_eq!(moons.iter().filter(|m| m.inner).count(), 1);
+        assert!(moon_of(&moons, 20).is_some_and(|m| m.inner));
+        // A column left out has the moon of those left out.
+        assert_eq!(moon_of(&moons, 19).map(|m| m.column), Some(None));
+        assert_eq!(moon_of(&moons, 3).map(|m| m.column), Some(Some(3)));
+    }
+
+    #[test]
+    fn labels_keep_their_order_and_room_around_where_they_were_wanted() {
+        let wanted = [100.0, 102.0, 104.0, 160.0];
+        let placed = spread(&wanted, 15.0);
+        assert!(placed.windows(2).all(|w| w[1] - w[0] >= 15.0 - 1e-4));
+        let middle = |ys: &[f32]| ys.iter().sum::<f32>() / ys.len() as f32;
+        assert!((middle(&placed) - middle(&wanted)).abs() < 1e-3);
+        // Far enough apart, labels stay where they were wanted.
+        assert_eq!(spread(&[10.0, 40.0], 15.0), vec![10.0, 40.0]);
     }
 }
